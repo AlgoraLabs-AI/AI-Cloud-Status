@@ -1,0 +1,32 @@
+{
+  "data": {
+    "type": "status_page",
+    "attributes": {
+      "company_name": "Hugging Face",
+      "aggregate_state": "downtime"
+    }
+  },
+  "included": [
+    {
+      "type": "status_page_resource",
+      "attributes": { "public_name": "Huggingface Hub", "status": "downtime", "availability": 0.5 }
+    },
+    {
+      "type": "status_page_resource",
+      "attributes": { "public_name": "Inference API", "status": "degraded", "availability": 0.9 }
+    },
+    {
+      "type": "status_page_resource",
+      "attributes": { "public_name": "Spaces", "status": "operational", "availability": 1.0 }
+    },
+    {
+      "type": "status_report",
+      "attributes": {
+        "title": "Hub API returning elevated 5xx errors",
+        "report_type": "incident",
+        "aggregate_state": "downtime",
+        "ends_at": null
+      }
+    }
+  ]
+}

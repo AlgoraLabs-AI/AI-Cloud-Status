@@ -1,0 +1,8 @@
+{
+  "page": { "name": "OpenAI" },
+  "status": {
+    "indicator": "none",
+    "description": "All Systems Operational"
+  },
+  "incidents": []
+}

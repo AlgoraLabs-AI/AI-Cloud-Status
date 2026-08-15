@@ -1,0 +1,24 @@
+{
+  "page": { "name": "Anthropic" },
+  "status": {
+    "indicator": "major",
+    "description": "Partial Outage"
+  },
+  "incidents": [
+    {
+      "name": "Elevated errors on the Messages API",
+      "status": "investigating",
+      "impact": "major"
+    },
+    {
+      "name": "Console latency",
+      "status": "monitoring",
+      "impact": "minor"
+    },
+    {
+      "name": "Old resolved incident",
+      "status": "resolved",
+      "impact": "minor"
+    }
+  ]
+}

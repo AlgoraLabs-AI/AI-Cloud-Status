@@ -1,0 +1,26 @@
+[
+  {
+    "service_name": "Amazon EC2",
+    "service": "ec2-us-east-1",
+    "summary": "Instances unreachable in a single Availability Zone",
+    "status": "3",
+    "region_name": "N. Virginia",
+    "arn": "arn:aws:health:us-east-1::event/EC2/AWS_EC2_OPERATIONAL_ISSUE/r1"
+  },
+  {
+    "service_name": "Amazon RDS",
+    "service": "rds-eu-west-1",
+    "summary": "Elevated query latency",
+    "status": "2",
+    "region_name": "Ireland",
+    "arn": "arn:aws:health:eu-west-1::event/RDS/AWS_RDS_OPERATIONAL_ISSUE/r2"
+  },
+  {
+    "service_name": "Amazon CloudFront",
+    "service": "cloudfront",
+    "summary": "Informational notice with no specific region",
+    "status": "1",
+    "region_name": "",
+    "arn": "arn:aws:health:::event/CLOUDFRONT/AWS_CLOUDFRONT_INFORMATIONAL/r3"
+  }
+]

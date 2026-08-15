@@ -1,0 +1,18 @@
+[
+  {
+    "service_name": "Amazon EC2",
+    "service": "ec2-us-east-1",
+    "summary": "Increased API error rates",
+    "status": "2",
+    "region_name": "N. Virginia",
+    "arn": "arn:aws:health:us-east-1::event/EC2/AWS_EC2_OPERATIONAL_ISSUE/abc123"
+  },
+  {
+    "service_name": "Amazon S3",
+    "service": "s3-us-west-2",
+    "summary": "Informational message",
+    "status": "1",
+    "region_name": "Oregon",
+    "arn": "arn:aws:health:us-west-2::event/S3/AWS_S3_INFORMATIONAL/def456"
+  }
+]

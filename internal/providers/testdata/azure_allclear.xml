@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Azure Status</title>
+    <item>
+      <title>Azure SQL Database - West Europe - Issue Resolved</title>
+      <description>This issue has been resolved.</description>
+    </item>
+  </channel>
+</rss>

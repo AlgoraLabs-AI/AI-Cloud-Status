@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:a10="http://www.w3.org/2005/Atom"
+  version="2.0">
+  <channel xmlns:slash="http://purl.org/rss/1.0/modules/slash/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wfw="http://wellformedweb.org/CommentAPI/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <title>Azure Status</title>
+    <link>https://azurestatusprodeus.azurewebsites.net/en-us/status/</link>
+    <description>Azure Status</description>
+    <language>en-us</language>
+    <lastBuildDate>Thu, 23 Jul 2026 16:49:55 Z</lastBuildDate>
+    <item>
+      <guid
+        isPermaLink="false">issues-connecting-to-resources-in-west-us</guid>
+      <link>https://azurestatusprodeus.azurewebsites.net/en-us/status/</link>
+      <category>Network Infrastructure</category>
+      <category>West US</category>
+      <title>Issues connecting to resources in West US </title>
+      <description>&lt;p&gt;Starting at 14:44 UTC on 23 July, 2026, we began investigating a networking issue affecting connectivity to Azure services in the West US region. Impacted customers may be experiencing intermittent connectivity failures, increased latency, or difficulty accessing Azure services. Customers with traffic traversing the West US region may also experience downstream impact.&lt;/p&gt;&lt;p&gt;Our investigation is currently focused on network infrastructure within the affected region. We have implemented mitigation actions on affected network components by removing the problematic devices from rotation, redirecting portions of traffic, and are actively monitoring traffic patterns and service recovery. Initial findings indicate the issue may be related to network path disruption within the affected infrastructure; however, analysis remains ongoing.&lt;/p&gt;&lt;p&gt;We continue to evaluate the effectiveness of mitigations, assess customer impact, and investigate contributing factors. We will provide additional information as it becomes available.&lt;/p&gt;</description>
+      <pubDate>Thu, 23 Jul 2026 16:29:09 Z</pubDate>
+    </item>
+  </channel>
+</rss>

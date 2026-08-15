@@ -1,0 +1,39 @@
+[
+  {
+    "id": "reg-high",
+    "external_desc": "Compute Engine VMs unreachable in multiple regions",
+    "begin": "2026-06-07T09:00:00Z",
+    "end": "",
+    "severity": "high",
+    "affected_products": [
+      { "title": "Google Compute Engine" }
+    ],
+    "currently_affected_locations": [
+      { "title": "Iowa (us-central1)", "id": "us-central1" },
+      { "title": "Belgium (europe-west1)", "id": "europe-west1" }
+    ]
+  },
+  {
+    "id": "reg-global",
+    "external_desc": "Cloud IAM global authentication delays",
+    "begin": "2026-06-07T08:00:00Z",
+    "end": "",
+    "severity": "medium",
+    "affected_products": [
+      { "title": "Cloud IAM" }
+    ]
+  },
+  {
+    "id": "resolved-region",
+    "external_desc": "Resolved BigQuery issue in asia-east1",
+    "begin": "2026-06-01T00:00:00Z",
+    "end": "2026-06-01T02:00:00Z",
+    "severity": "high",
+    "affected_products": [
+      { "title": "BigQuery" }
+    ],
+    "currently_affected_locations": [
+      { "title": "Taiwan (asia-east1)", "id": "asia-east1" }
+    ]
+  }
+]

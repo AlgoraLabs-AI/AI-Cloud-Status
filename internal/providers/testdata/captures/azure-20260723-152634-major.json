@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:a10="http://www.w3.org/2005/Atom"
+  version="2.0">
+  <channel xmlns:slash="http://purl.org/rss/1.0/modules/slash/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wfw="http://wellformedweb.org/CommentAPI/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <title>Azure Status</title>
+    <link>https://azurestatusprodwus.azurewebsites.net/en-us/status/</link>
+    <description>Azure Status</description>
+    <language>en-us</language>
+    <lastBuildDate>Thu, 23 Jul 2026 18:12:58 Z</lastBuildDate>
+    <item>
+      <guid
+        isPermaLink="false">issues-connecting-to-resources-in-west-us</guid>
+      <link>https://azurestatusprodwus.azurewebsites.net/en-us/status/</link>
+      <category>API Management</category>
+      <category>App Service</category>
+      <category>Azure Active Directory B2C</category>
+      <category>Azure Databricks</category>
+      <category>Azure Firewall</category>
+      <category>Azure Kubernetes Service (AKS)</category>
+      <category>Azure Cognitive Search</category>
+      <category>Azure VMware Solutions</category>
+      <category>Speech Services</category>
+      <category>ExpressRoute Circuits</category>
+      <category>ExpressRoute Gateways</category>
+      <category>Network Infrastructure</category>
+      <category>Power BI Embedded</category>
+      <category>Virtual WAN</category>
+      <category>West US</category>
+      <title>Issues connecting to resources in West US </title>
+      <description>&lt;p&gt;Starting at approximately 14:44 UTC on 23 July 2026, customers may have experienced intermittent connectivity failures, increased latency, or difficulty accessing Azure and other Microsoft cloud (&lt;a href="https://status.cloud.microsoft/" target="_blank"&gt;https://status.cloud.microsoft/&lt;/a&gt;) services associated with the West US region. Customers whose traffic traverses affected West US network infrastructure may also experience downstream impact. Impacted services include:&lt;/p&gt;&lt;p&gt;App Service, Application Gateway, Azure AD B2C, Azure AI Search, Azure API Management, Azure Bastion, Azure Bot Service, Azure Database for PostgreSQL - Flexible Server, Azure Databricks, Azure Firewall, Azure Kubernetes Service (AKS), Azure Virtual Desktop, Azure VMware Solution, ExpressRoute Circuits, ExpressRoute Gateways, Partner Center, Power BI Embedded, Virtual WAN, VPN Gateway&lt;/p&gt;&lt;p&gt;Current Status:&lt;/p&gt;&lt;p&gt;We may have identified the likely cause of the issue and are actively deploying mitigation actions. Based on our current progress, we expect to have additional information on the effectiveness of these actions within approximately 30 minutes. We are closely monitoring service recovery as this action is rolling out.&amp;nbsp;&lt;/p&gt;</description>
+      <pubDate>Thu, 23 Jul 2026 16:29:09 Z</pubDate>
+    </item>
+  </channel>
+</rss>

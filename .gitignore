@@ -1,0 +1,40 @@
+# Binaries
+/ai-status-pinger
+/ai-status-pinger.exe
+*.exe
+*.test
+*.out
+
+# Fyne packaging output
+*.app
+*.tar.xz
+fyne-cross/
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Agent / orchestrator session artifacts
+.ao/
+.claude/
+
+# Local working files (briefs, logo candidates) — never ship
+/local/
+acs.exe
+*.exe
+
+# Windows linker backup when overwriting a running exe
+*.exe~
+
+# aistack repo-scope artifacts (per-machine; not shipped)
+mempalace.yaml
+.serena/
+
+# graduation migration scaffold (per-machine, never shipped)
+graduation-manifest.json
+graduation-selection.json
+graduation-*.lock
+
+# Agent orchestrator config (per-machine tooling; not part of the product)
+agent-orchestrator.yaml
