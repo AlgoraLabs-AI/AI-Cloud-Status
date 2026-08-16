@@ -8,6 +8,8 @@ analysis.
 |---|---|
 | [macos-verification.md](macos-verification.md) | Build + test + hand-verification guide for macOS, focused on the paths that only a Mac can exercise. |
 | [platform-coverage.md](platform-coverage.md) | Which platforms each part of the code has actually been RUN on, versus merely compiled for. |
+| [2026-08-15-v1.0.0-release-and-soak.md](2026-08-15-v1.0.0-release-and-soak.md) | How v1.0.0 was cut, why the repo was deleted and recreated, and what the two memory soaks did and did not prove. |
+| [data/](data/) | Raw measurement output kept alongside the notes that cite it. |
 
 ## Current state
 
@@ -16,10 +18,17 @@ explicitly recorded as accepted; the suite is green across 15 packages, `go vet`
 is clean, and both non-Windows targets cross-compile (everything except
 `internal/ui`, which needs cgo and OpenGL and therefore cannot).
 
-**No release has been cut.** `v1.0.0` is gated on the macOS pass — see
-[macos-verification.md §6](macos-verification.md) for the checklist. The release
-workflow builds macOS and Linux binaries natively and would publish them without
-anyone ever having run the app on either.
+**`v1.0.0` is published** (2026-08-15) — Windows and macOS both hand-verified
+first; see [the release note](2026-08-15-v1.0.0-release-and-soak.md). `main` is a
+single commit: the repository was deleted and recreated rather than force-pushed,
+because a force-push leaves the old objects publicly readable by SHA (measured,
+not assumed).
+
+**Linux is still the open platform.** Its GUI has never been compiled or run by
+anyone; CI builds it and its tests pass, and that is all. The other open item
+worth a session is a memory soak with the window VISIBLE — both soaks so far ran
+with it hidden in the tray, which does not exercise the painting path the
+renderer leak lives in.
 
 Validated against production data, not only synthetic fixtures:
 

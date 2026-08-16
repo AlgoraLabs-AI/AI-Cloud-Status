@@ -100,14 +100,25 @@ confirm dialog in an app set to English.
 
 Still NOT verified on macOS, and worth a second pass:
 
-- **A long soak.** The app ran ~25 minutes, not the intended hour. RSS went
-  221 MB → 242 MB in the first 15 minutes and was still drifting up when the run
-  ended; that is probably caches warming, but it is not enough data to say the
-  Fyne renderer leak is gone here.
-- **`acs.log` rotation in the wild.** The unit tests cover it (including renaming
-  a file open for append, which is the platform-sensitive part), but the log grew
-  ~1 KB/min against an 8 MiB ceiling, so a live rotation is days away — it is not
-  something a verification session can sit through.
+- **A soak with the window VISIBLE.** Two soaks have now run — 62 minutes on
+  macOS, 45 on Windows — and both came out flat: macOS rose 13.5 MB in 20
+  minutes then held inside a 1.3 MB band, Windows actually *fell* 234 MB → 212 MB
+  with threads pinned at 29 and handles flat at ~756. Neither shows a leak.
+
+  But **both ran with the window hidden to the tray**, and the leak these were
+  chasing is the renderer/texture one described in `rowwidget.go` — the one the
+  per-row widget cache was built to fix — which is fed by PAINTING. `refreshLocked`
+  has no visibility guard, so the widget-tree half was exercised; the painting
+  half was not. What is established is therefore the narrow claim: *no leak in
+  the poll / update / log / capture path while idle in the tray*. Not "no leak".
+  The soak that answers the real question keeps the window visible and in the
+  foreground; instrument it to record window visibility per sample so one run
+  captures both phases and the slopes can be compared on the same process.
+- **`acs.log` rotation in the wild** — and it is now clear this can never be a
+  verification-session item. Measured growth is **924 B/min**, so reaching the
+  8 MiB ceiling takes **6.2 days**. Rotation is covered by unit tests only,
+  including the platform-sensitive part (renaming a file open for append). This
+  is closed as "not observable by design" rather than left as pending work.
 - **"Delete diagnostic data" end to end.** `TestDeleteDiagnosticsNeverTouchesUserState`
   passes here (it does not skip — the redirected `HOME` resolves), but the button
   itself has not been clicked on a Mac.
