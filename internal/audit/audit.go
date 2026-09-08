@@ -121,8 +121,8 @@ type Finding struct {
 // major incident as if it were still part of the old one — see
 // boundOpenIntervals.
 type MissingRecovery struct {
-	// Kind separates the two ways a window ends without a logged recovery. Its
-	// zero value is ClearedByCapture, the case that carries ClearedAt.
+	// Kind separates the ways a window ends without a logged recovery. Its zero
+	// value, KindUnset, asserts nothing — only ClearedByCapture carries ClearedAt.
 	Kind  MissingRecoveryKind
 	Start time.Time // when alert-log recorded the outage opening
 	// ClearedAt is the later capture proving it actually resolved. Set ONLY for
@@ -142,10 +142,19 @@ type MissingRecovery struct {
 type MissingRecoveryKind int
 
 const (
+	// KindUnset is the zero value ON PURPOSE, and it asserts nothing.
+	//
+	// The original defect in this file was a formatter printing a zero ClearedAt
+	// as a real clearance time. Making the ASSERTING kind the zero value would
+	// leave that one careless `MissingRecovery{Start: x}` away from returning —
+	// forever, in every future formatter, decode path and copy. Defending each
+	// consumer with an `IsZero()` guard patches the call sites; making the zero
+	// value non-asserting removes the class.
+	KindUnset MissingRecoveryKind = iota
 	// ClearedByCapture: a later capture read below Major, so the feed proves the
 	// incident really did resolve and only the recovery ALERT is missing — a
 	// delivery/logging gap, not a false outage.
-	ClearedByCapture MissingRecoveryKind = iota
+	ClearedByCapture
 	// BoundedByHorizon: nothing ever corroborated the window closing, and the
 	// record continued past the point it stopped being supported, so the window
 	// was closed by policy to stop it certifying every later capture. There is NO
@@ -307,11 +316,19 @@ type Report struct {
 	// A reader that cannot see which tier a verdict came from will trust a green
 	// report whose entire capture corpus was empty.
 	//
-	// HistoryPresent means USABLE: the file was there AND it parsed. The other
-	// two exist so a corrupt file cannot masquerade as either a healthy tier or a
-	// missing one — HistoryFound says the file was on disk, and HistoryErr says
-	// why it could not be used. Reporting "absent" for a file that is present but
-	// unreadable hides the evidence loss instead of naming it.
+	// HistoryPresent means the coverage tier can actually ANSWER: the file was
+	// there, it parsed, AND it holds at least one coverage entry. All three are
+	// required — an install upgraded to this build has a clean, parseable
+	// history.json with no coverage key at all, and calling that "tier present"
+	// while every verdict resolves to unknown is the contradiction the tier line
+	// exists to prevent.
+	//
+	// The other two make the three failure modes distinguishable, because a
+	// consumer that cannot tell them apart reports an evidence LOSS as a gap:
+	//   HistoryFound=false                     -> no file
+	//   HistoryFound=true, HistoryErr!=""      -> present, unreadable (loss)
+	//   HistoryFound=true, HistoryErr=="",
+	//     HistoryPresent=false                 -> readable, no coverage yet
 	HistoryPresent bool
 	HistoryFound   bool
 	HistoryErr     string
@@ -440,11 +457,6 @@ func Run(dir string) (Report, error) {
 	report := Report{
 		GeneratedAt:    time.Now(),
 		AlertLogStart:  alertStart,
-		// PRESENT means the tier can actually answer, which needs coverage DATA,
-		// not merely a file that parsed. An upgraded install's pre-change
-		// history.json parses cleanly and holds no coverage key at all — reporting
-		// that as "coverage tier present" while every verdict resolves to unknown
-		// is exactly the contradiction the tier line exists to prevent.
 		HistoryPresent: histFound && herr == nil && len(coverage) > 0,
 		HistoryFound:   histFound,
 		HistoryErr:     histErr,

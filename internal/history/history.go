@@ -136,6 +136,14 @@ type CoverageEntry struct {
 	ConsecutiveFailures int `json:"cf,omitempty"`
 }
 
+// failureRunGap is how long a silence may be before the next failure starts a
+// NEW run rather than extending the old one.
+//
+// Generous on purpose: it only has to be longer than a normal poll interval and
+// shorter than "the app was closed for a while", and erring long merely delays a
+// verdict rather than inventing one.
+const failureRunGap = time.Hour
+
 // CoverageObservation is one poll's worth of attendance, as reported by the
 // caller that actually made the request.
 //
@@ -280,6 +288,14 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// still the best explanation we have for why this provider was failing
 		// before the link dropped, and do NOT advance the failure run.
 	default:
+		// A "run" has to be contiguous to mean anything. Without this, nine
+		// failures, a month with the app closed, and one failure on relaunch add
+		// up to ten and read as sustained — a span with a working feed in the
+		// middle of it. Only a success resets the counter otherwise, and a long
+		// silence is not a success.
+		if !cov.LastInformative.IsZero() && obs.At.Sub(cov.LastInformative) > failureRunGap {
+			cov.ConsecutiveFailures = 0
+		}
 		cov.LastInformative = obs.At
 		cov.LastFailureClass = obs.FailureClass
 		cov.ConsecutiveFailures++

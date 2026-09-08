@@ -16,7 +16,10 @@
 //   - an Uncovered finding
 //   - a provider whose captures ALL currently fail to parse
 //   - an outage whose recovery was never logged, of either kind
-//   - a feed the coverage record shows was polled and never read (see hasIssues)
+//   - a feed whose coverage record shows a SUSTAINED, RECENT run of failed
+//     reads. Not "never read": a feed that worked for months and then broke is
+//     the case this exists for, so the verdict keys on the current failure run
+//     rather than on whether a success has ever been recorded (see hasIssues)
 //   - a continuity window left unclosed
 //
 // A never-captured provider is deliberately NOT in that list — zero captures is
@@ -134,10 +137,16 @@ func printContinuity(w io.Writer, r audit.ContinuityReport) {
 // produces. AllCapturesUnparseable covers the broken-parser case with actual
 // evidence.
 //
-// The per-provider last-successful-poll this comment used to say did not exist
-// now does — history.CoverageEntry — so FeedBroken IS a fault: the feed was
-// polled and never once read, which is positive evidence rather than the absence
-// NeverCaptured reports.
+// The per-provider attendance record this comment used to say did not exist now
+// does — history.CoverageEntry — so FeedBroken IS a fault: it means a sustained,
+// recent run of attempts that all failed to read the feed. That is positive
+// evidence, unlike the absence NeverCaptured reports.
+//
+// Note what it does NOT mean: "never read". A feed that worked for months and
+// then broke is precisely the case this exists to catch, so the verdict keys on
+// the CURRENT failure run, not on whether a success has ever been recorded — an
+// earlier version keyed on the latter and could never fire in production, since
+// any working launch records a success within a minute.
 //
 // The two tiers are judged SEPARATELY and neither is inferred from the other: no
 // capture-tier verdict rests on coverage data, and the coverage verdict never
@@ -226,9 +235,14 @@ func printReport(w io.Writer, r audit.Report) {
 				note = fmt.Sprintf("  <- FEED NOT READABLE: %d consecutive failures (last: %s) — see the section below",
 					p.Coverage.ConsecutiveFailures, p.Coverage.LastFailureClass)
 			case audit.FeedHealthy:
-				// humanAge already ends in "ago" (or is "just now"); appending
-				// another produced "5m ago ago" and "just now ago".
-				note = fmt.Sprintf("  <- no captures because it was healthy: feed last read %s",
+				// States what the record actually holds, and nothing more. The
+				// coverage entry is a high-water mark with no history — a success
+				// clears the failure run behind it — so "no captures BECAUSE it was
+				// healthy" would certify a whole window from one poll. That is the
+				// unobserved-claim class this whole change set is about.
+				//
+				// humanAge already ends in "ago" (or is "just now").
+				note = fmt.Sprintf("  <- no captures on record; the last poll DID read the feed, %s",
 					humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)))
 			default:
 				// Advisory only — it does not fail the run. See hasIssues. This

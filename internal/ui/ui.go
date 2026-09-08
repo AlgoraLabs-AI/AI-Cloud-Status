@@ -328,6 +328,31 @@ func feedOutcome(k providers.FeedFailure) string {
 	}
 }
 
+// coverageObservation builds the attendance record for one completed check.
+//
+// One definition, because there are two callers and the blindness rule is subtle
+// enough that a copy would drift: a future non-informative case added here must
+// not be missed on the other path.
+//
+// offline is a PARAMETER rather than a read, because the callers legitimately
+// have different right answers — a poll round uses one snapshot for every
+// provider so they are judged alike, while a one-off recheck uses the state at
+// the moment it ran.
+func coverageObservation(st provState, offline bool) history.CoverageObservation {
+	return history.CoverageObservation{
+		At:      st.when,
+		OK:      st.outcome == history.OutcomeReadable,
+		Skipped: st.skipped,
+		// A poll that never got an answer from the feed — because the machine had
+		// no link, or because shutdown cancelled it — is an attempt that carries
+		// no verdict about the feed.
+		Blind: st.err != nil && (offline || errors.Is(st.err, context.Canceled)),
+		// RecordCoverage reads this only on the branch where the poll really
+		// failed, where st.outcome is already the failure class.
+		FailureClass: st.outcome,
+	}
+}
+
 // carryLastOK folds the previous state's lastOK into a fresh observation: a
 // readable feed stamps it now, an unreadable one inherits it. Without the
 // inherit, one failed poll erases the app's memory of when it last saw the
@@ -1532,15 +1557,7 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			// never got an answer from the feed, so counting it would let a user
 			// who launches and quits during the poll window accumulate failures no
 			// provider ever produced — and that now reaches the audit's exit code.
-			c.history.RecordCoverage(p.ID, history.CoverageObservation{
-				At:           st.when,
-				OK:           st.outcome == history.OutcomeReadable,
-				Skipped:      st.skipped,
-				Blind:        st.err != nil && (offlineAtRoundStart || errors.Is(st.err, context.Canceled)),
-				// RecordCoverage reads FailureClass only on the branch where the
-				// poll really failed, and st.outcome is already the class there.
-				FailureClass: st.outcome,
-			})
+			c.history.RecordCoverage(p.ID, coverageObservation(st, offlineAtRoundStart))
 
 			// Journal every incident the feed currently lists so the detail
 			// panel can show a last-24h history after they resolve. Recorded
@@ -1727,17 +1744,19 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		c.mu.Lock()
 		c.provStates[p.ID] = st
 		c.mu.Unlock()
-		// A manual Retry is a look, and coverage's whole question is "was anyone
-		// watching, and did the look succeed". Leaving it out let the user watch a
-		// feed read successfully while the attendance record still counted it as
-		// failing — and that record now drives the audit's exit code.
-		c.history.RecordCoverage(p.ID, history.CoverageObservation{
-			At:           st.when,
-			OK:           st.outcome == history.OutcomeReadable,
-			Skipped:      st.skipped,
-			Blind:        st.err != nil && (c.offline.Offline() || errors.Is(st.err, context.Canceled)),
-			FailureClass: st.outcome,
-		})
+		// Only a SUCCESSFUL manual retry is recorded. Its value is letting the
+		// user's own observation clear a failure run they just watched end —
+		// otherwise the record contradicts what they are looking at, and that
+		// record now drives the audit's exit code.
+		//
+		// Its FAILURES are deliberately not recorded. The scheduled path is
+		// rate-limited to one increment per poll round; this one is rate-limited
+		// only by how fast someone can click, so counting failures here would let
+		// ten clicks in a minute manufacture exactly the "sustained run" the
+		// verdict exists to require.
+		if obs := coverageObservation(st, c.offline.Offline()); obs.OK {
+			c.history.RecordCoverage(p.ID, obs)
+		}
 		c.refresh()
 	}()
 }

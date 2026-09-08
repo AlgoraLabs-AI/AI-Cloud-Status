@@ -129,12 +129,20 @@ func TestMissingRecoveryKindIsExplicit(t *testing.T) {
 		t.Error("BoundedByHorizon must be distinguishable from ClearedByCapture without reading ClearedAt")
 	}
 
-	// The zero value of the struct is the cleared kind, which is what keeps every
-	// pre-existing MissingRecovery{Start, ClearedAt} construction meaning what it
-	// always meant.
+	// The zero value must assert NOTHING. Making the asserting kind the zero
+	// value would leave the original fabricated-timestamp defect one careless
+	// `MissingRecovery{Start: x}` away from returning, in every future formatter
+	// and decode path. This invariant is what removes that class, rather than
+	// each consumer defending against it.
 	var zero MissingRecovery
-	if zero.Kind != ClearedByCapture {
-		t.Errorf("zero MissingRecovery Kind = %v, want ClearedByCapture", zero.Kind)
+	if zero.Kind == ClearedByCapture {
+		t.Error("the zero value is the kind that ASSERTS a clearance; a careless construction would fabricate a timestamp")
+	}
+	if zero.Kind != KindUnset {
+		t.Errorf("zero MissingRecovery Kind = %v, want KindUnset", zero.Kind)
+	}
+	if !zero.ClearedAt.IsZero() {
+		t.Error("precondition: a zero MissingRecovery has no clearance time")
 	}
 }
 
