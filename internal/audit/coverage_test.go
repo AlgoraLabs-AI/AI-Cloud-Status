@@ -108,8 +108,8 @@ func TestFeedVerdictThreeWay(t *testing.T) {
 func TestMissingRecoveryKindIsExplicit(t *testing.T) {
 	opened := time.Now().Add(-2 * time.Hour)
 	cleared := MissingRecovery{Kind: ClearedByCapture, Start: opened, ClearedAt: time.Now()}
-	if cleared.Kind != ClearedByCapture {
-		t.Error("ClearedByCapture must be the zero value so existing constructions stay correct")
+	if cleared.Kind == KindUnset {
+		t.Error("an explicitly-cleared finding must not read as the unset kind")
 	}
 	if cleared.ClearedAt.IsZero() {
 		t.Error("a ClearedByCapture finding must carry the capture time that proves it")

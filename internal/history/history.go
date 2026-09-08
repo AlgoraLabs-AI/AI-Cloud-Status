@@ -136,12 +136,13 @@ type CoverageEntry struct {
 	ConsecutiveFailures int `json:"cf,omitempty"`
 }
 
-// failureRunGap is how long a silence may be before the next failure starts a
-// NEW run rather than extending the old one.
+// failureRunGap is the FALLBACK gap, used only when an observation supplies
+// none. See CoverageObservation.RunGap: a caller that knows the poll cadence
+// must pass one, because the cadence is user-configurable with no upper bound
+// and a constant cannot be "longer than a normal poll interval" for a user who
+// chose a longer one.
 //
-// Generous on purpose: it only has to be longer than a normal poll interval and
-// shorter than "the app was closed for a while", and erring long merely delays a
-// verdict rather than inventing one.
+// Erring long merely delays a verdict; erring short prevents one entirely.
 const failureRunGap = time.Hour
 
 // CoverageObservation is one poll's worth of attendance, as reported by the
@@ -166,6 +167,15 @@ type CoverageObservation struct {
 	// intended.
 	Skipped      bool
 	FailureClass string
+	// RunGap is how long a silence may be before the next failure starts a NEW
+	// run instead of extending the old one. Zero falls back to failureRunGap.
+	//
+	// It is supplied by the caller because only the caller knows the poll
+	// cadence, and the cadence is user-configurable with no ceiling. A constant
+	// here would be wrong for anyone who slows polling past it: every failure
+	// would land after the gap, reset the counter, and pin it at one forever, so
+	// the sustained-failure verdict could never fire at all.
+	RunGap time.Duration
 }
 
 // History is a concurrency-safe collection of per-check ring buffers.
@@ -274,6 +284,15 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		h.coverage = map[string]CoverageEntry{}
 	}
 	cov := h.coverage[id]
+	// High-water mark, as the field's own doc says — so enforce it. Two polls for
+	// one provider can complete out of order: a scheduled round that started
+	// earlier can finish AFTER a manual retry that started later, and recording
+	// its older result would move LastInformative backward, resurrect a failure
+	// run the user just watched clear, and drop the verdict from healthy to
+	// inconclusive about a feed they are looking at working.
+	if !obs.At.After(cov.LastAttempt) && !cov.LastAttempt.IsZero() {
+		return
+	}
 	cov.LastAttempt = obs.At
 	switch {
 	case obs.OK:
@@ -293,7 +312,11 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// up to ten and read as sustained — a span with a working feed in the
 		// middle of it. Only a success resets the counter otherwise, and a long
 		// silence is not a success.
-		if !cov.LastInformative.IsZero() && obs.At.Sub(cov.LastInformative) > failureRunGap {
+		gap := obs.RunGap
+		if gap <= 0 {
+			gap = failureRunGap
+		}
+		if !cov.LastInformative.IsZero() && obs.At.Sub(cov.LastInformative) > gap {
 			cov.ConsecutiveFailures = 0
 		}
 		cov.LastInformative = obs.At

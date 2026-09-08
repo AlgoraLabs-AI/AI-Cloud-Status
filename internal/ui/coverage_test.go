@@ -43,6 +43,25 @@ func TestCoverageObservation(t *testing.T) {
 			want:    history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeTransport},
 		},
 		{
+			// THE case the whole record exists for. The offline latch trips when
+			// EVERY enabled provider fails at once, which is exactly what a
+			// fleet-wide feed outage looks like. If the latch alone decided
+			// blindness, that outage would be recorded as "we could not see" from
+			// round two onward and the verdict could never fire. An HTTP status
+			// proves the server answered, so it is evidence regardless.
+			name:    "HTTP failure is NEVER blind, even with the offline latch set",
+			st:      provState{when: at, outcome: history.OutcomeHTTP, err: errors.New("unexpected status 405")},
+			offline: true,
+			want:    history.CoverageObservation{At: at, FailureClass: history.OutcomeHTTP},
+		},
+		{
+			// Same reasoning: bytes arrived, they just did not parse.
+			name:    "parse failure is never blind either",
+			st:      provState{when: at, outcome: history.OutcomeParse, err: errors.New("bad json")},
+			offline: true,
+			want:    history.CoverageObservation{At: at, FailureClass: history.OutcomeParse},
+		},
+		{
 			// Shutdown cancelled the request; the feed never answered.
 			name: "cancelled at shutdown is blind even when online",
 			st:   provState{when: at, outcome: history.OutcomeTransport, err: context.Canceled},
@@ -65,7 +84,7 @@ func TestCoverageObservation(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := coverageObservation(tc.st, tc.offline)
+			got := coverageObservation(tc.st, tc.offline, 0)
 			if got != tc.want {
 				t.Errorf("coverageObservation() = %+v, want %+v", got, tc.want)
 			}
@@ -82,14 +101,14 @@ func TestCoverageObservationFeedsRecordCoverageCorrectly(t *testing.T) {
 
 	// One real read, then the link dies and stays dead for twenty rounds.
 	h.RecordCoverage("p", coverageObservation(
-		provState{when: t0, outcome: history.OutcomeReadable}, false))
+		provState{when: t0, outcome: history.OutcomeReadable}, false, time.Hour))
 	for i := range 20 {
 		st := provState{
 			when:    t0.Add(time.Duration(i+1) * time.Minute),
 			outcome: history.OutcomeTransport,
 			err:     errors.New("no such host"),
 		}
-		h.RecordCoverage("p", coverageObservation(st, true))
+		h.RecordCoverage("p", coverageObservation(st, true, time.Hour))
 	}
 
 	cov, ok := h.Coverage("p")

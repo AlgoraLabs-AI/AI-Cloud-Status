@@ -112,11 +112,11 @@ func TestPrintReportShowsCoverageFaultEvenWithCaptures(t *testing.T) {
 // TestPrintReportSurvivesAZeroKindFinding closes the hole the Kind
 // discriminator leaves open on its own.
 //
-// ClearedByCapture is the ZERO value of MissingRecoveryKind, so any future
-// construction that omits Kind — or any decode/copy path that zeroes it — lands
-// on the branch that prints ClearedAt, with ClearedAt zero. That is the original
-// fabricated-timestamp defect, verbatim, reachable without anyone writing a bug.
-// The formatter must not depend on every author remembering the doc.
+// The zero Kind is KindUnset and asserts nothing, so a finding built without
+// naming a Kind falls to the bounded pass — that is the primary defence, and it
+// is what this asserts. The formatter's ClearedAt check is the second one, for a
+// finding that CLAIMS ClearedByCapture without carrying a time; either way,
+// nothing may print a fabricated clearance.
 func TestPrintReportSurvivesAZeroKindFinding(t *testing.T) {
 	r := audit.Report{
 		GeneratedAt:    time.Now(),
@@ -184,12 +184,26 @@ func TestPrintReportKeepsTheTwoKindsApart(t *testing.T) {
 func TestPrintReportEvidenceTierStates(t *testing.T) {
 	base := audit.Report{GeneratedAt: time.Now()}
 
+	withCaptures := audit.Report{
+		GeneratedAt: base.GeneratedAt, HistoryPresent: true, HistoryFound: true,
+		AlertLogStart: base.GeneratedAt.Add(-24 * time.Hour),
+		Providers:     []audit.ProviderReport{{ID: "a", TotalCaptures: 3}},
+	}
+
 	cases := []struct {
 		name string
 		r    audit.Report
 		want string
 	}{
-		{"usable", audit.Report{GeneratedAt: base.GeneratedAt, HistoryPresent: true, HistoryFound: true}, "Both present"},
+		{"both tiers really present", withCaptures, "Both present"},
+		{
+			// The default install: diagnostics off, so the capture tier is empty.
+			// Announcing "both present" here asserts a tier the line never looked
+			// at, and an empty capture corpus reads identically to a clean one.
+			"coverage only — capture tier empty",
+			audit.Report{GeneratedAt: base.GeneratedAt, HistoryPresent: true, HistoryFound: true},
+			"CAPTURE tier is EMPTY",
+		},
 		{"corrupt", audit.Report{GeneratedAt: base.GeneratedAt, HistoryFound: true, HistoryErr: "unexpected end of JSON input"}, "could NOT be read"},
 		{"absent", base, "is absent"},
 	}

@@ -334,23 +334,49 @@ func feedOutcome(k providers.FeedFailure) string {
 // enough that a copy would drift: a future non-informative case added here must
 // not be missed on the other path.
 //
-// offline is a PARAMETER rather than a read, because the callers legitimately
-// have different right answers — a poll round uses one snapshot for every
-// provider so they are judged alike, while a one-off recheck uses the state at
-// the moment it ran.
-func coverageObservation(st provState, offline bool) history.CoverageObservation {
+// offline is a PARAMETER rather than a read so a whole poll round can be judged
+// against one snapshot: reading the latch per provider lets a link dropping
+// mid-round give some of them a real failure and others a blind one.
+//
+// runGap likewise comes from the caller, which is the only side that knows the
+// configured poll cadence — see CoverageObservation.RunGap.
+func coverageObservation(st provState, offline bool, runGap time.Duration) history.CoverageObservation {
 	return history.CoverageObservation{
 		At:      st.when,
 		OK:      st.outcome == history.OutcomeReadable,
 		Skipped: st.skipped,
+		RunGap:  runGap,
 		// A poll that never got an answer from the feed — because the machine had
 		// no link, or because shutdown cancelled it — is an attempt that carries
 		// no verdict about the feed.
-		Blind: st.err != nil && (offline || errors.Is(st.err, context.Canceled)),
+		//
+		// But an answer we DID receive can never be blind, whatever the offline
+		// latch says, and that exception is load-bearing rather than tidy. The
+		// latch itself trips when every enabled provider fails at once
+		// (monitor.Evaluate's all-unreachable rule), so a fleet-wide feed outage
+		// — every provider on one Statuspage host answering 405, which is the
+		// incident this whole record exists for — would latch offline on round 1
+		// and then record every later round as blind. The failure counter would
+		// freeze at one and the verdict could never fire, for days, while the
+		// user saw nothing.
+		//
+		// An HTTP status or a parse failure proves the server answered over
+		// HTTPS. That is evidence about the feed by construction, so it is judged
+		// on its own and never deferred to a machine-wide guess.
+		Blind: st.err != nil && !answeredOverHTTP(st.outcome) &&
+			(offline || errors.Is(st.err, context.Canceled)),
 		// RecordCoverage reads this only on the branch where the poll really
 		// failed, where st.outcome is already the failure class.
 		FailureClass: st.outcome,
 	}
+}
+
+// answeredOverHTTP reports whether the outcome proves the far end actually
+// replied — a non-200 status, or bytes that did not parse. Both mean the
+// request completed over HTTPS, so the result says something about THIS feed no
+// matter what the machine-wide offline latch believes.
+func answeredOverHTTP(outcome string) bool {
+	return outcome == history.OutcomeHTTP || outcome == history.OutcomeParse
 }
 
 // carryLastOK folds the previous state's lastOK into a fresh observation: a
@@ -1491,6 +1517,11 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	// the sustained run a verdict needs. Recording coverage after the round
 	// completes would close even that, at the cost of restructuring the hot path.
 	offlineAtRoundStart := c.offline.Offline()
+	// Three rounds of silence, derived from the CONFIGURED cadence rather than a
+	// constant: the interval has no ceiling, and a fixed gap shorter than the
+	// user's interval would reset the failure counter on every single failure and
+	// make the sustained-failure verdict unreachable.
+	roundGap := 3 * c.providerInterval()
 	var wg sync.WaitGroup
 	for _, p := range list {
 		wg.Add(1)
@@ -1557,7 +1588,7 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			// never got an answer from the feed, so counting it would let a user
 			// who launches and quits during the poll window accumulate failures no
 			// provider ever produced — and that now reaches the audit's exit code.
-			c.history.RecordCoverage(p.ID, coverageObservation(st, offlineAtRoundStart))
+			c.history.RecordCoverage(p.ID, coverageObservation(st, offlineAtRoundStart, roundGap))
 
 			// Journal every incident the feed currently lists so the detail
 			// panel can show a last-24h history after they resolve. Recorded
@@ -1754,7 +1785,11 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		// only by how fast someone can click, so counting failures here would let
 		// ten clicks in a minute manufacture exactly the "sustained run" the
 		// verdict exists to require.
-		if obs := coverageObservation(st, c.offline.Offline()); obs.OK {
+		// Only OK observations survive the guard below, and RecordCoverage reads
+		// Blind only on the failure branch — so passing the live offline state
+		// here would take a mutex for a value that can never be read. false says
+		// what the code does.
+		if obs := coverageObservation(st, false, 3*c.providerInterval()); obs.OK {
 			c.history.RecordCoverage(p.ID, obs)
 		}
 		c.refresh()

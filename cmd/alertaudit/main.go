@@ -187,10 +187,24 @@ func printReport(w io.Writer, r audit.Report) {
 	// and the alert log exist only while diagnostics are enabled, so on a default
 	// install both are empty and every capture-tier verdict below is vacuous —
 	// which reads identically to "all clear" unless the report says otherwise.
+	// The capture half has to be CHECKED, not assumed. Announcing "both present"
+	// off HistoryPresent alone asserts a tier this line never looked at — and on
+	// a default install with diagnostics off that tier is entirely empty, which
+	// is the precise misreading this line exists to prevent.
+	captureTier := !r.AlertLogStart.IsZero()
+	for _, p := range r.Providers {
+		if p.TotalCaptures > 0 {
+			captureTier = true
+			break
+		}
+	}
 	switch {
-	case r.HistoryPresent:
+	case r.HistoryPresent && captureTier:
 		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier (feed-samples + alert-log, written only while diagnostics are on) "+
 			"and COVERAGE tier (history.json, always written). Both present.")
+	case r.HistoryPresent:
+		fmt.Fprintln(w, "Evidence tiers: COVERAGE tier only (history.json). The CAPTURE tier is EMPTY — no alert log and no "+
+			"captures — so every capture-tier verdict below is vacuous rather than clean. Diagnostics are off by default.")
 	case r.HistoryFound && r.HistoryErr != "":
 		// Present but unusable. Saying "absent" here would report an evidence
 		// LOSS as an evidence gap, and the two need different responses.
@@ -242,7 +256,11 @@ func printReport(w io.Writer, r audit.Report) {
 				// unobserved-claim class this whole change set is about.
 				//
 				// humanAge already ends in "ago" (or is "just now").
-				note = fmt.Sprintf("  <- no captures on record; the last poll DID read the feed, %s",
+				// "the last poll that learned anything", not "the last poll":
+				// FeedHealthy is defined on the last INFORMATIVE observation, and
+				// blind or skipped polls after it keep advancing LastAttempt. The
+				// shorter sentence would claim a read for polls that read nothing.
+				note = fmt.Sprintf("  <- no captures on record; the last poll that learned anything DID read the feed, %s",
 					humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)))
 			default:
 				// Advisory only — it does not fail the run. See hasIssues. This
@@ -286,12 +304,12 @@ func printReport(w io.Writer, r audit.Report) {
 	anyCleared, anyBounded := false, false
 	for _, p := range r.Providers {
 		for _, m := range p.MissingRecoveries {
-			// Belt and braces: ClearedByCapture is the ZERO value of Kind, so any
-			// future MissingRecovery built without naming one lands here with a
-			// zero ClearedAt and would print the fabricated timestamp all over
-			// again. The doc says "read Kind, never ClearedAt.IsZero()" — that is
-			// the right rule for a reader, and a bad thing for a FORMATTER to
-			// depend on every author remembering.
+			// The zero Kind is KindUnset, which asserts nothing, so a finding
+			// built without naming a Kind already falls to the other pass. The
+			// ClearedAt check is the remaining belt-and-braces: a finding that
+			// CLAIMS ClearedByCapture without carrying a time would still print a
+			// fabricated one, and a formatter should not depend on every producer
+			// keeping those two fields in step.
 			if m.Kind != audit.ClearedByCapture || m.ClearedAt.IsZero() {
 				continue
 			}
