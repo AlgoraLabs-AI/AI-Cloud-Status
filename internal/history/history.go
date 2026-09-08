@@ -80,9 +80,16 @@ type Sample struct {
 	// Outcome says WHY Unknown is set, which the bool alone cannot: Unknown
 	// collapses an unreadable feed and a deliberately skipped check into one
 	// value, so a reader that treats every Unknown as a broken feed misreads an
-	// Optional provider that has no feed at all. Empty on samples written before
-	// this field existed, and on the ping and custom-URL paths, which never set
-	// Unknown — there, failing to respond IS the monitored signal.
+	// Optional provider that has no feed at all.
+	//
+	// Written ONLY on Unknown samples, and only by the provider path. It is empty
+	// on every up/down sample, on samples written before the field existed, and
+	// on custom-URL Unknown samples — which DO occur: urlchecks records Unknown
+	// when a probe fails while the machine is offline. A reader must therefore
+	// treat an empty Outcome on an Unknown sample as "cause not recorded", never
+	// as a specific cause. (The older note at the top of this struct claiming
+	// custom URL checks never set Unknown is wrong; it is left alone here rather
+	// than edited from a distance, but do not rely on it.)
 	Outcome string `json:"oc,omitempty"`
 }
 
@@ -119,6 +126,32 @@ type CoverageEntry struct {
 	// never-succeeded check would serialize a zero time rather than omit it.
 	LastSuccess      time.Time `json:"ls,omitzero"`
 	LastFailureClass string    `json:"lfc,omitempty"`
+	// ConsecutiveFailures counts failed attempts since the last success. It is
+	// the field that makes a verdict possible at all: LastSuccess alone says only
+	// that the feed worked ONCE, and since a working launch stamps it within a
+	// minute, "has ever succeeded" is true for every provider almost immediately
+	// and can never again indicate a fault. What distinguishes a feed that is
+	// broken right now is that attempts keep failing AFTER the last success.
+	//
+	// It does NOT advance while the machine itself is offline — see
+	// CoverageObservation.Blind. Counting those would blame every provider for
+	// the user's own router.
+	ConsecutiveFailures int `json:"cf,omitempty"`
+}
+
+// CoverageObservation is one poll's worth of attendance, as reported by the
+// caller that actually made the request.
+//
+// Blind is the load-bearing field. It marks an attempt that tells us nothing
+// about THIS feed because the machine had no connectivity at all — the same
+// distinction internal/ui already draws on the custom-URL path before feeding
+// its failure tracker. A blind attempt still records that someone was watching;
+// it must never count as evidence against the provider.
+type CoverageObservation struct {
+	At           time.Time
+	OK           bool
+	Blind        bool
+	FailureClass string
 }
 
 // History is a concurrency-safe collection of per-check ring buffers.
@@ -220,21 +253,64 @@ func (h *History) Last(id string) (time.Time, int) {
 // failureClass is one of the Outcome constants, or "" on success. Callers on the
 // ping and custom-URL paths do not use this — coverage answers "could the feed be
 // read", which is only a question for checks that HAVE a feed.
-func (h *History) RecordCoverage(id string, at time.Time, ok bool, failureClass string) {
+func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.coverage == nil { // a History built by a zero literal rather than New
 		h.coverage = map[string]CoverageEntry{}
 	}
 	cov := h.coverage[id]
-	cov.LastAttempt = at
-	if ok {
-		cov.LastSuccess = at
+	cov.LastAttempt = obs.At
+	switch {
+	case obs.OK:
+		cov.LastSuccess = obs.At
 		cov.LastFailureClass = ""
-	} else {
-		cov.LastFailureClass = failureClass
+		cov.ConsecutiveFailures = 0
+	case obs.Blind:
+		// The machine had no connectivity, so this attempt is not evidence about
+		// this feed. Record that we looked; change nothing else — in particular do
+		// NOT clear a real failure class, which is still the best explanation we
+		// have for why this provider was failing before the link dropped.
+	default:
+		cov.LastFailureClass = obs.FailureClass
+		cov.ConsecutiveFailures++
 	}
 	h.coverage[id] = cov
+}
+
+// LoadCoverage reads ONLY the coverage map from a history file.
+//
+// A reader that wants the ~15 attendance entries should not pay for the ring:
+// Load unmarshals every retained sample and then deep-copies each series into a
+// fresh slice, which on a mature install is megabytes of parsing and copying for
+// a map that fits in a kilobyte. alertaudit reads this file twice in one run, so
+// the difference is doubled.
+//
+// The three returns are deliberately distinct, because a reader that cannot tell
+// them apart will report a corrupt file as an absent one:
+//   - (nil, false, nil)  the file does not exist
+//   - (nil, true, err)   it exists and could not be read or parsed
+//   - (map, true, nil)   it was read; the map may still be empty
+func LoadCoverage(path string) (map[string]CoverageEntry, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, true, err
+	}
+	// Only the coverage key is decoded; the series are skipped rather than
+	// materialized.
+	var snap struct {
+		Coverage map[string]CoverageEntry `json:"coverage"`
+	}
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, true, err
+	}
+	if snap.Coverage == nil {
+		snap.Coverage = map[string]CoverageEntry{}
+	}
+	return snap.Coverage, true, nil
 }
 
 // Coverage returns check id's attendance record and whether one exists.
@@ -302,11 +378,15 @@ func (h *History) Uptime(id string) (float64, bool) {
 	}
 	up, known := 0, 0
 	for _, s := range buf {
-		// Unknown samples are neither up nor down, so they belong in neither
-		// half of the ratio. Counting them in the denominator — which this did
-		// until 2026-09-08 — reports a check whose feed was unreadable all
-		// window as though it had been DOWN all window, contradicting the
-		// Sample doc above and inverting the one signal a reader wants.
+		// Unknown samples are neither up nor down, so they belong in neither half
+		// of the ratio: counting them in the denominator reads a check whose feed
+		// was unreadable all window as though it had been DOWN all window.
+		//
+		// This function has NO production callers — every displayed and sorted
+		// uptime goes through Controller.regionUptime, the muting-aware
+		// replacement, which already excluded unknown samples. So no user ever saw
+		// that reading; this aligns the helper with the contract Sample's own doc
+		// states, rather than fixing a shipped defect.
 		if s.Unknown {
 			continue
 		}

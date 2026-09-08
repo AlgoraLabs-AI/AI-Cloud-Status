@@ -20,7 +20,8 @@ func TestHasIssuesCoverageTier(t *testing.T) {
 
 	brokenFeed := audit.Report{HistoryPresent: true, Providers: []audit.ProviderReport{
 		{ID: "a", Enabled: true, HasPublicFeed: true, TotalCaptures: 0, HasCoverage: true,
-			Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeHTTP}},
+			Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeHTTP,
+				ConsecutiveFailures: 25}},
 	}}
 	if !hasIssues(brokenFeed) {
 		t.Error("hasIssues(feed polled and never read) = false; that is positive evidence of a broken feed, not an absence")
@@ -58,7 +59,8 @@ func TestHasIssuesDoesNotMixTiers(t *testing.T) {
 	// Capture tier empty, coverage tier says broken -> must still fail.
 	onlyCoverageEvidence := audit.Report{HistoryPresent: true, Providers: []audit.ProviderReport{
 		{ID: "a", Enabled: true, HasPublicFeed: true, TotalCaptures: 0, HasCoverage: true,
-			Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeTransport}},
+			Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeTransport,
+				ConsecutiveFailures: 25}},
 	}}
 	if !hasIssues(onlyCoverageEvidence) {
 		t.Error("a coverage-tier fault was suppressed because the capture tier was empty")

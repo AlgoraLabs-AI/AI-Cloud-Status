@@ -20,7 +20,7 @@ func TestCoverageSurvivesPrune(t *testing.T) {
 	ancient := time.Now().Add(-90 * 24 * time.Hour)
 
 	h.Add("p", Sample{Time: ancient, Up: true})
-	h.RecordCoverage("p", ancient, true, "")
+	h.RecordCoverage("p", CoverageObservation{At: ancient, OK: true})
 
 	h.Prune(24*time.Hour, time.Now())
 
@@ -51,8 +51,8 @@ func TestCoverageRoundTripsThroughLoadThenSave(t *testing.T) {
 	at := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	h := New(100)
-	h.RecordCoverage("p", at, true, "")
-	h.RecordCoverage("broken", at, false, OutcomeHTTP)
+	h.RecordCoverage("p", CoverageObservation{At: at, OK: true})
+	h.RecordCoverage("broken", CoverageObservation{At: at, FailureClass: OutcomeHTTP})
 	if err := h.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -146,8 +146,8 @@ func TestRecordCoverageKeepsLastSuccessAcrossFailures(t *testing.T) {
 	good := time.Now().Add(-2 * time.Hour)
 	bad := time.Now().Add(-time.Minute)
 
-	h.RecordCoverage("p", good, true, "")
-	h.RecordCoverage("p", bad, false, OutcomeTransport)
+	h.RecordCoverage("p", CoverageObservation{At: good, OK: true})
+	h.RecordCoverage("p", CoverageObservation{At: bad, FailureClass: OutcomeTransport})
 
 	cov, ok := h.Coverage("p")
 	if !ok {
@@ -166,10 +166,74 @@ func TestRecordCoverageKeepsLastSuccessAcrossFailures(t *testing.T) {
 	// A later success must clear the stale failure class, or the audit would keep
 	// naming a failure that has since resolved.
 	recovered := time.Now()
-	h.RecordCoverage("p", recovered, true, "")
+	h.RecordCoverage("p", CoverageObservation{At: recovered, OK: true})
 	cov, _ = h.Coverage("p")
 	if cov.LastFailureClass != "" {
 		t.Errorf("LastFailureClass = %q after recovery, want empty", cov.LastFailureClass)
+	}
+	if cov.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d after recovery, want 0", cov.ConsecutiveFailures)
+	}
+}
+
+// TestBlindAttemptIsNotAFeedFailure is the regression guard for blaming every
+// provider for the user's own dead router.
+//
+// When the machine has no connectivity every provider poll fails identically.
+// Counting those as per-feed failures would drive all fifteen to a "feed not
+// readable" verdict — and that verdict now reaches the exit code. The custom-URL
+// path already refuses to feed its tracker under the same condition; this is the
+// provider path holding the same line.
+func TestBlindAttemptIsNotAFeedFailure(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+
+	// A real failure, then the link drops and ten polls fail blind.
+	h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeHTTP})
+	for i := range 10 {
+		h.RecordCoverage("p", CoverageObservation{
+			At: t0.Add(time.Duration(i+1) * time.Minute), Blind: true, FailureClass: OutcomeTransport,
+		})
+	}
+
+	cov, ok := h.Coverage("p")
+	if !ok {
+		t.Fatal("no coverage recorded")
+	}
+	if cov.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1 — blind attempts are not evidence about this feed", cov.ConsecutiveFailures)
+	}
+	if cov.LastFailureClass != OutcomeHTTP {
+		t.Errorf("LastFailureClass = %q, want %q — a blind attempt must not overwrite the real explanation",
+			cov.LastFailureClass, OutcomeHTTP)
+	}
+	// It still records that somebody looked.
+	if !cov.LastAttempt.After(t0) {
+		t.Error("LastAttempt did not advance; a blind poll is still an attempt")
+	}
+}
+
+// TestConsecutiveFailuresIsWhatMakesAVerdictPossible pins the distinction that
+// a verdict resting on LastSuccess alone cannot make: a feed that worked for
+// months and then broke has a non-zero LastSuccess forever, so "has ever
+// succeeded" can never again indicate a fault.
+func TestConsecutiveFailuresIsWhatMakesAVerdictPossible(t *testing.T) {
+	h := New(10)
+	worked := time.Now().Add(-72 * time.Hour)
+	h.RecordCoverage("p", CoverageObservation{At: worked, OK: true})
+
+	for i := range 30 {
+		h.RecordCoverage("p", CoverageObservation{
+			At: worked.Add(time.Duration(i+1) * time.Minute), FailureClass: OutcomeHTTP,
+		})
+	}
+
+	cov, _ := h.Coverage("p")
+	if cov.LastSuccess.IsZero() {
+		t.Fatal("precondition: this provider HAS succeeded before, which is the whole point")
+	}
+	if cov.ConsecutiveFailures != 30 {
+		t.Errorf("ConsecutiveFailures = %d, want 30", cov.ConsecutiveFailures)
 	}
 }
 

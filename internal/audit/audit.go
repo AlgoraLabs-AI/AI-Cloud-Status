@@ -178,19 +178,36 @@ type ProviderReport struct {
 type FeedVerdict int
 
 const (
-	// FeedUnknown: no coverage record. Either nothing ever polled this provider,
-	// or every poll predates the build that records coverage. NOT a fault.
+	// FeedUnknown: nothing conclusive. No coverage record at all, or a run of
+	// failures too short to call sustained. NOT a fault.
 	FeedUnknown FeedVerdict = iota
-	// FeedHealthy: polled, and at least one poll read the feed successfully.
+	// FeedHealthy: the most recent attempt read the feed.
 	FeedHealthy
-	// FeedBroken: polled repeatedly and NEVER once read successfully. This is the
+	// FeedBroken: attempts keep failing and none has succeeded since. This is the
 	// case that used to be indistinguishable from "genuinely operational all
 	// window", and the reason the audit could not tell the two apart.
 	FeedBroken
 )
 
-// FeedVerdict classifies whether this provider's feed could actually be read,
+// sustainedFailureAttempts is how many consecutive failed polls it takes before
+// a feed is called broken rather than merely failing right now.
+//
+// A count, not a duration, because a poll round has no fixed length: a round in
+// which a provider is timing out costs several times a healthy one, so any
+// wall-clock threshold derived from the configured interval understates the real
+// elapsed time by a wide and variable margin. What the verdict actually needs is
+// "this was not one bad look", and consecutive attempts say that directly.
+const sustainedFailureAttempts = 10
+
+// FeedVerdict classifies whether this provider's feed can actually be read,
 // from the attendance record rather than by inferring it from an absence.
+//
+// It keys on the CURRENT run of failures, not on whether a success has ever been
+// recorded. "Has ever succeeded" is useless as a health signal: any working
+// launch stamps LastSuccess within a minute, so after the first successful poll
+// of the provider's life it is permanently non-zero — a verdict resting on it
+// could never report a fault again, least of all for a feed that worked fine for
+// months and then broke.
 //
 // It deliberately does not look at Findings or captures: those are the tier that
 // only exists when diagnostics are on, and mixing the two is what made the old
@@ -199,11 +216,25 @@ func (r ProviderReport) FeedVerdict() FeedVerdict {
 	switch {
 	case !r.HasCoverage || r.Coverage.LastAttempt.IsZero():
 		return FeedUnknown
-	case !r.Coverage.LastSuccess.IsZero():
+	case r.Coverage.ConsecutiveFailures == 0:
 		return FeedHealthy
-	default:
+	case r.Coverage.ConsecutiveFailures >= sustainedFailureAttempts:
 		return FeedBroken
+	default:
+		// Failing, but not for long enough to assert it. One bad poll is not
+		// evidence of a broken feed — which is the same absence-vs-evidence line
+		// this whole change exists to hold.
+		return FeedUnknown
 	}
+}
+
+// FeedFault reports a coverage-tier fault worth failing the run over.
+//
+// The exit code and the printed report must both come from HERE. Deriving the
+// condition independently in two places is how a run ends up exiting 1 while its
+// own report says nothing was found.
+func (r ProviderReport) FeedFault() bool {
+	return r.Enabled && r.HasPublicFeed && r.FeedVerdict() == FeedBroken
 }
 
 // UncoveredCount returns how many Findings are genuinely Uncovered.
@@ -249,7 +280,15 @@ type Report struct {
 	// install, while history.json is ordinary user state and is always written.
 	// A reader that cannot see which tier a verdict came from will trust a green
 	// report whose entire capture corpus was empty.
+	//
+	// HistoryPresent means USABLE: the file was there AND it parsed. The other
+	// two exist so a corrupt file cannot masquerade as either a healthy tier or a
+	// missing one — HistoryFound says the file was on disk, and HistoryErr says
+	// why it could not be used. Reporting "absent" for a file that is present but
+	// unreadable hides the evidence loss instead of naming it.
 	HistoryPresent bool
+	HistoryFound   bool
+	HistoryErr     string
 }
 
 // transition is one alert-log line for a provider, restricted to the
@@ -356,24 +395,29 @@ func Run(dir string) (Report, error) {
 		}
 	}
 
-	// The coverage tier. history.json is loaded separately from the capture and
+	// The coverage tier. history.json is read separately from the capture and
 	// alert-log corpora above and stays separate all the way to the exit code: it
 	// is user state written on every poll, so it is the only witness that exists
-	// on an install with diagnostics off. Load failures are non-fatal — a missing
-	// or unreadable history simply means no coverage verdicts, never a wrong one.
-	histPath := filepath.Join(dir, "history.json")
-	hist, herr := history.Load(histPath, history.DefaultCapacity)
-	historyPresent := false
-	if herr == nil {
-		// Load returns an empty History for a missing file rather than an error,
-		// so its success does not prove the file was there.
-		if _, statErr := os.Stat(histPath); statErr == nil {
-			historyPresent = true
-		}
+	// on an install with diagnostics off.
+	//
+	// Only the coverage map is decoded — the sample ring is megabytes and this
+	// audit reads none of it. Failures are non-fatal but must not be silent: a
+	// present-but-corrupt file has to report as unreadable, not as absent, and
+	// certainly not as "coverage tier present" while yielding no verdicts.
+	coverage, histFound, herr := history.LoadCoverage(filepath.Join(dir, "history.json"))
+	histErr := ""
+	if herr != nil {
+		histErr = herr.Error()
 	}
 
 	feedSamplesDir := filepath.Join(dir, "feed-samples")
-	report := Report{GeneratedAt: time.Now(), AlertLogStart: alertStart, HistoryPresent: historyPresent}
+	report := Report{
+		GeneratedAt:    time.Now(),
+		AlertLogStart:  alertStart,
+		HistoryPresent: histFound && herr == nil,
+		HistoryFound:   histFound,
+		HistoryErr:     histErr,
+	}
 	for _, p := range providers.Default() {
 		captures, err := loadCaptures(filepath.Join(feedSamplesDir, p.ID), p, cfg.Regions)
 		if err != nil {
@@ -391,9 +435,7 @@ func Run(dir string) (Report, error) {
 			LastAlertTime:     lastAlertByID[p.ID],
 			MissingRecoveries: missing,
 		}
-		if hist != nil {
-			pr.Coverage, pr.HasCoverage = hist.Coverage(p.ID)
-		}
+		pr.Coverage, pr.HasCoverage = coverage[p.ID]
 		for _, c := range captures {
 			if c.Time.After(pr.LastCaptureTime) {
 				pr.LastCaptureTime = c.Time

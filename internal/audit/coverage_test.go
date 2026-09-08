@@ -25,15 +25,38 @@ func TestFeedVerdictThreeWay(t *testing.T) {
 			want: FeedUnknown,
 		},
 		{
-			name: "polled and read successfully",
+			name: "last poll read the feed",
 			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
 				Coverage: history.CoverageEntry{LastAttempt: now, LastSuccess: now.Add(-time.Minute)}},
 			want: FeedHealthy,
 		},
 		{
-			name: "polled repeatedly, never once read",
+			name: "sustained run of failures",
 			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
-				Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeHTTP}},
+				Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeHTTP,
+					ConsecutiveFailures: sustainedFailureAttempts}},
+			want: FeedBroken,
+		},
+		{
+			// One bad poll is not a broken feed. Asserting it from a single
+			// attempt is the same absence-vs-evidence error this whole change
+			// exists to avoid, pointed the other way.
+			name: "one failed poll is not conclusive",
+			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
+				Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeTransport,
+					ConsecutiveFailures: 1}},
+			want: FeedUnknown,
+		},
+		{
+			// THE case the feature exists for: worked for months, then broke.
+			// A verdict resting on "has ever succeeded" reports this as healthy
+			// forever, which made the whole mechanism inert in production.
+			name: "worked for months, now sustained failure",
+			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
+				Coverage: history.CoverageEntry{
+					LastAttempt: now, LastSuccess: now.Add(-72 * time.Hour),
+					LastFailureClass: history.OutcomeHTTP, ConsecutiveFailures: 500,
+				}},
 			want: FeedBroken,
 		},
 		{
@@ -94,12 +117,14 @@ func TestMissingRecoveryKindIsExplicit(t *testing.T) {
 	}
 }
 
-// TestUptimeStyleTierSeparation documents, at the audit layer, that a coverage
-// verdict never depends on how many captures exist and vice versa. The two are
-// different grades of evidence: captures only exist while diagnostics are on.
+// TestCoverageVerdictIndependentOfCaptures documents, at the audit layer, that a
+// coverage verdict never depends on how many captures exist and vice versa. The
+// two are different grades of evidence: captures only exist while diagnostics
+// are on.
 func TestCoverageVerdictIndependentOfCaptures(t *testing.T) {
 	now := time.Now()
-	broken := history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeTransport}
+	broken := history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeTransport,
+		ConsecutiveFailures: sustainedFailureAttempts}
 
 	withCaptures := ProviderReport{
 		ID: "a", Enabled: true, HasPublicFeed: true,

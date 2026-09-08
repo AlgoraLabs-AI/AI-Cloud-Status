@@ -19,6 +19,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -72,7 +73,7 @@ func main() {
 // (exactly the 2026-08-02 failure) but is blind to a check that was never
 // probed at all. A reader who cannot tell those apart will over-trust a clean
 // run, so the difference is stated every time.
-func printContinuity(w *os.File, r audit.ContinuityReport) {
+func printContinuity(w io.Writer, r audit.ContinuityReport) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "CONTINUITY — custom URL checks & connectivity alerts (no raw-capture archive exists for these)")
 	fmt.Fprintln(w, "  Evidence: the alert journal cross-checked against the sample history — two of the app's OWN")
@@ -142,14 +143,21 @@ func hasIssues(r audit.Report) bool {
 			return true
 		}
 		// COVERAGE tier — always available, judged on its own evidence.
-		if p.Enabled && p.HasPublicFeed && p.FeedVerdict() == audit.FeedBroken {
+		// FeedFault is the SAME predicate printReport uses for its coverage
+		// section. Re-deriving it here would let the exit code and the report
+		// drift apart, which is how a run exits 1 next to "nothing found".
+		if p.FeedFault() {
 			return true
 		}
 	}
 	return false
 }
 
-func printReport(w *os.File, r audit.Report) {
+// printReport takes an io.Writer, not the *os.File it used to, so a test can
+// point it at a buffer. The defect this change set exists to fix — a fabricated
+// "cleared by 0000-12-31 21:00:00" — lived HERE, in the formatting, and no test
+// could reach it.
+func printReport(w io.Writer, r audit.Report) {
 	fmt.Fprintf(w, "AI-Cloud-Status alert audit — %s\n", r.GeneratedAt.Local().Format("2006-01-02 15:04"))
 	if r.AlertLogStart.IsZero() {
 		fmt.Fprintln(w, "alert-log.jsonl: not found / empty — nothing to correlate against yet.")
@@ -161,10 +169,16 @@ func printReport(w *os.File, r audit.Report) {
 	// and the alert log exist only while diagnostics are enabled, so on a default
 	// install both are empty and every capture-tier verdict below is vacuous —
 	// which reads identically to "all clear" unless the report says otherwise.
-	if r.HistoryPresent {
+	switch {
+	case r.HistoryPresent:
 		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier (feed-samples + alert-log, written only while diagnostics are on) "+
 			"and COVERAGE tier (history.json, always written). Both present.")
-	} else {
+	case r.HistoryFound:
+		// Present but unusable. Saying "absent" here would report an evidence
+		// LOSS as an evidence gap, and the two need different responses.
+		fmt.Fprintf(w, "Evidence tiers: CAPTURE tier only — history.json is present but could NOT be read (%s), "+
+			"so the coverage tier is lost, not missing. No coverage verdict is given below.\n", r.HistoryErr)
+	default:
 		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier only — history.json is absent, so no coverage verdict can be given "+
 			"and 'no captures' below stays ambiguous.")
 	}
@@ -195,14 +209,16 @@ func printReport(w *os.File, r audit.Report) {
 			// the feed was ever READ, rather than inferring health from an absence.
 			switch p.FeedVerdict() {
 			case audit.FeedBroken:
-				note = fmt.Sprintf("  <- FEED NEVER READ: polled, last attempt %s, never once succeeded (last failure: %s)",
-					humanAge(r.GeneratedAt.Sub(p.Coverage.LastAttempt)), p.Coverage.LastFailureClass)
+				note = fmt.Sprintf("  <- FEED NOT READABLE: %d consecutive failures (last: %s) — see the section below",
+					p.Coverage.ConsecutiveFailures, p.Coverage.LastFailureClass)
 			case audit.FeedHealthy:
-				note = fmt.Sprintf("  <- no captures because it was healthy: feed last read OK %s",
-					humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)))
+				note = fmt.Sprintf("  <- no captures because it was healthy: last poll read the feed, %s ago",
+					humanAge(r.GeneratedAt.Sub(p.Coverage.LastAttempt)))
 			default:
-				// Advisory only — it does not fail the run. See hasIssues.
-				note = "  <- no captures and no coverage record: healthy all window, feed never loaded, or never polled (cannot tell apart)"
+				// Advisory only — it does not fail the run. See hasIssues. This
+				// covers both "no coverage record at all" and "failing, but not
+				// yet long enough to call it": neither is an assertion.
+				note = "  <- no captures and nothing conclusive in the coverage record: healthy, feed never loaded, or never polled"
 			}
 		case p.AllCapturesUnparseable():
 			note = "  <- EVERY capture fails to parse with the current adapter; likely broken right now"
@@ -259,6 +275,28 @@ func printReport(w *os.File, r audit.Report) {
 		}
 	}
 
+	// The coverage section is driven by FeedFault, the same predicate hasIssues
+	// uses, and it is INDEPENDENT of the capture count. Hanging it off the
+	// per-row note instead would print nothing for a provider that has captures
+	// and a broken feed — exit 1 beside a report that found nothing.
+	anyFeedFault := false
+	for _, p := range r.Providers {
+		if !p.FeedFault() {
+			continue
+		}
+		if !anyFeedFault {
+			fmt.Fprintln(w, "FEED NOT READABLE — polled repeatedly and no attempt has succeeded since the last success. "+
+				"This is the COVERAGE tier (history.json), independent of whether any captures exist:")
+			anyFeedFault = true
+		}
+		last := "never"
+		if !p.Coverage.LastSuccess.IsZero() {
+			last = humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)) + " ago"
+		}
+		fmt.Fprintf(w, "  [%s] %d consecutive failures, last success %s, last failure class %q\n",
+			p.ID, p.Coverage.ConsecutiveFailures, last, p.Coverage.LastFailureClass)
+	}
+
 	anyUnparseable := false
 	for _, p := range r.Providers {
 		if p.AllCapturesUnparseable() {
@@ -271,7 +309,7 @@ func printReport(w *os.File, r audit.Report) {
 		}
 	}
 
-	if !anyUncovered && !anyMissingRecovery && !anyUnparseable {
+	if !anyUncovered && !anyMissingRecovery && !anyUnparseable && !anyFeedFault {
 		fmt.Fprintln(w, "No uncovered major incidents, unrecovered outage windows, or broken parsers found — every real "+
 			"major-severity capture matches (or is explained by suppression / predating alert-log).")
 	} else {

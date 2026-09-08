@@ -1491,8 +1491,14 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			reachable := st.res.Reachable() && !st.skipped
 			up := reachable && unmutedSeverity(st.res, interest) < providers.SevMajor
 			sample := history.Sample{
-				Time: st.when, Up: up, Unknown: !reachable,
-				Latency: st.latency, Outcome: st.outcome,
+				Time: st.when, Up: up, Unknown: !reachable, Latency: st.latency,
+			}
+			if !reachable {
+				// Outcome explains an Unknown. On an up/down sample there is
+				// nothing to explain, and stamping "readable" on every healthy
+				// poll would add a constant per-sample cost to a file whose whole
+				// design is "deliberately tiny, bounded by construction".
+				sample.Outcome = st.outcome
 			}
 			if !up && reachable {
 				sample.DownRegions, _ = sampleDownRegions(st.res, interest)
@@ -1517,7 +1523,25 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			// can. Skipped checks are recorded as attempts with no success and no
 			// failure class: an Optional provider with no public feed was looked
 			// at, and it is not broken.
-			c.history.RecordCoverage(p.ID, st.when, st.outcome == history.OutcomeReadable, coverageFailureClass(st.outcome))
+			//
+			// Blind mirrors the custom-URL path exactly: a failed poll while the
+			// machine itself has no connectivity says nothing about THIS feed, and
+			// counting it would blame all fifteen providers for the user's router
+			// — a fault that now reaches the audit's exit code, so it must not be
+			// recorded from an unreadable observation.
+			//
+			// Offline() is the state computed from a PREVIOUS round, so the first
+			// round of a connectivity drop is not yet marked blind and leaks one
+			// failure per provider. That is deliberate rather than overlooked: the
+			// verdict needs a sustained run to fire, so a single leaked failure per
+			// outage cannot reach it, and reading a mid-round offline state would
+			// mean each provider judged itself against a different answer.
+			c.history.RecordCoverage(p.ID, history.CoverageObservation{
+				At:           st.when,
+				OK:           st.outcome == history.OutcomeReadable,
+				Blind:        st.err != nil && c.offline.Offline(),
+				FailureClass: coverageFailureClass(st.outcome),
+			})
 
 			// Journal every incident the feed currently lists so the detail
 			// panel can show a last-24h history after they resolve. Recorded
