@@ -277,7 +277,6 @@ func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
 // months-old verdict about a provider nobody has polled since.
 const coverageFreshness = 7 * 24 * time.Hour
 
-
 // FeedFault reports a coverage-tier fault worth failing the run over.
 //
 // The exit code and the printed report must both come from HERE. Deriving the

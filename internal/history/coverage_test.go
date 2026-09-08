@@ -240,9 +240,13 @@ func TestConsecutiveFailuresIsWhatMakesAVerdictPossible(t *testing.T) {
 	worked := time.Now().Add(-72 * time.Hour)
 	h.RecordCoverage("p", CoverageObservation{At: worked, OK: true})
 
+	// Spaced like real rounds: the failure counter deliberately refuses to move
+	// faster than a quarter of the run-gap, so that a user hammering a manual
+	// refresh cannot manufacture a "sustained" run. RunGap defaults to an hour
+	// here, so 20 minutes apart is comfortably a distinct round.
 	for i := range 30 {
 		h.RecordCoverage("p", CoverageObservation{
-			At: worked.Add(time.Duration(i+1) * time.Minute), FailureClass: OutcomeHTTP,
+			At: worked.Add(time.Duration(i+1) * 20 * time.Minute), FailureClass: OutcomeHTTP,
 		})
 	}
 
@@ -252,6 +256,35 @@ func TestConsecutiveFailuresIsWhatMakesAVerdictPossible(t *testing.T) {
 	}
 	if cov.ConsecutiveFailures != 30 {
 		t.Errorf("ConsecutiveFailures = %d, want 30", cov.ConsecutiveFailures)
+	}
+}
+
+// TestRapidRepeatsCannotManufactureARun: the counter advances per polling ROUND,
+// not per call. Anything that re-enters the poll on demand — Retry, "Refresh
+// now", any future trigger — would otherwise let a user click their way to the
+// sustained run the verdict is supposed to require.
+func TestRapidRepeatsCannotManufactureARun(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	gap := time.Hour
+
+	// Twenty failures one second apart, as fast as someone can click.
+	for i := range 20 {
+		h.RecordCoverage("p", CoverageObservation{
+			At: t0.Add(time.Duration(i) * time.Second), FailureClass: OutcomeHTTP, RunGap: gap,
+		})
+	}
+
+	cov, ok := h.Coverage("p")
+	if !ok {
+		t.Fatal("the attempts must still be recorded — someone did look")
+	}
+	if cov.ConsecutiveFailures > 1 {
+		t.Errorf("ConsecutiveFailures = %d after 20 clicks in 20 seconds; a run counts rounds, not clicks",
+			cov.ConsecutiveFailures)
+	}
+	if !cov.LastAttempt.After(t0) {
+		t.Error("LastAttempt did not advance; the looking still happened")
 	}
 }
 
@@ -355,23 +388,24 @@ func TestLoadCoverageDropsFutureDatedEntries(t *testing.T) {
 // them blind is for.
 func TestBlindAttemptsDoNotBreakAFailureRun(t *testing.T) {
 	h := New(10)
-	t0 := time.Now().Add(-2 * time.Hour)
-	gap := 10 * time.Minute
+	t0 := time.Now().Add(-8 * time.Hour)
+	gap := time.Hour         // so a distinct round is >= 15 minutes apart
+	step := 20 * time.Minute // and the blind stretch stays inside the 6h informative window
 
-	// Five real failures, a stretch of blind polls well past the gap, then more
-	// real failures. The blind stretch is contiguous in ATTEMPTS.
+	// Five real failures, a stretch of blind polls, then more real failures. The
+	// blind stretch never interrupts the ATTEMPTS, so the run continues.
 	at := t0
 	for range 5 {
 		h.RecordCoverage("p", CoverageObservation{At: at, FailureClass: OutcomeHTTP, RunGap: gap})
-		at = at.Add(time.Minute)
+		at = at.Add(step)
 	}
-	for range 30 {
+	for range 8 {
 		h.RecordCoverage("p", CoverageObservation{At: at, Blind: true, RunGap: gap})
-		at = at.Add(time.Minute)
+		at = at.Add(step)
 	}
 	for range 5 {
 		h.RecordCoverage("p", CoverageObservation{At: at, FailureClass: OutcomeHTTP, RunGap: gap})
-		at = at.Add(time.Minute)
+		at = at.Add(step)
 	}
 
 	cov, _ := h.Coverage("p")

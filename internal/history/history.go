@@ -152,6 +152,13 @@ const failureRunGap = time.Hour
 // either side are separate events rather than one.
 const informativeRunGapFactor = 6
 
+// minInformativeWindow floors that window. At the shipped defaults the derived
+// value is only a few minutes, which any ordinary connectivity drop exceeds — so
+// a flaky link would wipe every in-progress run and the sustained-failure
+// verdict would be unreachable on exactly the networks where a feed is hardest
+// to read. Episodes are separated by hours, not by minutes.
+const minInformativeWindow = 2 * time.Hour
+
 // CoverageFutureSlack is how far ahead of now a PERSISTED timestamp may be
 // before it is treated as clock damage rather than an observation.
 //
@@ -371,15 +378,27 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		if gap <= 0 {
 			gap = failureRunGap
 		}
+		informativeWindow := max(informativeRunGapFactor*gap, minInformativeWindow)
 		pollingStopped := !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) > gap
 		learnedNothingTooLong := !cov.LastInformative.IsZero() &&
-			obs.At.Sub(cov.LastInformative) > informativeRunGapFactor*gap
+			obs.At.Sub(cov.LastInformative) > informativeWindow
 		if pollingStopped || learnedNothingTooLong {
 			cov.ConsecutiveFailures = 0
 		}
-		cov.LastInformative = obs.At
-		cov.LastFailureClass = obs.FailureClass
-		cov.ConsecutiveFailures++
+		// The run counts polling ROUNDS, not calls. Anything that can re-enter
+		// the poll on demand — the Retry affordance, the "Refresh now" button,
+		// any future trigger — would otherwise let a user advance the counter as
+		// fast as they can click and manufacture the sustained run the verdict
+		// exists to require. Guarding each button is a race the buttons win; the
+		// counter refusing to move faster than the cadence is not.
+		//
+		// The attempt itself is still recorded above: someone did look.
+		tooSoonToCount := !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) < gap/4
+		if !tooSoonToCount {
+			cov.LastInformative = obs.At
+			cov.LastFailureClass = obs.FailureClass
+			cov.ConsecutiveFailures++
+		}
 	}
 	h.coverage[id] = cov
 }
@@ -467,7 +486,7 @@ func (h *History) Coverage(id string) (CoverageEntry, bool) {
 // further than an hour into the future (clock changes / corrupt persisted
 // data). Called after restoring persisted history at launch.
 func (h *History) Prune(maxAge time.Duration, now time.Time) {
-	const futureSlack = time.Hour
+	const futureSlack = CoverageFutureSlack
 	cutoff := now.Add(-maxAge)
 	limit := now.Add(futureSlack)
 	h.mu.Lock()

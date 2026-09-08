@@ -114,6 +114,14 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // blip is tolerated without a tight retry loop.
 const providerRetryAttempts = 3
 
+// maxRoundCostEstimate caps how much of a measured round duration may feed the
+// coverage run-gap. A real round is bounded by the retry attempts times the
+// client timeout plus the URL checks; anything far past that is a suspended
+// machine or a pathological stall, not a cadence, and letting it through would
+// stretch the "is this run continuous" window by however long the laptop was
+// asleep.
+const maxRoundCostEstimate = 5 * time.Minute
+
 // historySaveEvery is how many countdown ticks (seconds) elapse between
 // background saves of the on-disk history ring buffer.
 const historySaveEvery = 60
@@ -180,7 +188,12 @@ type Controller struct {
 	// resets the failure counter on every failure and makes the verdict
 	// unreachable.
 	lastRoundCost time.Duration
-	connDown      bool // every enabled connectivity target is currently unreachable
+	// lastRoundAnyOK is whether ANY provider read its feed in the previous round.
+	// It is the independent proof of connectivity for machines whose networks
+	// block the probe targets — and it is not circular, because it is a DIFFERENT
+	// provider succeeding, never the failing one vouching for itself.
+	lastRoundAnyOK bool
+	connDown       bool // every enabled connectivity target is currently unreachable
 	// connJudged is whether any connectivity target was checked at all. Without
 	// it connDown==false is ambiguous between "the link is fine" and "nothing
 	// was asked", and the second is not evidence of the first.
@@ -1571,7 +1584,13 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	// connectivity checks loses the feed-not-readable verdict; the alternative is
 	// asserting a link nobody observed and blaming providers for the user's own
 	// network, which is the failure this whole record exists to avoid.
-	noLinkAtRoundStart := c.connDown || !c.connJudged
+	// anyOK is the escape hatch for a network that blocks the probe targets
+	// outright — common on corporate links — where connDown is permanently true
+	// and would otherwise make every failure blind, leaving the verdict inert and
+	// silent about being inert. A successful HTTPS fetch from ANY provider proves
+	// the machine was online, and it is not circular: it is a different provider
+	// succeeding, never the failing one excusing itself.
+	noLinkAtRoundStart := (c.connDown || !c.connJudged) && !c.lastRoundAnyOK
 	c.mu.Unlock()
 	// The run-gap has to exceed the real spacing between two observations of one
 	// provider, and that spacing is (previous round's cost + the interval), not
@@ -1582,6 +1601,11 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	c.mu.Lock()
 	prevRoundCost := c.lastRoundCost
 	c.mu.Unlock()
+	// Clamped, because it is an unbounded wall-clock measurement: a machine
+	// suspended mid-round, or one pathological round, would otherwise widen the
+	// "is this run continuous" window by however long that took — and the
+	// informative window is a multiple of it, so the distortion multiplies.
+	prevRoundCost = min(prevRoundCost, maxRoundCostEstimate)
 	roundGap := 2 * (prevRoundCost + c.providerInterval())
 	var wg sync.WaitGroup
 	for _, p := range list {
@@ -1704,6 +1728,13 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	wg.Wait()
 	c.mu.Lock()
 	c.lastRoundCost = time.Since(roundStart)
+	c.lastRoundAnyOK = false
+	for _, p := range list {
+		if st, ok := c.provStates[p.ID]; ok && st.outcome == history.OutcomeReadable {
+			c.lastRoundAnyOK = true
+			break
+		}
+	}
 	c.mu.Unlock()
 }
 

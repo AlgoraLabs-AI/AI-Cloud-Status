@@ -171,10 +171,6 @@ func hasIssues(r audit.Report) bool {
 	return false
 }
 
-// printReport takes an io.Writer, not the *os.File it used to, so a test can
-// point it at a buffer. The defect this change set exists to fix — a fabricated
-// "cleared by 0000-12-31 21:00:00" — lived HERE, in the formatting, and no test
-// could reach it.
 // captureTierPhrase describes the capture tier from a measurement, so nothing
 // can announce it without one.
 //
@@ -212,6 +208,11 @@ func coverageTierPhrase(r audit.Report) string {
 	}
 }
 
+// printReport renders the provider section.
+//
+// It takes an io.Writer, not the *os.File it used to, so a test can point it at
+// a buffer: the defect this whole change set exists to remove — a fabricated
+// clearance timestamp — lived in the FORMATTING, where no test could reach it.
 func printReport(w io.Writer, r audit.Report) {
 	fmt.Fprintf(w, "AI-Cloud-Status alert audit — %s\n", r.GeneratedAt.Local().Format("2006-01-02 15:04"))
 	if r.AlertLogStart.IsZero() {
@@ -402,6 +403,15 @@ func printReport(w io.Writer, r audit.Report) {
 	}
 
 	if !anyUncovered && !anyMissingRecovery && !anyUnparseable && !anyFeedFault {
+		// "unreadable feeds" belongs in this sentence only when the coverage tier
+		// could actually answer. Claiming none were found when the tier was
+		// absent, corrupt or empty reports a question that was never asked as a
+		// question that came back clean.
+		if !r.HistoryPresent {
+			fmt.Fprintln(w, "No uncovered major incidents, missing recoveries, outage windows left open, or broken "+
+				"parsers found. Feed readability was NOT assessed — see the coverage tier above.")
+			return
+		}
 		fmt.Fprintln(w, "No uncovered major incidents, missing recoveries, outage windows left open, unreadable feeds, or "+
 			"broken parsers found — every real "+
 			"major-severity capture matches (or is explained by suppression / predating alert-log).")
