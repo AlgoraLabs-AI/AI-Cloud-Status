@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -19,72 +18,80 @@ func TestCoverageObservation(t *testing.T) {
 	at := time.Now()
 
 	cases := []struct {
-		name    string
-		st      provState
-		offline bool
-		want    history.CoverageObservation
+		name      string
+		st        provState
+		noLink    bool
+		cancelled bool
+		want      history.CoverageObservation
 	}{
 		{
+			// FailureClass is empty because nothing failed: RecordCoverage's doc
+			// says the field is "a failure class, or empty on success".
 			name: "successful read",
 			st:   provState{when: at, outcome: history.OutcomeReadable},
-			want: history.CoverageObservation{At: at, OK: true, FailureClass: history.OutcomeReadable},
+			want: history.CoverageObservation{At: at, OK: true},
 		},
 		{
-			name: "http failure while online is real evidence",
+			name: "http failure with a link is real evidence",
 			st:   provState{when: at, outcome: history.OutcomeHTTP, err: errors.New("unexpected status 405")},
 			want: history.CoverageObservation{At: at, FailureClass: history.OutcomeHTTP},
 		},
 		{
-			// The one that matters: the machine's own link is down, so this says
-			// nothing about the provider.
-			name:    "transport failure while OFFLINE is blind",
-			st:      provState{when: at, outcome: history.OutcomeTransport, err: errors.New("no such host")},
-			offline: true,
-			want:    history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeTransport},
+			// The machine's own link is down, so this says nothing about the
+			// provider.
+			name:   "transport failure with NO LINK is blind",
+			st:     provState{when: at, outcome: history.OutcomeTransport, err: errors.New("no such host")},
+			noLink: true,
+			want:   history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeTransport},
 		},
 		{
-			// THE case the whole record exists for. The offline latch trips when
-			// EVERY enabled provider fails at once, which is exactly what a
-			// fleet-wide feed outage looks like. If the latch alone decided
-			// blindness, that outage would be recorded as "we could not see" from
-			// round two onward and the verdict could never fire. An HTTP status
-			// proves the server answered, so it is evidence regardless.
-			name:    "HTTP failure is NEVER blind, even with the offline latch set",
-			st:      provState{when: at, outcome: history.OutcomeHTTP, err: errors.New("unexpected status 405")},
-			offline: true,
-			want:    history.CoverageObservation{At: at, FailureClass: history.OutcomeHTTP},
+			// THE case the record exists for, and the reason blindness must key
+			// on the connectivity PROBE rather than on the offline latch: the
+			// latch folds in "every provider failed", so a fleet-wide feed outage
+			// would excuse itself. Here the probe says the link is fine.
+			name: "transport failure WITH a link is evidence, not blindness",
+			st:   provState{when: at, outcome: history.OutcomeTransport, err: errors.New("no such host")},
+			want: history.CoverageObservation{At: at, FailureClass: history.OutcomeTransport},
 		},
 		{
-			// Same reasoning: bytes arrived, they just did not parse.
-			name:    "parse failure is never blind either",
-			st:      provState{when: at, outcome: history.OutcomeParse, err: errors.New("bad json")},
-			offline: true,
-			want:    history.CoverageObservation{At: at, FailureClass: history.OutcomeParse},
+			// And an answer that arrived is never blind, whatever the link says.
+			name:   "HTTP failure is never blind, even with no link",
+			st:     provState{when: at, outcome: history.OutcomeHTTP, err: errors.New("unexpected status 405")},
+			noLink: true,
+			want:   history.CoverageObservation{At: at, FailureClass: history.OutcomeHTTP},
 		},
 		{
-			// Shutdown cancelled the request; the feed never answered.
-			name: "cancelled at shutdown is blind even when online",
-			st:   provState{when: at, outcome: history.OutcomeTransport, err: context.Canceled},
-			want: history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeTransport},
+			name:   "parse failure is never blind either",
+			st:     provState{when: at, outcome: history.OutcomeParse, err: errors.New("bad json")},
+			noLink: true,
+			want:   history.CoverageObservation{At: at, FailureClass: history.OutcomeParse},
 		},
 		{
-			// An Optional provider with no public feed, working as designed.
-			name: "skipped is neither success nor failure",
+			// Cancellation comes from the CALLER's ctx, not from st.err:
+			// monitor.Retry returns the last attempt's error when cancellation
+			// lands during a backoff, so st.err is silent about it exactly then.
+			name:      "cancelled at shutdown is blind even with a link, and even with a non-context error",
+			st:        provState{when: at, outcome: history.OutcomeTransport, err: errors.New("no such host")},
+			cancelled: true,
+			want:      history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeTransport},
+		},
+		{
+			name: "skipped is neither success nor failure, and carries no failure class",
 			st:   provState{when: at, outcome: history.OutcomeSkipped, skipped: true},
-			want: history.CoverageObservation{At: at, Skipped: true, FailureClass: history.OutcomeSkipped},
+			want: history.CoverageObservation{At: at, Skipped: true},
 		},
 		{
-			// offline must not turn a SUCCESS into a blind attempt.
-			name:    "a successful read while the latch says offline is still a success",
-			st:      provState{when: at, outcome: history.OutcomeReadable},
-			offline: true,
-			want:    history.CoverageObservation{At: at, OK: true, FailureClass: history.OutcomeReadable},
+			// A dead link must not turn a SUCCESS into a blind attempt.
+			name:   "a successful read while the probe says no link is still a success",
+			st:     provState{when: at, outcome: history.OutcomeReadable},
+			noLink: true,
+			want:   history.CoverageObservation{At: at, OK: true},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := coverageObservation(tc.st, tc.offline, 0)
+			got := coverageObservation(tc.st, tc.noLink, tc.cancelled, 0)
 			if got != tc.want {
 				t.Errorf("coverageObservation() = %+v, want %+v", got, tc.want)
 			}
@@ -101,14 +108,14 @@ func TestCoverageObservationFeedsRecordCoverageCorrectly(t *testing.T) {
 
 	// One real read, then the link dies and stays dead for twenty rounds.
 	h.RecordCoverage("p", coverageObservation(
-		provState{when: t0, outcome: history.OutcomeReadable}, false, time.Hour))
+		provState{when: t0, outcome: history.OutcomeReadable}, false, false, time.Hour))
 	for i := range 20 {
 		st := provState{
 			when:    t0.Add(time.Duration(i+1) * time.Minute),
 			outcome: history.OutcomeTransport,
 			err:     errors.New("no such host"),
 		}
-		h.RecordCoverage("p", coverageObservation(st, true, time.Hour))
+		h.RecordCoverage("p", coverageObservation(st, true, false, time.Hour))
 	}
 
 	cov, ok := h.Coverage("p")

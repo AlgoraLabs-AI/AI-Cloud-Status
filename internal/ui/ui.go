@@ -9,7 +9,6 @@ package ui
 import (
 	"context"
 	_ "embed"
-	"errors"
 	"fmt"
 	"image/color"
 	"log/slog"
@@ -171,7 +170,17 @@ type Controller struct {
 	cfg        config.Config
 	engine     *monitor.Engine
 	provStates map[string]provState
-	connDown   bool // every enabled connectivity target is currently unreachable
+	// lastRoundCost is how long the previous provider round actually took, wall
+	// clock. It is MEASURED rather than derived from the configured interval
+	// because a round in which providers are timing out costs several times a
+	// healthy one — three retries against a 15s client timeout, plus backoff,
+	// plus the URL checks — so the configured cadence understates the real
+	// spacing between two observations of one provider by a wide and variable
+	// margin. Coverage's run-gap rule needs the real spacing; guessing it short
+	// resets the failure counter on every failure and makes the verdict
+	// unreachable.
+	lastRoundCost time.Duration
+	connDown      bool // every enabled connectivity target is currently unreachable
 	// connDownSince is when the current total-connectivity blackout began
 	// (zero when connectivity is up). It bounds which provider observations
 	// still count as evidence that the machine has internet.
@@ -334,13 +343,24 @@ func feedOutcome(k providers.FeedFailure) string {
 // enough that a copy would drift: a future non-informative case added here must
 // not be missed on the other path.
 //
-// offline is a PARAMETER rather than a read so a whole poll round can be judged
-// against one snapshot: reading the latch per provider lets a link dropping
-// mid-round give some of them a real failure and others a blind one.
+// Every judgement it cannot make for itself arrives as a parameter, and each one
+// is the WITNESS for a property rather than a proxy for it:
 //
-// runGap likewise comes from the caller, which is the only side that knows the
-// configured poll cadence — see CoverageObservation.RunGap.
-func coverageObservation(st provState, offline bool, runGap time.Duration) history.CoverageObservation {
+//	noLink    the connectivity probe said the machine had no link. NOT the
+//	          offline latch, which folds in "every provider failed" and would
+//	          therefore excuse a fleet-wide feed outage with itself.
+//	cancelled the poll was aborted by shutdown. From ctx.Err(), NOT from
+//	          inspecting st.err: monitor.Retry returns the LAST ATTEMPT's error
+//	          when cancellation lands during a backoff, so the error value is
+//	          silent about cancellation exactly when it matters.
+//	runGap    how far apart consecutive observations of one provider actually
+//	          are — measured, not derived from the configured cadence, because a
+//	          failing round costs several times a healthy one.
+//
+// Taking them as parameters also lets one poll round judge every provider
+// against a single snapshot; reading them per provider lets a link dropping
+// mid-round give some a real failure and others a blind one.
+func coverageObservation(st provState, noLink, cancelled bool, runGap time.Duration) history.CoverageObservation {
 	return history.CoverageObservation{
 		At:      st.when,
 		OK:      st.outcome == history.OutcomeReadable,
@@ -350,24 +370,28 @@ func coverageObservation(st provState, offline bool, runGap time.Duration) histo
 		// no link, or because shutdown cancelled it — is an attempt that carries
 		// no verdict about the feed.
 		//
-		// But an answer we DID receive can never be blind, whatever the offline
-		// latch says, and that exception is load-bearing rather than tidy. The
-		// latch itself trips when every enabled provider fails at once
-		// (monitor.Evaluate's all-unreachable rule), so a fleet-wide feed outage
-		// — every provider on one Statuspage host answering 405, which is the
-		// incident this whole record exists for — would latch offline on round 1
-		// and then record every later round as blind. The failure counter would
-		// freeze at one and the verdict could never fire, for days, while the
-		// user saw nothing.
-		//
-		// An HTTP status or a parse failure proves the server answered over
-		// HTTPS. That is evidence about the feed by construction, so it is judged
-		// on its own and never deferred to a machine-wide guess.
-		Blind: st.err != nil && !answeredOverHTTP(st.outcome) &&
-			(offline || errors.Is(st.err, context.Canceled)),
-		// RecordCoverage reads this only on the branch where the poll really
-		// failed, where st.outcome is already the failure class.
-		FailureClass: st.outcome,
+		// noLink is the CONNECTIVITY PROBE's answer, not the offline latch — see
+		// the caller. An answer that did arrive is also never blind: an HTTP
+		// status or a parse failure proves the server replied over HTTPS, so it
+		// is evidence about this feed no matter what the machine believes.
+		Blind: st.err != nil && !answeredOverHTTP(st.outcome) && (noLink || cancelled),
+		// Only set when the poll actually FAILED. RecordCoverage happens to read
+		// this field on that branch alone today, but its own doc says the value
+		// is "a failure class, or empty on success" — so passing "readable" or
+		// "skipped" here violates the contract and quietly waits for someone to
+		// hoist the assignment out of the failure branch, at which point a
+		// healthy feed persists LastFailureClass="readable".
+		FailureClass: failureClassOf(st),
+	}
+}
+
+// failureClassOf is st.outcome when the poll failed, and empty otherwise.
+func failureClassOf(st provState) string {
+	switch st.outcome {
+	case history.OutcomeReadable, history.OutcomeSkipped, "":
+		return ""
+	default:
+		return st.outcome
 	}
 }
 
@@ -1516,12 +1540,33 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	// and any successful poll resets the counter to zero — which is well inside
 	// the sustained run a verdict needs. Recording coverage after the round
 	// completes would close even that, at the cost of restructuring the hot path.
-	offlineAtRoundStart := c.offline.Offline()
-	// Three rounds of silence, derived from the CONFIGURED cadence rather than a
-	// constant: the interval has no ceiling, and a fixed gap shorter than the
-	// user's interval would reset the failure counter on every single failure and
-	// make the sustained-failure verdict unreachable.
-	roundGap := 3 * c.providerInterval()
+	// The witness for "this poll could not see anything" is the CONNECTIVITY
+	// PROBE, not the offline latch.
+	//
+	// monitor.Evaluate mixes two very different things into that latch: the ping
+	// result, which is independent evidence, and "every provider was
+	// unreachable", which is a heuristic derived from the same failures we would
+	// be excusing. Keying blindness on the latch is therefore circular — a
+	// fleet-wide feed outage makes every provider fail, the latch flips, and from
+	// the next round on the outage is recorded as "we could not see" and the
+	// verdict can never fire. Which is precisely the incident this record exists
+	// to catch.
+	//
+	// c.connDown comes from ICMP/TCP probes to the default targets. It says
+	// nothing about any provider's feed, which is exactly why it can arbitrate.
+	c.mu.Lock()
+	connDownAtRoundStart := c.connDown
+	c.mu.Unlock()
+	// The run-gap has to exceed the real spacing between two observations of one
+	// provider, and that spacing is (previous round's cost + the interval), not
+	// the interval alone. Measured, generously doubled: erring long only delays a
+	// verdict, while erring short prevents one entirely — every failure would
+	// land past the gap, reset the counter, and pin it at one forever.
+	roundStart := time.Now()
+	c.mu.Lock()
+	prevRoundCost := c.lastRoundCost
+	c.mu.Unlock()
+	roundGap := 2 * (prevRoundCost + c.providerInterval())
 	var wg sync.WaitGroup
 	for _, p := range list {
 		wg.Add(1)
@@ -1588,7 +1633,12 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			// never got an answer from the feed, so counting it would let a user
 			// who launches and quits during the poll window accumulate failures no
 			// provider ever produced — and that now reaches the audit's exit code.
-			c.history.RecordCoverage(p.ID, coverageObservation(st, offlineAtRoundStart, roundGap))
+			// ctx.Err() rather than inspecting st.err: monitor.Retry returns the
+			// LAST ATTEMPT's error when cancellation lands during a backoff, so
+			// the error value is silent about cancellation in exactly the case
+			// this filter exists for.
+			c.history.RecordCoverage(p.ID, coverageObservation(
+				st, connDownAtRoundStart, ctx.Err() != nil, roundGap))
 
 			// Journal every incident the feed currently lists so the detail
 			// panel can show a last-24h history after they resolve. Recorded
@@ -1636,6 +1686,9 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 		}(p)
 	}
 	wg.Wait()
+	c.mu.Lock()
+	c.lastRoundCost = time.Since(roundStart)
+	c.mu.Unlock()
 }
 
 // checkProviderWithRetry fetches p's feed, retrying a failed READ with
@@ -1773,6 +1826,11 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		defer cancel()
 		st := c.checkProviderWithRetry(ctx, p)
 		c.mu.Lock()
+		// carryLastOK, exactly as the scheduled path does. Without it a FAILED
+		// retry drops lastOK to the zero time, and the detail panel uses lastOK
+		// as the reference clock for its 24h incident window — so one click on a
+		// still-broken provider silently emptied the list it was showing.
+		st = carryLastOK(c.provStates[p.ID], st)
 		c.provStates[p.ID] = st
 		c.mu.Unlock()
 		// Only a SUCCESSFUL manual retry is recorded. Its value is letting the
@@ -1785,11 +1843,12 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		// only by how fast someone can click, so counting failures here would let
 		// ten clicks in a minute manufacture exactly the "sustained run" the
 		// verdict exists to require.
-		// Only OK observations survive the guard below, and RecordCoverage reads
-		// Blind only on the failure branch — so passing the live offline state
-		// here would take a mutex for a value that can never be read. false says
-		// what the code does.
-		if obs := coverageObservation(st, false, 3*c.providerInterval()); obs.OK {
+		// Every judgement this builder takes is unreachable from here, so all
+		// three are passed as their zero values rather than computed: only OK
+		// observations survive the guard below, and RecordCoverage reads Blind
+		// and RunGap on the failure branch alone. Computing them would take two
+		// locks for values nothing downstream can consume.
+		if obs := coverageObservation(st, false, false, 0); obs.OK {
 			c.history.RecordCoverage(p.ID, obs)
 		}
 		c.refresh()

@@ -145,6 +145,12 @@ type CoverageEntry struct {
 // Erring long merely delays a verdict; erring short prevents one entirely.
 const failureRunGap = time.Hour
 
+// coverageFutureSlack mirrors Prune's futureSlack: how far ahead of now a
+// timestamp may be before it is treated as clock damage rather than an
+// observation. The series has guarded this since it was written; coverage,
+// which is monotonic and therefore MORE vulnerable, did not until 2026-09-08.
+const coverageFutureSlack = time.Hour
+
 // CoverageObservation is one poll's worth of attendance, as reported by the
 // caller that actually made the request.
 //
@@ -291,6 +297,16 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	// run the user just watched clear, and drop the verdict from healthy to
 	// inconclusive about a feed they are looking at working.
 	if !obs.At.After(cov.LastAttempt) && !cov.LastAttempt.IsZero() {
+		return
+	}
+	// ...and reject a stamp implausibly far in the FUTURE, the same way Prune
+	// guards the series with futureSlack. Without it one observation written
+	// while the clock ran fast locks this check closed forever once the clock is
+	// corrected: every later poll, successes included, fails the monotonic test
+	// and returns early. A frozen entry holding a sustained failure run would
+	// then fail the audit permanently, and the staleness escape could not free it
+	// either — the elapsed time it measures is negative.
+	if obs.At.After(time.Now().Add(coverageFutureSlack)) {
 		return
 	}
 	cov.LastAttempt = obs.At
