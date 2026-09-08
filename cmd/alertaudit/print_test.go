@@ -178,6 +178,38 @@ func TestPrintReportKeepsTheTwoKindsApart(t *testing.T) {
 	}
 }
 
+// TestPrintReportNeverAgesAZeroSuccess closes the loop on the defect this whole
+// change set began with, in the branch that reintroduced it.
+//
+// A coverage record can legitimately hold "attempted, no failures outstanding,
+// never succeeded". Formatting its zero LastSuccess as an age prints roughly
+// 739,000 days — a fabricated timestamp rendered as a measurement, which is
+// exactly what "cleared by 0000-12-31" was.
+//
+// The verdict should not produce this state (see the audit-side test), and the
+// formatter must not depend on that: three rounds apart, one change made the
+// unreachable reachable and nothing failed.
+func TestPrintReportNeverAgesAZeroSuccess(t *testing.T) {
+	now := time.Now()
+	r := audit.Report{
+		GeneratedAt: now, HistoryPresent: true, HistoryFound: true,
+		Providers: []audit.ProviderReport{{
+			ID: "a", Enabled: true, HasPublicFeed: true, TotalCaptures: 0, HasCoverage: true,
+			Coverage: history.CoverageEntry{LastAttempt: now, LastInformative: now},
+		}},
+	}
+
+	var buf bytes.Buffer
+	printReport(&buf, r)
+	out := buf.String()
+
+	for _, absurd := range []string{"739", "0000-", "y ago"} {
+		if strings.Contains(out, absurd) {
+			t.Errorf("a never-succeeded record rendered %q as an age:\n%s", absurd, out)
+		}
+	}
+}
+
 // TestPrintReportEvidenceTierStates: present, lost, and absent must read
 // differently. A corrupt history reported as "absent" hides an evidence LOSS as
 // an evidence gap, and the two call for different responses from the operator.

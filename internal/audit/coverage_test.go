@@ -190,6 +190,32 @@ func TestFeedVerdictNeverInventsHealth(t *testing.T) {
 	}
 }
 
+// TestFeedHealthyRequiresAnObservedSuccess pins the invariant against the state
+// that made it reachable.
+//
+// "No failures outstanding" is not "a read happened". A record can hold zero
+// failures with a FAILURE as its last informative observation — a rate limit
+// that resets the run and then declines to count produces exactly that — and
+// inferring health from the counter alone asserts a read that never occurred.
+//
+// This check was once deleted as unreachable on an invariant held in ANOTHER
+// package. A change there made it reachable, and nothing failed. That is why it
+// is checked here rather than assumed.
+func TestFeedHealthyRequiresAnObservedSuccess(t *testing.T) {
+	now := time.Now()
+	failureWasTheLastThingLearned := ProviderReport{
+		ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
+		Coverage: history.CoverageEntry{
+			LastAttempt: now, LastInformative: now,
+			LastFailureClass: history.OutcomeHTTP, ConsecutiveFailures: 0,
+		},
+	}
+
+	if got := failureWasTheLastThingLearned.FeedVerdict(now); got == FeedHealthy {
+		t.Error("reported HEALTHY from a zero counter while the last thing learned was a failure")
+	}
+}
+
 // TestFeedVerdictGoesUnknownWhenStale: a verdict nobody has re-observed in
 // months must not keep failing the run. Silence is not evidence — including
 // silence in time.

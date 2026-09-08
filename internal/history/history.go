@@ -382,9 +382,6 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		pollingStopped := !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) > gap
 		learnedNothingTooLong := !cov.LastInformative.IsZero() &&
 			obs.At.Sub(cov.LastInformative) > informativeWindow
-		if pollingStopped || learnedNothingTooLong {
-			cov.ConsecutiveFailures = 0
-		}
 		// The run counts polling ROUNDS, not calls. Anything that can re-enter
 		// the poll on demand — the Retry affordance, the "Refresh now" button,
 		// any future trigger — would otherwise let a user advance the counter as
@@ -393,12 +390,22 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// counter refusing to move faster than the cadence is not.
 		//
 		// The attempt itself is still recorded above: someone did look.
+		//
+		// The reset and the increment are one decision, not two. Splitting them
+		// let a call reset the run to zero and then decline to count, leaving a
+		// record whose last informative observation is a FAILURE and whose run
+		// reads zero — which the verdict resolves to healthy. A rate limit that
+		// can invent health is worse than no rate limit.
 		tooSoonToCount := !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) < gap/4
-		if !tooSoonToCount {
-			cov.LastInformative = obs.At
-			cov.LastFailureClass = obs.FailureClass
-			cov.ConsecutiveFailures++
+		if tooSoonToCount {
+			break
 		}
+		if pollingStopped || learnedNothingTooLong {
+			cov.ConsecutiveFailures = 0
+		}
+		cov.LastInformative = obs.At
+		cov.LastFailureClass = obs.FailureClass
+		cov.ConsecutiveFailures++
 	}
 	h.coverage[id] = cov
 }

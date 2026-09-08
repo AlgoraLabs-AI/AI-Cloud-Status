@@ -284,6 +284,15 @@ func printReport(w io.Writer, r audit.Report) {
 				// FeedHealthy is defined on the last INFORMATIVE observation, and
 				// blind or skipped polls after it keep advancing LastAttempt. The
 				// shorter sentence would claim a read for polls that read nothing.
+				// Guarded, because a zero LastSuccess formats as an age of roughly
+				// 739,000 days — a fabricated timestamp printed as a measurement,
+				// which is the single defect this whole change set began with. The
+				// verdict should not produce this state; the formatter must not
+				// depend on that.
+				if p.Coverage.LastSuccess.IsZero() {
+					note = "  <- no captures on record, and no successful read has ever been recorded"
+					break
+				}
 				note = fmt.Sprintf("  <- no captures on record; the last poll that learned anything DID read the feed, %s",
 					humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)))
 			default:

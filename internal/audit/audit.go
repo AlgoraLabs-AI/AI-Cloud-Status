@@ -258,17 +258,20 @@ func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
 		// Failing, but not for long enough to assert it. One bad poll is not
 		// evidence of a broken feed.
 		return FeedUnknown
-	default:
-		// Reaching here means no failures are outstanding and something WAS
-		// learned, and RecordCoverage only clears the failure count on a success —
-		// which stamps LastSuccess and LastInformative together. So the last thing
-		// learned was that success.
+	case cov.LastSuccess.Equal(cov.LastInformative):
+		// The last thing actually learned was a successful read. CHECKED, not
+		// inferred from "no failures outstanding".
 		//
-		// An explicit `LastSuccess.Equal(LastInformative)` case used to sit here
-		// with an unreachable default behind it. Two arms where one can never run
-		// read as a considered choice between them; one arm and the invariant
-		// written down says what is actually true.
+		// This check was removed once as unreachable, on the reasoning that only a
+		// success clears the failure count. A later change to the recorder made it
+		// reachable — a reset that declines to count leaves zero failures with a
+		// FAILURE as the last informative observation — and the verdict then
+		// asserted a read that never happened, which is the whole class this file
+		// exists to prevent. An invariant enforced in another package is not an
+		// invariant; it is an assumption with a footnote.
 		return FeedHealthy
+	default:
+		return FeedUnknown
 	}
 }
 
