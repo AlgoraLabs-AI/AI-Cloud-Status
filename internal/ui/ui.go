@@ -180,7 +180,7 @@ type Controller struct {
 	// resets the failure counter on every failure and makes the verdict
 	// unreachable.
 	lastRoundCost time.Duration
-	connDown bool // every enabled connectivity target is currently unreachable
+	connDown      bool // every enabled connectivity target is currently unreachable
 	// connJudged is whether any connectivity target was checked at all. Without
 	// it connDown==false is ambiguous between "the link is fine" and "nothing
 	// was asked", and the second is not evidence of the first.

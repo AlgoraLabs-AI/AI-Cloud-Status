@@ -472,9 +472,9 @@ func Run(dir string) (Report, error) {
 
 	feedSamplesDir := filepath.Join(dir, "feed-samples")
 	report := Report{
-		GeneratedAt:    time.Now(),
-		AlertLogStart:  alertStart,
-		HistoryPresent: histFound && herr == nil && len(coverage) > 0,
+		GeneratedAt:        time.Now(),
+		AlertLogStart:      alertStart,
+		HistoryPresent:     histFound && herr == nil && len(coverage) > 0,
 		HistoryFound:       histFound,
 		HistoryErr:         histErr,
 		DiagnosticsEnabled: cfg.DebugLogging,
