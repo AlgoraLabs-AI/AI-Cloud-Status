@@ -234,7 +234,7 @@ func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
 	switch {
 	case !r.HasCoverage || cov.LastAttempt.IsZero():
 		return FeedUnknown
-	case cov.LastAttempt.After(now.Add(coverageFutureSlack)):
+	case cov.LastAttempt.After(now.Add(history.CoverageFutureSlack)):
 		// A record stamped ahead of now is clock damage, not an observation. It
 		// matters here and not only at load because the staleness escape below
 		// measures elapsed time: against a future stamp that value is negative,
@@ -258,10 +258,17 @@ func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
 		// Failing, but not for long enough to assert it. One bad poll is not
 		// evidence of a broken feed.
 		return FeedUnknown
-	case cov.LastSuccess.Equal(cov.LastInformative):
-		return FeedHealthy
 	default:
-		return FeedUnknown
+		// Reaching here means no failures are outstanding and something WAS
+		// learned, and RecordCoverage only clears the failure count on a success —
+		// which stamps LastSuccess and LastInformative together. So the last thing
+		// learned was that success.
+		//
+		// An explicit `LastSuccess.Equal(LastInformative)` case used to sit here
+		// with an unreachable default behind it. Two arms where one can never run
+		// read as a considered choice between them; one arm and the invariant
+		// written down says what is actually true.
+		return FeedHealthy
 	}
 }
 
@@ -270,9 +277,6 @@ func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
 // months-old verdict about a provider nobody has polled since.
 const coverageFreshness = 7 * 24 * time.Hour
 
-// coverageFutureSlack is how far ahead of the audit's clock a coverage stamp may
-// be before it is read as clock damage rather than as an observation.
-const coverageFutureSlack = time.Hour
 
 // FeedFault reports a coverage-tier fault worth failing the run over.
 //
@@ -327,12 +331,14 @@ type Report struct {
 	// A reader that cannot see which tier a verdict came from will trust a green
 	// report whose entire capture corpus was empty.
 	//
-	// HistoryPresent means the coverage tier can actually ANSWER: the file was
-	// there, it parsed, AND it holds at least one coverage entry. All three are
-	// required — an install upgraded to this build has a clean, parseable
-	// history.json with no coverage key at all, and calling that "tier present"
-	// while every verdict resolves to unknown is the contradiction the tier line
-	// exists to prevent.
+	// HistoryPresent means the coverage tier can actually ANSWER — NOT that the
+	// file exists, which is HistoryFound's job. Three conditions, all required:
+	// the file was there, it parsed, AND it holds at least one coverage entry.
+	//
+	// The third matters because an install upgraded to this build has a clean,
+	// parseable history.json with no coverage key at all, and calling that "tier
+	// present" while every verdict resolves to unknown is the contradiction the
+	// tier line exists to prevent.
 	//
 	// The other two make the three failure modes distinguishable, because a
 	// consumer that cannot tell them apart reports an evidence LOSS as a gap:

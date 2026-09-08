@@ -145,12 +145,24 @@ type CoverageEntry struct {
 // Erring long merely delays a verdict; erring short prevents one entirely.
 const failureRunGap = time.Hour
 
-// coverageFutureSlack mirrors Prune's futureSlack: how far ahead of now a
-// PERSISTED timestamp may be before it is treated as clock damage rather than an
-// observation. Coverage needs it more than the series does, because coverage is
-// monotonic — a future stamp does not just look odd, it refuses every later
-// observation.
-const coverageFutureSlack = time.Hour
+// informativeRunGapFactor is how many run-gaps of learning NOTHING may pass
+// before a failure run is no longer one episode. Looser than the attempt gap
+// because a blind stretch is an expected, legitimate state — the app polling
+// through a network outage — and only long enough of it means the failures on
+// either side are separate events rather than one.
+const informativeRunGapFactor = 6
+
+// CoverageFutureSlack is how far ahead of now a PERSISTED timestamp may be
+// before it is treated as clock damage rather than an observation.
+//
+// Exported so the audit uses THIS value rather than declaring its own. Two
+// packages judging the same file against two constants can disagree about what
+// counts as damage, and the disagreement would show up as the app and the audit
+// reporting different things about one record.
+//
+// Coverage needs the guard more than the sample ring does: it is monotonic, so a
+// future stamp does not merely look odd, it refuses every later observation.
+const CoverageFutureSlack = time.Hour
 
 // CoverageObservation is one poll's worth of attendance, as reported by the
 // caller that actually made the request.
@@ -320,7 +332,14 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		cov.LastInformative = obs.At
 		cov.LastFailureClass = ""
 		cov.ConsecutiveFailures = 0
-	case obs.Blind, obs.Skipped:
+	case obs.Skipped:
+		// Nothing was fetched because there was nothing to fetch. Unlike a blind
+		// attempt, this DOES say something: whatever the feed used to fail with no
+		// longer applies, so keeping the old class would report a failure the
+		// provider does not have any more. The failure RUN is untouched — a skip
+		// is not a success either.
+		cov.LastFailureClass = ""
+	case obs.Blind:
 		// Either the machine had no connectivity, or there was nothing to fetch.
 		// Neither is evidence about this feed. Record that we looked; change
 		// nothing else — in particular do NOT clear a real failure class, which is
@@ -332,20 +351,30 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// up to ten and read as sustained — a span with a working feed in the
 		// middle of it. Only a success resets the counter otherwise, and a long
 		// silence is not a success.
-		// Measured from the last ATTEMPT, not the last informative one. The
-		// question this asks is "did the looking stop?", and a blind attempt is
-		// still someone looking. Keying it on LastInformative made a connectivity
-		// blip — a stretch of attempts that deliberately teach nothing — read as
-		// a break in the run and silently reset a genuine failure streak, which
-		// is blind polls counting against the feed through the back door.
+		// A run continues only while BOTH remain true: the looking never stopped,
+		// AND something was still being learned. Either bound alone is wrong, and
+		// each was tried:
 		//
-		// Because blind attempts DO advance LastAttempt, a gap here only opens
-		// when polling actually stopped, so the bound can be generous.
+		//   keyed on LastInformative only — a connectivity blip is a stretch of
+		//     attempts that deliberately teach nothing, so it read as a break and
+		//     silently reset a genuine failure streak. Blind polls counting
+		//     against the feed through the back door.
+		//   keyed on LastAttempt only — blind attempts advance it, so an
+		//     arbitrarily long blind window never breaks a run at all, and
+		//     failures on either side of a week offline join into one.
+		//
+		// Attempts bound the first question and informative observations the
+		// second, so both are measured. informativeGap is deliberately looser: a
+		// blind stretch is expected and only becomes disqualifying when it is long
+		// enough that the run is no longer one continuous episode.
 		gap := obs.RunGap
 		if gap <= 0 {
 			gap = failureRunGap
 		}
-		if !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) > gap {
+		pollingStopped := !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) > gap
+		learnedNothingTooLong := !cov.LastInformative.IsZero() &&
+			obs.At.Sub(cov.LastInformative) > informativeRunGapFactor*gap
+		if pollingStopped || learnedNothingTooLong {
 			cov.ConsecutiveFailures = 0
 		}
 		cov.LastInformative = obs.At
@@ -401,13 +430,24 @@ func LoadCoverage(path string) (map[string]CoverageEntry, bool, error) {
 	// refused forever, and a frozen entry holding a failure run would fail the
 	// audit permanently. Discarding the entry costs one provider's history and
 	// restores a record that can move again.
-	cutoff := time.Now().Add(coverageFutureSlack)
-	for id, cov := range snap.Coverage {
+	dropFutureDated(snap.Coverage)
+	return snap.Coverage, true, nil
+}
+
+// dropFutureDated removes entries stamped implausibly far ahead of now.
+//
+// Shared by BOTH read paths on purpose. Guarding only the audit's reader left
+// the app's own Load unprotected, which is the path that matters more: the app
+// is what then refuses every later observation for that provider and rewrites
+// the file. A guard that covers one of two readers of the same file is not a
+// guard, it is a coin toss on which one sees the damage first.
+func dropFutureDated(m map[string]CoverageEntry) {
+	cutoff := time.Now().Add(CoverageFutureSlack)
+	for id, cov := range m {
 		if cov.LastAttempt.After(cutoff) {
-			delete(snap.Coverage, id)
+			delete(m, id)
 		}
 	}
-	return snap.Coverage, true, nil
 }
 
 // Coverage returns check id's attendance record and whether one exists.
@@ -605,7 +645,11 @@ func Load(path string, capacity int) (*History, error) {
 		h.series[id] = cp
 	}
 	// Symmetric with Save: coverage read into the snapshot has to be copied onto
-	// the History itself, or the next Save rebuilds the file without it.
+	// the History itself, or the next Save rebuilds the file without it. And the
+	// same clock-damage guard the audit's reader applies — this is the path that
+	// matters more, since the app is what refuses later observations and rewrites
+	// the file.
+	dropFutureDated(snap.Coverage)
 	maps.Copy(h.coverage, snap.Coverage)
 	return h, nil
 }

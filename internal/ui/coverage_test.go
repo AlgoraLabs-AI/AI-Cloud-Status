@@ -54,17 +54,22 @@ func TestCoverageObservation(t *testing.T) {
 			want: history.CoverageObservation{At: at, FailureClass: history.OutcomeTransport},
 		},
 		{
-			// And an answer that arrived is never blind, whatever the link says.
-			name:   "HTTP failure is never blind, even with no link",
+			// No exemption for "it answered". A captive portal or intercepting
+			// proxy replies 200 with a login page, which parses as garbage — so
+			// "the far end answered" is not proof the PROVIDER answered, and
+			// exempting it would file a portal as evidence against all fifteen
+			// feeds at once. The probe already covers the case the exemption was
+			// invented for: with a real link, this is evidence (the case above).
+			name:   "HTTP failure with no link is blind — an answer may not be the provider's",
 			st:     provState{when: at, outcome: history.OutcomeHTTP, err: errors.New("unexpected status 405")},
 			noLink: true,
-			want:   history.CoverageObservation{At: at, FailureClass: history.OutcomeHTTP},
+			want:   history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeHTTP},
 		},
 		{
-			name:   "parse failure is never blind either",
+			name:   "parse failure with no link is blind — this is what a portal looks like",
 			st:     provState{when: at, outcome: history.OutcomeParse, err: errors.New("bad json")},
 			noLink: true,
-			want:   history.CoverageObservation{At: at, FailureClass: history.OutcomeParse},
+			want:   history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeParse},
 		},
 		{
 			// Cancellation comes from the CALLER's ctx, not from st.err:

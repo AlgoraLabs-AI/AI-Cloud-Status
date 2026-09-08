@@ -375,10 +375,18 @@ func coverageObservation(st provState, noLink, cancelled bool, runGap time.Durat
 		// no verdict about the feed.
 		//
 		// noLink is the CONNECTIVITY PROBE's answer, not the offline latch — see
-		// the caller. An answer that did arrive is also never blind: an HTTP
-		// status or a parse failure proves the server replied over HTTPS, so it
-		// is evidence about this feed no matter what the machine believes.
-		Blind: st.err != nil && !answeredOverHTTP(st.outcome) && (noLink || cancelled),
+		// the caller.
+		//
+		// There is deliberately no "but it answered over HTTP" exemption. That
+		// existed only while blindness was keyed on the offline latch, which
+		// folded in "every provider failed" and so would have excused a
+		// fleet-wide feed outage with itself; the exemption was the patch for
+		// that circularity. With an independent witness the exemption is not
+		// merely redundant, it is harmful: a captive portal or intercepting proxy
+		// answers 200 with a login page, which parses as garbage, and the
+		// exemption would file that as positive evidence against every provider
+		// at once.
+		Blind: st.err != nil && (noLink || cancelled),
 		// Only set when the poll actually FAILED. RecordCoverage happens to read
 		// this field on that branch alone today, but its own doc says the value
 		// is "a failure class, or empty on success" — so passing "readable" or
@@ -397,14 +405,6 @@ func failureClassOf(st provState) string {
 	default:
 		return st.outcome
 	}
-}
-
-// answeredOverHTTP reports whether the outcome proves the far end actually
-// replied — a non-200 status, or bytes that did not parse. Both mean the
-// request completed over HTTPS, so the result says something about THIS feed no
-// matter what the machine-wide offline latch believes.
-func answeredOverHTTP(outcome string) bool {
-	return outcome == history.OutcomeHTTP || outcome == history.OutcomeParse
 }
 
 // carryLastOK folds the previous state's lastOK into a fresh observation: a
