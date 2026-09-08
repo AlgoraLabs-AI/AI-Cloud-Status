@@ -299,6 +299,47 @@ type provState struct {
 	// open the last time anyone could see — "resolved 1m ago" would otherwise be
 	// inferred from an absence that is our own blindness.
 	lastOK time.Time
+	// outcome is WHY this poll ended the way it did, as a history.Outcome*
+	// constant. Classified once, where the error is still in hand, so the sample
+	// and the coverage record can never disagree about the same poll.
+	//
+	// carryLastOK folds `prev` into a fresh observation but touches only lastOK,
+	// so this field is always the fresh poll's own answer.
+	outcome string
+}
+
+// feedOutcome maps a classified feed failure onto the coarser vocabulary the
+// history layer persists.
+//
+// history keeps its own constants rather than storing a providers value, for the
+// same reason IncidentLog stores a bare severity int: the on-disk format must not
+// move when the classifier gains a case. DNS, timeout, TLS and the unclassified
+// fallback all collapse to "transport" — the distinction matters in the log line
+// and in the UI, not in the answer to "was the feed readable".
+func feedOutcome(k providers.FeedFailure) string {
+	switch k {
+	case providers.FeedFailHTTP:
+		return history.OutcomeHTTP
+	case providers.FeedFailUnparseable:
+		return history.OutcomeParse
+	default:
+		return history.OutcomeTransport
+	}
+}
+
+// coverageFailureClass is the failure class to persist for a poll outcome, or ""
+// when the poll is not a failure.
+//
+// A SKIPPED check is deliberately not a failure: an Optional provider that
+// publishes no feed was looked at and is working as designed. Recording it as a
+// broken feed is the single misreading the coverage record exists to prevent.
+func coverageFailureClass(outcome string) string {
+	switch outcome {
+	case history.OutcomeReadable, history.OutcomeSkipped, "":
+		return ""
+	default:
+		return outcome
+	}
 }
 
 // carryLastOK folds the previous state's lastOK into a fresh observation: a
@@ -1449,7 +1490,10 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			// outage.
 			reachable := st.res.Reachable() && !st.skipped
 			up := reachable && unmutedSeverity(st.res, interest) < providers.SevMajor
-			sample := history.Sample{Time: st.when, Up: up, Unknown: !reachable, Latency: st.latency}
+			sample := history.Sample{
+				Time: st.when, Up: up, Unknown: !reachable,
+				Latency: st.latency, Outcome: st.outcome,
+			}
 			if !up && reachable {
 				sample.DownRegions, _ = sampleDownRegions(st.res, interest)
 			}
@@ -1464,6 +1508,16 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 				}
 			}
 			c.history.Add(p.ID, sample)
+
+			// Attendance, separately from the sample. The ring is display-scoped
+			// and Prune truncates it to the uptime window at every launch, so it
+			// cannot answer "when did this feed LAST work" once an outage outlives
+			// that window — which is exactly the question asked after the fact.
+			// Coverage is a per-check high-water mark and is never pruned, so it
+			// can. Skipped checks are recorded as attempts with no success and no
+			// failure class: an Optional provider with no public feed was looked
+			// at, and it is not broken.
+			c.history.RecordCoverage(p.ID, st.when, st.outcome == history.OutcomeReadable, coverageFailureClass(st.outcome))
 
 			// Journal every incident the feed currently lists so the detail
 			// panel can show a last-24h history after they resolve. Recorded
@@ -1537,6 +1591,7 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 	switch {
 	case err == providers.ErrNoFeed:
 		st.skipped = true
+		st.outcome = history.OutcomeSkipped
 	case err != nil:
 		st.err = err
 		st.res = providers.Result{Feed: providers.FeedUnreachable}
@@ -1547,10 +1602,12 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 		// reason and the raw error both go in; the reason is what you grep for,
 		// the error is what you send to whoever owns the network.
 		kind, code := providers.ClassifyFeedFailure(err)
+		st.outcome = feedOutcome(kind)
 		slog.Warn("provider feed unreadable", "id", p.ID, "reason", kind.String(),
 			"http_status", code, "attempts", tries, "err", err)
 	default:
 		st.res = res
+		st.outcome = history.OutcomeReadable
 	}
 	st.when = time.Now()
 	return st

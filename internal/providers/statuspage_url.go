@@ -5,7 +5,7 @@ package providers
 // app polls. Clicking a provider name in the table opens this.
 var statusPageURLs = map[string]string{
 	"openai":      "https://status.openai.com",
-	"anthropic":   "https://status.anthropic.com",
+	"anthropic":   "https://status.claude.com", // moved from status.anthropic.com; keep in step with anthropic.go
 	"gemini":      "https://status.cloud.google.com", // Gemini health is reported under Google Cloud
 	"mistral":     "https://status.mistral.ai",
 	"cohere":      "https://status.cohere.com",

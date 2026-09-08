@@ -21,6 +21,7 @@ import (
 
 	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/alertlog"
 	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/config"
+	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/history"
 	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/monitor"
 	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/providers"
 )
@@ -120,9 +121,37 @@ type Finding struct {
 // major incident as if it were still part of the old one — see
 // boundOpenIntervals.
 type MissingRecovery struct {
-	Start     time.Time // when alert-log recorded the outage opening
-	ClearedAt time.Time // the later capture proving it actually resolved
+	// Kind separates the two ways a window ends without a logged recovery. Its
+	// zero value is ClearedByCapture, the case that carries ClearedAt.
+	Kind  MissingRecoveryKind
+	Start time.Time // when alert-log recorded the outage opening
+	// ClearedAt is the later capture proving it actually resolved. Set ONLY for
+	// ClearedByCapture; for BoundedByHorizon no such capture exists and this
+	// stays zero. Read Kind — never ClearedAt.IsZero(). A formatter that printed
+	// this field unconditionally is what emitted the literal
+	// "cleared by 0000-12-31 21:00:00", asserting a clearance nobody observed.
+	ClearedAt time.Time
 }
+
+// MissingRecoveryKind separates the two ways an outage window ends without a
+// logged recovery. They are different findings and must not read alike.
+//
+// A discriminator rather than a second timestamp on purpose: a "BoundedAt" field
+// would carry the auditor's own horizon POLICY inside a finding about the
+// incident, and the zero-value hazard would just move to the other branch.
+type MissingRecoveryKind int
+
+const (
+	// ClearedByCapture: a later capture read below Major, so the feed proves the
+	// incident really did resolve and only the recovery ALERT is missing — a
+	// delivery/logging gap, not a false outage.
+	ClearedByCapture MissingRecoveryKind = iota
+	// BoundedByHorizon: nothing ever corroborated the window closing, and the
+	// record continued past the point it stopped being supported, so the window
+	// was closed by policy to stop it certifying every later capture. There is NO
+	// evidence the incident cleared; it may still be open right now.
+	BoundedByHorizon
+)
 
 // ProviderReport summarizes one provider's audit.
 type ProviderReport struct {
@@ -136,6 +165,45 @@ type ProviderReport struct {
 	LastAlertTime     time.Time // zero if never in alert-log
 	Findings          []Finding // only true-major captures, chronological
 	MissingRecoveries []MissingRecovery
+	// Coverage is this provider's attendance record from history.json, and
+	// HasCoverage says whether one exists at all. This is a DIFFERENT evidence
+	// tier from everything above it: captures and the alert log are written only
+	// when diagnostics are enabled, while history is ordinary user state that is
+	// always written. Keep the two apart when reporting — see Report.
+	Coverage    history.CoverageEntry
+	HasCoverage bool
+}
+
+// FeedVerdict is the three-way answer NeverCaptured could never give.
+type FeedVerdict int
+
+const (
+	// FeedUnknown: no coverage record. Either nothing ever polled this provider,
+	// or every poll predates the build that records coverage. NOT a fault.
+	FeedUnknown FeedVerdict = iota
+	// FeedHealthy: polled, and at least one poll read the feed successfully.
+	FeedHealthy
+	// FeedBroken: polled repeatedly and NEVER once read successfully. This is the
+	// case that used to be indistinguishable from "genuinely operational all
+	// window", and the reason the audit could not tell the two apart.
+	FeedBroken
+)
+
+// FeedVerdict classifies whether this provider's feed could actually be read,
+// from the attendance record rather than by inferring it from an absence.
+//
+// It deliberately does not look at Findings or captures: those are the tier that
+// only exists when diagnostics are on, and mixing the two is what made the old
+// advisory untrustworthy.
+func (r ProviderReport) FeedVerdict() FeedVerdict {
+	switch {
+	case !r.HasCoverage || r.Coverage.LastAttempt.IsZero():
+		return FeedUnknown
+	case !r.Coverage.LastSuccess.IsZero():
+		return FeedHealthy
+	default:
+		return FeedBroken
+	}
 }
 
 // UncoveredCount returns how many Findings are genuinely Uncovered.
@@ -172,6 +240,16 @@ type Report struct {
 	GeneratedAt   time.Time
 	AlertLogStart time.Time // zero if alert-log.jsonl doesn't exist / is empty
 	Providers     []ProviderReport
+	// HistoryPresent says whether history.json existed, which is what makes the
+	// coverage tier answerable at all.
+	//
+	// It is reported separately from the alert log and the captures because the
+	// three are NOT the same grade of evidence: alert-log.jsonl and feed-samples/
+	// are written only while diagnostics are enabled and are absent on a default
+	// install, while history.json is ordinary user state and is always written.
+	// A reader that cannot see which tier a verdict came from will trust a green
+	// report whose entire capture corpus was empty.
+	HistoryPresent bool
 }
 
 // transition is one alert-log line for a provider, restricted to the
@@ -278,8 +356,24 @@ func Run(dir string) (Report, error) {
 		}
 	}
 
+	// The coverage tier. history.json is loaded separately from the capture and
+	// alert-log corpora above and stays separate all the way to the exit code: it
+	// is user state written on every poll, so it is the only witness that exists
+	// on an install with diagnostics off. Load failures are non-fatal — a missing
+	// or unreadable history simply means no coverage verdicts, never a wrong one.
+	histPath := filepath.Join(dir, "history.json")
+	hist, herr := history.Load(histPath, history.DefaultCapacity)
+	historyPresent := false
+	if herr == nil {
+		// Load returns an empty History for a missing file rather than an error,
+		// so its success does not prove the file was there.
+		if _, statErr := os.Stat(histPath); statErr == nil {
+			historyPresent = true
+		}
+	}
+
 	feedSamplesDir := filepath.Join(dir, "feed-samples")
-	report := Report{GeneratedAt: time.Now(), AlertLogStart: alertStart}
+	report := Report{GeneratedAt: time.Now(), AlertLogStart: alertStart, HistoryPresent: historyPresent}
 	for _, p := range providers.Default() {
 		captures, err := loadCaptures(filepath.Join(feedSamplesDir, p.ID), p, cfg.Regions)
 		if err != nil {
@@ -296,6 +390,9 @@ func Run(dir string) (Report, error) {
 			TotalCaptures:     len(captures),
 			LastAlertTime:     lastAlertByID[p.ID],
 			MissingRecoveries: missing,
+		}
+		if hist != nil {
+			pr.Coverage, pr.HasCoverage = hist.Coverage(p.ID)
 		}
 		for _, c := range captures {
 			if c.Time.After(pr.LastCaptureTime) {
@@ -375,7 +472,9 @@ func boundOpenIntervals(windows []interval, captures []Capture, tolerance time.D
 			}
 			if c.Severity < providers.SevMajor {
 				out[i].End = c.Time
-				missing = append(missing, MissingRecovery{Start: out[i].Start, ClearedAt: c.Time})
+				missing = append(missing, MissingRecovery{
+					Kind: ClearedByCapture, Start: out[i].Start, ClearedAt: c.Time,
+				})
 				cleared = true
 				break
 			}
@@ -411,7 +510,10 @@ func boundOpenIntervals(windows []interval, captures []Capture, tolerance time.D
 		bound := lastSupport.Add(openWindowHorizon)
 		if !recordEnd.IsZero() && recordEnd.After(bound) {
 			out[i].End = bound
-			missing = append(missing, MissingRecovery{Start: out[i].Start})
+			// No clearing capture was ever seen: the window is closed by POLICY,
+			// not by evidence. ClearedAt stays zero and Kind says so, because the
+			// incident may well still be open.
+			missing = append(missing, MissingRecovery{Kind: BoundedByHorizon, Start: out[i].Start})
 		}
 	}
 	return out, missing

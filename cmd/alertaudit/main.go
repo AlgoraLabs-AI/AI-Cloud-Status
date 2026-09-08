@@ -123,12 +123,26 @@ func printContinuity(w *os.File, r audit.ContinuityReport) {
 // "no uncovered major incidents found" — a contradiction that teaches the
 // operator to ignore exit 1, which is the same output a genuinely broken feed
 // produces. AllCapturesUnparseable covers the broken-parser case with actual
-// evidence. Telling healthy from broken needs a signal the audit does not
-// persist today (a per-provider last-successful-poll), so until that exists the
-// honest thing is to surface it as advisory rather than assert it as a fault.
+// evidence.
+//
+// The per-provider last-successful-poll this comment used to say did not exist
+// now does — history.CoverageEntry — so FeedBroken IS a fault: the feed was
+// polled and never once read, which is positive evidence rather than the absence
+// NeverCaptured reports.
+//
+// The two tiers are judged SEPARATELY and neither is inferred from the other: no
+// capture-tier verdict rests on coverage data, and the coverage verdict never
+// rests on how many captures exist. That separation is the point. Mixing them is
+// how an empty capture corpus on a default install would read as "all clear"
+// while the coverage record showed a feed unreadable for weeks.
 func hasIssues(r audit.Report) bool {
 	for _, p := range r.Providers {
+		// CAPTURE tier — only meaningful when diagnostics were on.
 		if p.UncoveredCount() > 0 || p.AllCapturesUnparseable() || len(p.MissingRecoveries) > 0 {
+			return true
+		}
+		// COVERAGE tier — always available, judged on its own evidence.
+		if p.Enabled && p.HasPublicFeed && p.FeedVerdict() == audit.FeedBroken {
 			return true
 		}
 	}
@@ -142,6 +156,17 @@ func printReport(w *os.File, r audit.Report) {
 	} else {
 		fmt.Fprintf(w, "alert-log.jsonl covers since %s. Captures older than that are labeled pre-alertlog, not a miss.\n",
 			r.AlertLogStart.Local().Format("2006-01-02 15:04"))
+	}
+	// Name the evidence tiers explicitly. They are NOT interchangeable: captures
+	// and the alert log exist only while diagnostics are enabled, so on a default
+	// install both are empty and every capture-tier verdict below is vacuous —
+	// which reads identically to "all clear" unless the report says otherwise.
+	if r.HistoryPresent {
+		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier (feed-samples + alert-log, written only while diagnostics are on) "+
+			"and COVERAGE tier (history.json, always written). Both present.")
+	} else {
+		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier only — history.json is absent, so no coverage verdict can be given "+
+			"and 'no captures' below stays ambiguous.")
 	}
 	fmt.Fprintln(w, "Severity is re-derived from each raw capture with the CURRENTLY registered parser — a mismatch here reflects "+
 		"today's parser against the historical alert trail, not necessarily what the parser in production at capture time decided.")
@@ -165,8 +190,20 @@ func printReport(w *os.File, r audit.Report) {
 		note := ""
 		switch {
 		case p.NeverCaptured():
-			// Advisory only — it does not fail the run. See hasIssues.
-			note = "  <- no captures on record: healthy all window, or its feed never loaded (cannot tell apart)"
+			// Zero captures used to be a three-way ambiguity the archive could not
+			// resolve. The coverage tier resolves it directly — it records whether
+			// the feed was ever READ, rather than inferring health from an absence.
+			switch p.FeedVerdict() {
+			case audit.FeedBroken:
+				note = fmt.Sprintf("  <- FEED NEVER READ: polled, last attempt %s, never once succeeded (last failure: %s)",
+					humanAge(r.GeneratedAt.Sub(p.Coverage.LastAttempt)), p.Coverage.LastFailureClass)
+			case audit.FeedHealthy:
+				note = fmt.Sprintf("  <- no captures because it was healthy: feed last read OK %s",
+					humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)))
+			default:
+				// Advisory only — it does not fail the run. See hasIssues.
+				note = "  <- no captures and no coverage record: healthy all window, feed never loaded, or never polled (cannot tell apart)"
+			}
 		case p.AllCapturesUnparseable():
 			note = "  <- EVERY capture fails to parse with the current adapter; likely broken right now"
 		}
@@ -190,16 +227,35 @@ func printReport(w *os.File, r audit.Report) {
 		}
 	}
 
+	// The two Kinds get separate headers because they are separate findings. The
+	// single merged header is what claimed "the raw feed later showed it had
+	// cleared" for windows where nothing of the sort was ever observed — and then
+	// formatted the zero ClearedAt as the literal "0000-12-31 21:00:00", printing
+	// a fabricated timestamp as if it were a measurement.
 	anyMissingRecovery := false
+	clearedHeader, boundedHeader := false, false
 	for _, p := range r.Providers {
 		for _, m := range p.MissingRecoveries {
-			if !anyMissingRecovery {
-				fmt.Fprintln(w, "MISSING RECOVERY — the outage alert fired, but alert-log never recorded it clearing "+
-					"(the raw feed later showed it had, so this is a delivery/logging gap, not a false outage):")
-				anyMissingRecovery = true
+			anyMissingRecovery = true
+			switch m.Kind {
+			case audit.ClearedByCapture:
+				if !clearedHeader {
+					fmt.Fprintln(w, "MISSING RECOVERY — the outage alert fired, but alert-log never recorded it clearing "+
+						"(the raw feed later showed it had, so this is a delivery/logging gap, not a false outage):")
+					clearedHeader = true
+				}
+				fmt.Fprintf(w, "  [%s] opened %s, feed showed it cleared by %s but no recovery was ever logged\n",
+					p.ID, m.Start.Local().Format("2006-01-02 15:04:05"), m.ClearedAt.Local().Format("2006-01-02 15:04:05"))
+			default:
+				if !boundedHeader {
+					fmt.Fprintln(w, "OUTAGE WINDOW LEFT OPEN — the outage alert fired, no recovery was ever logged, and NOTHING "+
+						"in the archive shows it clearing. The window was closed by the auditor's own horizon so it could not "+
+						"certify every later capture. The incident may still be open:")
+					boundedHeader = true
+				}
+				fmt.Fprintf(w, "  [%s] opened %s — no corroborating evidence that it ever cleared\n",
+					p.ID, m.Start.Local().Format("2006-01-02 15:04:05"))
 			}
-			fmt.Fprintf(w, "  [%s] opened %s, feed showed it cleared by %s but no recovery was ever logged\n",
-				p.ID, m.Start.Local().Format("2006-01-02 15:04:05"), m.ClearedAt.Local().Format("2006-01-02 15:04:05"))
 		}
 	}
 
@@ -216,7 +272,7 @@ func printReport(w *os.File, r audit.Report) {
 	}
 
 	if !anyUncovered && !anyMissingRecovery && !anyUnparseable {
-		fmt.Fprintln(w, "No uncovered major incidents, missing recoveries, or broken parsers found — every real "+
+		fmt.Fprintln(w, "No uncovered major incidents, unrecovered outage windows, or broken parsers found — every real "+
 			"major-severity capture matches (or is explained by suppression / predating alert-log).")
 	} else {
 		fmt.Fprintln(w, "See the sections above for what needs a look — everything not listed there checked out clean.")

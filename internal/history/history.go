@@ -7,6 +7,7 @@ package history
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"sort"
 	"sync"
@@ -76,6 +77,48 @@ type Sample struct {
 	DownRegions     []string      `json:"dr,omitempty"`
 	Degraded        bool          `json:"dg,omitempty"`
 	DegradedRegions []string      `json:"dgr,omitempty"`
+	// Outcome says WHY Unknown is set, which the bool alone cannot: Unknown
+	// collapses an unreadable feed and a deliberately skipped check into one
+	// value, so a reader that treats every Unknown as a broken feed misreads an
+	// Optional provider that has no feed at all. Empty on samples written before
+	// this field existed, and on the ping and custom-URL paths, which never set
+	// Unknown — there, failing to respond IS the monitored signal.
+	Outcome string `json:"oc,omitempty"`
+}
+
+// Outcome values for Sample.Outcome, and for CoverageEntry.LastFailureClass.
+//
+// Plain strings rather than a typed enum borrowed from providers, for the same
+// reason Incident stores a bare severity int: this package stays decoupled from
+// the providers package.
+const (
+	OutcomeReadable  = "readable"
+	OutcomeTransport = "transport"
+	OutcomeHTTP      = "http"
+	OutcomeParse     = "parse"
+	OutcomeSkipped   = "skipped"
+)
+
+// CoverageEntry is the per-check attendance record: was anyone watching, and did
+// the look succeed.
+//
+// It answers the one question no event store can. Every other artifact this app
+// writes is edge- or failure-triggered, and silence in an event store is not
+// evidence — "nothing happened" and "nobody was watching" produce the identical
+// empty result. cmd/alertaudit names the missing primitive in its own source,
+// "a per-provider last-successful-poll", and this is it.
+//
+// It is deliberately NOT a Sample: it is a high-water mark, not an observation,
+// so it is bounded by the number of checks rather than by time, and it must
+// survive Prune. See onDisk, where it is a sibling of Series for exactly that
+// reason — the same idiom, and the same justification, as TotalLoss sitting
+// beside Checks in the outage state file.
+type CoverageEntry struct {
+	LastAttempt time.Time `json:"la"`
+	// omitzero, not omitempty: omitempty has no effect on a struct field, so a
+	// never-succeeded check would serialize a zero time rather than omit it.
+	LastSuccess      time.Time `json:"ls,omitzero"`
+	LastFailureClass string    `json:"lfc,omitempty"`
 }
 
 // History is a concurrency-safe collection of per-check ring buffers.
@@ -84,6 +127,13 @@ type History struct {
 	cap    int
 	caps   map[string]int // per-check cap overrides (see SetCap)
 	series map[string][]Sample
+	// coverage is NOT a ring buffer and is never pruned. It has to live on the
+	// in-memory History rather than only in onDisk, because Save rebuilds the
+	// snapshot from these fields on every call — a field that exists only in the
+	// serialized form is read into the snapshot at Load, dropped, and then erased
+	// by the next Save. Keeping the reader and the writer symmetric here is the
+	// whole reason this is a struct field and not a local.
+	coverage map[string]CoverageEntry
 }
 
 // New returns an empty History retaining up to capacity samples per check.
@@ -92,7 +142,12 @@ func New(capacity int) *History {
 	if capacity <= 0 {
 		capacity = DefaultCapacity
 	}
-	return &History{cap: capacity, caps: map[string]int{}, series: map[string][]Sample{}}
+	return &History{
+		cap:      capacity,
+		caps:     map[string]int{},
+		series:   map[string][]Sample{},
+		coverage: map[string]CoverageEntry{},
+	}
 }
 
 // Capacity returns the default per-check sample cap.
@@ -159,6 +214,41 @@ func (h *History) Last(id string) (time.Time, int) {
 	return buf[len(buf)-1].Time, len(buf)
 }
 
+// RecordCoverage updates check id's attendance record for one poll: the attempt
+// always, and either the success time or the failure class.
+//
+// failureClass is one of the Outcome constants, or "" on success. Callers on the
+// ping and custom-URL paths do not use this — coverage answers "could the feed be
+// read", which is only a question for checks that HAVE a feed.
+func (h *History) RecordCoverage(id string, at time.Time, ok bool, failureClass string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.coverage == nil { // a History built by a zero literal rather than New
+		h.coverage = map[string]CoverageEntry{}
+	}
+	cov := h.coverage[id]
+	cov.LastAttempt = at
+	if ok {
+		cov.LastSuccess = at
+		cov.LastFailureClass = ""
+	} else {
+		cov.LastFailureClass = failureClass
+	}
+	h.coverage[id] = cov
+}
+
+// Coverage returns check id's attendance record and whether one exists.
+//
+// A false second return means this check was never polled by a build that
+// records coverage — which is NOT the same as "the feed never loaded", and
+// callers must keep the two apart.
+func (h *History) Coverage(id string) (CoverageEntry, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	cov, ok := h.coverage[id]
+	return cov, ok
+}
+
 // Prune drops samples outside the plausible display range from every series:
 // older than now-maxAge (they can never render in the uptime window again) and
 // further than an hour into the future (clock changes / corrupt persisted
@@ -210,13 +300,25 @@ func (h *History) Uptime(id string) (float64, bool) {
 	if len(buf) == 0 {
 		return 0, false
 	}
-	up := 0
+	up, known := 0, 0
 	for _, s := range buf {
+		// Unknown samples are neither up nor down, so they belong in neither
+		// half of the ratio. Counting them in the denominator — which this did
+		// until 2026-09-08 — reports a check whose feed was unreadable all
+		// window as though it had been DOWN all window, contradicting the
+		// Sample doc above and inverting the one signal a reader wants.
+		if s.Unknown {
+			continue
+		}
+		known++
 		if s.Up {
 			up++
 		}
 	}
-	return float64(up) / float64(len(buf)), true
+	if known == 0 {
+		return 0, false // nothing was actually observed: no percentage is honest
+	}
+	return float64(up) / float64(known), true
 }
 
 // LastLatency returns the most recent recorded latency for check id.
@@ -247,18 +349,37 @@ type onDisk struct {
 	Version int                 `json:"version"`
 	Cap     int                 `json:"cap"`
 	Series  map[string][]Sample `json:"series"`
+	// Coverage is a SIBLING of Series, not a member of it, because the two carry
+	// different lifetimes: Series is a display-scoped ring that Prune truncates
+	// to the uptime window at every launch, while Coverage is a per-check
+	// high-water mark that must outlive it. Prune walks h.series only, so a
+	// sibling is pruning-exempt by construction — which is what lets this answer
+	// "when did this feed last work" over months without storing months.
+	//
+	// omitempty so a build that has never recorded coverage writes a file a
+	// previous version reads unchanged.
+	Coverage map[string]CoverageEntry `json:"coverage,omitempty"`
 }
 
 // Save atomically writes the history to path (temp file + rename), creating the
 // parent directory if needed.
 func (h *History) Save(path string) error {
 	h.mu.Lock()
-	snap := onDisk{Version: snapshotVersion, Cap: h.cap, Series: map[string][]Sample{}}
+	snap := onDisk{
+		Version:  snapshotVersion,
+		Cap:      h.cap,
+		Series:   map[string][]Sample{},
+		Coverage: map[string]CoverageEntry{},
+	}
 	for id, buf := range h.series {
 		cp := make([]Sample, len(buf))
 		copy(cp, buf)
 		snap.Series[id] = cp
 	}
+	// Coverage is copied here for the same reason Series is: this snapshot is
+	// rebuilt from scratch on every Save, so anything not copied across is
+	// silently erased on the next write.
+	maps.Copy(snap.Coverage, h.coverage)
 	h.mu.Unlock()
 
 	data, err := json.Marshal(snap)
@@ -308,5 +429,8 @@ func Load(path string, capacity int) (*History, error) {
 		copy(cp, buf)
 		h.series[id] = cp
 	}
+	// Symmetric with Save: coverage read into the snapshot has to be copied onto
+	// the History itself, or the next Save rebuilds the file without it.
+	maps.Copy(h.coverage, snap.Coverage)
 	return h, nil
 }
