@@ -237,31 +237,81 @@ func TestConsecutiveFailuresIsWhatMakesAVerdictPossible(t *testing.T) {
 	}
 }
 
-// TestUptimeExcludesUnknown pins the contract Sample's own doc states: unknown
-// samples are neither up nor down and belong in neither half of the ratio.
+// TestSaveThenLoadCoverageRoundTrip pins the writer and the coverage-only reader
+// against each other.
 //
-// Counting them in the denominator reported a provider whose feed was unreadable
-// all window as though it had been DOWN all window — inverting the one signal a
-// reader wants from this number.
-func TestUptimeExcludesUnknown(t *testing.T) {
+// Save and LoadCoverage are two code paths over one JSON key. Nothing else makes
+// them agree — and if they drift, LoadCoverage finds nothing, returns an empty
+// map with NO error, and the audit reports the coverage tier as present while
+// every verdict resolves to "unknown". The feature would be dead and silent.
+func TestSaveThenLoadCoverageRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.json")
+	at := time.Now().Truncate(time.Second)
+
 	h := New(100)
-	now := time.Now()
-	h.Add("p", Sample{Time: now, Up: true})
-	h.Add("p", Sample{Time: now, Up: false, Unknown: true})
-	h.Add("p", Sample{Time: now, Up: false, Unknown: true})
+	h.Add("p", Sample{Time: at, Up: true}) // a series too, so the reader must skip it
+	h.RecordCoverage("p", CoverageObservation{At: at, FailureClass: OutcomeHTTP})
+	if err := h.Save(path); err != nil {
+		t.Fatal(err)
+	}
 
-	got, ok := h.Uptime("p")
+	cov, found, err := LoadCoverage(path)
+	if err != nil || !found {
+		t.Fatalf("LoadCoverage = (_, %v, %v), want (map, true, nil)", found, err)
+	}
+	got, ok := cov["p"]
 	if !ok {
-		t.Fatal("Uptime reported no data despite one known sample")
+		t.Fatal("LoadCoverage found no entry that Save had just written — the writer and this reader have drifted")
 	}
-	if got != 1.0 {
-		t.Errorf("Uptime = %v, want 1.0 — one known sample, up; the two unknowns are neither up nor down", got)
+	if got.ConsecutiveFailures != 1 || got.LastFailureClass != OutcomeHTTP {
+		t.Errorf("entry = %+v, want 1 failure of class %q", got, OutcomeHTTP)
+	}
+}
+
+// TestLoadCoverageDistinguishesAbsentFromUnreadable: a corrupt file must not
+// report as a missing one. They are different facts calling for different
+// responses, and reporting the loss as a gap is how evidence loss goes unseen.
+func TestLoadCoverageDistinguishesAbsentFromUnreadable(t *testing.T) {
+	dir := t.TempDir()
+
+	_, found, err := LoadCoverage(filepath.Join(dir, "nope.json"))
+	if found || err != nil {
+		t.Errorf("missing file = (found %v, err %v), want (false, nil)", found, err)
 	}
 
-	// All-unknown is not 0% uptime, it is "no percentage is honest".
-	h2 := New(100)
-	h2.Add("q", Sample{Time: now, Up: false, Unknown: true})
-	if _, ok := h2.Uptime("q"); ok {
-		t.Error("Uptime returned a percentage for an all-unknown series; nothing was actually observed")
+	corrupt := filepath.Join(dir, "corrupt.json")
+	if err := os.WriteFile(corrupt, []byte(`{"version":1,"series":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, found, err = LoadCoverage(corrupt)
+	if !found {
+		t.Error("a corrupt file must report as FOUND; calling it absent hides an evidence loss")
+	}
+	if err == nil {
+		t.Error("a corrupt file must report its error, not return an empty map silently")
+	}
+}
+
+// TestSkippedPollIsNotAFeedFailure: an Optional provider that publishes no feed
+// answers 404 and is skipped by design. Counting that as a failure gives a
+// provider working exactly as intended a sustained "broken feed" run.
+func TestSkippedPollIsNotAFeedFailure(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	for i := range 30 {
+		h.RecordCoverage("groq", CoverageObservation{
+			At: t0.Add(time.Duration(i) * time.Minute), Skipped: true,
+		})
+	}
+	cov, ok := h.Coverage("groq")
+	if !ok {
+		t.Fatal("a skipped poll is still an attempt and must be recorded")
+	}
+	if cov.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d after 30 skipped polls, want 0", cov.ConsecutiveFailures)
+	}
+	if cov.LastFailureClass != "" {
+		t.Errorf("LastFailureClass = %q, want empty — nothing failed", cov.LastFailureClass)
 	}
 }

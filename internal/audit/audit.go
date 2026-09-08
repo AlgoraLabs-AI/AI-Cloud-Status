@@ -212,29 +212,49 @@ const sustainedFailureAttempts = 10
 // It deliberately does not look at Findings or captures: those are the tier that
 // only exists when diagnostics are on, and mixing the two is what made the old
 // advisory untrustworthy.
-func (r ProviderReport) FeedVerdict() FeedVerdict {
+// It takes `now` rather than reading a clock, so a verdict is reproducible and a
+// caller cannot get a different answer than the report it is printing.
+func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
 	switch {
 	case !r.HasCoverage || r.Coverage.LastAttempt.IsZero():
 		return FeedUnknown
-	case r.Coverage.ConsecutiveFailures == 0:
-		return FeedHealthy
-	case r.Coverage.ConsecutiveFailures >= sustainedFailureAttempts:
-		return FeedBroken
-	default:
-		// Failing, but not for long enough to assert it. One bad poll is not
-		// evidence of a broken feed — which is the same absence-vs-evidence line
-		// this whole change exists to hold.
+	case now.Sub(r.Coverage.LastAttempt) > coverageFreshness:
+		// Nobody has looked in a long time. Whatever the record says was true
+		// then, not now — and a verdict nobody has re-observed since is the same
+		// "silence is not evidence" error this file argues against, pointed at
+		// time instead of at captures.
 		return FeedUnknown
+	case r.Coverage.ConsecutiveFailures > 0:
+		if r.Coverage.ConsecutiveFailures >= sustainedFailureAttempts {
+			return FeedBroken
+		}
+		// Failing, but not for long enough to assert it. One bad poll is not
+		// evidence of a broken feed.
+		return FeedUnknown
+	case r.Coverage.LastSuccess.IsZero():
+		// No failures counted AND no success ever recorded. That is not health:
+		// it is what a run of blind or skipped attempts looks like, since neither
+		// advances the failure count. Calling it healthy would assert a reading
+		// that never happened — the same fabricated-observation class this change
+		// set exists to remove.
+		return FeedUnknown
+	default:
+		return FeedHealthy
 	}
 }
+
+// coverageFreshness bounds how long a coverage record is allowed to speak for
+// the present. Past it the audit reports "unknown" rather than repeating a
+// months-old verdict about a provider nobody has polled since.
+const coverageFreshness = 7 * 24 * time.Hour
 
 // FeedFault reports a coverage-tier fault worth failing the run over.
 //
 // The exit code and the printed report must both come from HERE. Deriving the
 // condition independently in two places is how a run ends up exiting 1 while its
 // own report says nothing was found.
-func (r ProviderReport) FeedFault() bool {
-	return r.Enabled && r.HasPublicFeed && r.FeedVerdict() == FeedBroken
+func (r ProviderReport) FeedFault(now time.Time) bool {
+	return r.Enabled && r.HasPublicFeed && r.FeedVerdict(now) == FeedBroken
 }
 
 // UncoveredCount returns how many Findings are genuinely Uncovered.

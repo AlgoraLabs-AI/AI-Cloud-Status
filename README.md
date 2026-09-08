@@ -117,7 +117,7 @@ A normal install writes exactly five things there, all of them your own state:
 | File | What it is |
 | --- | --- |
 | `config.json` | Your settings: which checks are on, intervals, regions, mutes, language |
-| `history.json` | The uptime strip's samples, so the last 24 h survives a restart |
+| `history.json` | The uptime strip's samples, so the last 24 h survives a restart — plus a small per-provider coverage record (last attempt, last successful read, current run of failures) that is **not** trimmed with the samples, so "when did this feed last work" survives longer than the strip does |
 | `incidents.json` | The incident journal behind "Incident history — last 24 h" |
 | `open-outages.json` | Outages still open at shutdown, so their recovery alert is not swallowed |
 | `instance.lock` | The single-instance guard |

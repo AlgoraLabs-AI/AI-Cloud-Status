@@ -144,9 +144,10 @@ func hasIssues(r audit.Report) bool {
 		}
 		// COVERAGE tier — always available, judged on its own evidence.
 		// FeedFault is the SAME predicate printReport uses for its coverage
-		// section. Re-deriving it here would let the exit code and the report
-		// drift apart, which is how a run exits 1 next to "nothing found".
-		if p.FeedFault() {
+		// section, evaluated against the SAME clock. Re-deriving it here would let
+		// the exit code and the report drift apart, which is how a run exits 1
+		// next to "nothing found".
+		if p.FeedFault(r.GeneratedAt) {
 			return true
 		}
 	}
@@ -207,13 +208,15 @@ func printReport(w io.Writer, r audit.Report) {
 			// Zero captures used to be a three-way ambiguity the archive could not
 			// resolve. The coverage tier resolves it directly — it records whether
 			// the feed was ever READ, rather than inferring health from an absence.
-			switch p.FeedVerdict() {
+			switch p.FeedVerdict(r.GeneratedAt) {
 			case audit.FeedBroken:
 				note = fmt.Sprintf("  <- FEED NOT READABLE: %d consecutive failures (last: %s) — see the section below",
 					p.Coverage.ConsecutiveFailures, p.Coverage.LastFailureClass)
 			case audit.FeedHealthy:
-				note = fmt.Sprintf("  <- no captures because it was healthy: last poll read the feed, %s ago",
-					humanAge(r.GeneratedAt.Sub(p.Coverage.LastAttempt)))
+				// humanAge already ends in "ago" (or is "just now"); appending
+				// another produced "5m ago ago" and "just now ago".
+				note = fmt.Sprintf("  <- no captures because it was healthy: feed last read %s",
+					humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)))
 			default:
 				// Advisory only — it does not fail the run. See hasIssues. This
 				// covers both "no coverage record at all" and "failing, but not
@@ -248,32 +251,42 @@ func printReport(w io.Writer, r audit.Report) {
 	// cleared" for windows where nothing of the sort was ever observed — and then
 	// formatted the zero ClearedAt as the literal "0000-12-31 21:00:00", printing
 	// a fabricated timestamp as if it were a measurement.
-	anyMissingRecovery := false
-	clearedHeader, boundedHeader := false, false
+	// TWO SEPARATE PASSES, not one loop with lazily-emitted headers. Interleaving
+	// them means a provider carrying both kinds prints its cleared rows under
+	// whichever header was emitted first — filing a proven-cleared window under
+	// "may still be open" is the same misattribution this section exists to fix,
+	// merely inverted.
+	anyCleared, anyBounded := false, false
 	for _, p := range r.Providers {
 		for _, m := range p.MissingRecoveries {
-			anyMissingRecovery = true
-			switch m.Kind {
-			case audit.ClearedByCapture:
-				if !clearedHeader {
-					fmt.Fprintln(w, "MISSING RECOVERY — the outage alert fired, but alert-log never recorded it clearing "+
-						"(the raw feed later showed it had, so this is a delivery/logging gap, not a false outage):")
-					clearedHeader = true
-				}
-				fmt.Fprintf(w, "  [%s] opened %s, feed showed it cleared by %s but no recovery was ever logged\n",
-					p.ID, m.Start.Local().Format("2006-01-02 15:04:05"), m.ClearedAt.Local().Format("2006-01-02 15:04:05"))
-			default:
-				if !boundedHeader {
-					fmt.Fprintln(w, "OUTAGE WINDOW LEFT OPEN — the outage alert fired, no recovery was ever logged, and NOTHING "+
-						"in the archive shows it clearing. The window was closed by the auditor's own horizon so it could not "+
-						"certify every later capture. The incident may still be open:")
-					boundedHeader = true
-				}
-				fmt.Fprintf(w, "  [%s] opened %s — no corroborating evidence that it ever cleared\n",
-					p.ID, m.Start.Local().Format("2006-01-02 15:04:05"))
+			if m.Kind != audit.ClearedByCapture {
+				continue
 			}
+			if !anyCleared {
+				fmt.Fprintln(w, "MISSING RECOVERY — the outage alert fired, but alert-log never recorded it clearing "+
+					"(the raw feed later showed it had, so this is a delivery/logging gap, not a false outage):")
+				anyCleared = true
+			}
+			fmt.Fprintf(w, "  [%s] opened %s, feed showed it cleared by %s but no recovery was ever logged\n",
+				p.ID, m.Start.Local().Format("2006-01-02 15:04:05"), m.ClearedAt.Local().Format("2006-01-02 15:04:05"))
 		}
 	}
+	for _, p := range r.Providers {
+		for _, m := range p.MissingRecoveries {
+			if m.Kind != audit.BoundedByHorizon {
+				continue
+			}
+			if !anyBounded {
+				fmt.Fprintln(w, "OUTAGE WINDOW LEFT OPEN — the outage alert fired, no recovery was ever logged, and NOTHING "+
+					"in the archive shows it clearing. The window was closed by the auditor's own horizon so it could not "+
+					"certify every later capture. The incident may still be open:")
+				anyBounded = true
+			}
+			fmt.Fprintf(w, "  [%s] opened %s — no corroborating evidence that it ever cleared\n",
+				p.ID, m.Start.Local().Format("2006-01-02 15:04:05"))
+		}
+	}
+	anyMissingRecovery := anyCleared || anyBounded
 
 	// The coverage section is driven by FeedFault, the same predicate hasIssues
 	// uses, and it is INDEPENDENT of the capture count. Hanging it off the
@@ -281,7 +294,7 @@ func printReport(w io.Writer, r audit.Report) {
 	// and a broken feed — exit 1 beside a report that found nothing.
 	anyFeedFault := false
 	for _, p := range r.Providers {
-		if !p.FeedFault() {
+		if !p.FeedFault(r.GeneratedAt) {
 			continue
 		}
 		if !anyFeedFault {
@@ -291,10 +304,13 @@ func printReport(w io.Writer, r audit.Report) {
 		}
 		last := "never"
 		if !p.Coverage.LastSuccess.IsZero() {
-			last = humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)) + " ago"
+			last = humanAge(r.GeneratedAt.Sub(p.Coverage.LastSuccess)) // already ends in "ago"
 		}
-		fmt.Fprintf(w, "  [%s] %d consecutive failures, last success %s, last failure class %q\n",
-			p.ID, p.Coverage.ConsecutiveFailures, last, p.Coverage.LastFailureClass)
+		// The last-ATTEMPT age is printed too: without it a reader cannot tell a
+		// live fault from a record nobody has refreshed.
+		fmt.Fprintf(w, "  [%s] %d consecutive failures, last success %s, last attempt %s, last failure class %q\n",
+			p.ID, p.Coverage.ConsecutiveFailures, last,
+			humanAge(r.GeneratedAt.Sub(p.Coverage.LastAttempt)), p.Coverage.LastFailureClass)
 	}
 
 	anyUnparseable := false
@@ -310,7 +326,8 @@ func printReport(w io.Writer, r audit.Report) {
 	}
 
 	if !anyUncovered && !anyMissingRecovery && !anyUnparseable && !anyFeedFault {
-		fmt.Fprintln(w, "No uncovered major incidents, unrecovered outage windows, or broken parsers found — every real "+
+		fmt.Fprintln(w, "No uncovered major incidents, missing recoveries, outage windows left open, unreadable feeds, or "+
+			"broken parsers found — every real "+
 			"major-severity capture matches (or is explained by suppression / predating alert-log).")
 	} else {
 		fmt.Fprintln(w, "See the sections above for what needs a look — everything not listed there checked out clean.")

@@ -109,6 +109,49 @@ func TestPrintReportShowsCoverageFaultEvenWithCaptures(t *testing.T) {
 	}
 }
 
+// TestPrintReportKeepsTheTwoKindsApart: a provider carrying BOTH kinds must not
+// get its proven-cleared rows filed under the "may still be open" header. A
+// single loop with lazily-emitted headers does exactly that once both headers
+// have been printed, which is the same misattribution inverted.
+func TestPrintReportKeepsTheTwoKindsApart(t *testing.T) {
+	t0 := time.Date(2026, 9, 7, 10, 0, 0, 0, time.Local)
+	r := audit.Report{
+		GeneratedAt:    time.Now(),
+		HistoryPresent: true,
+		Providers: []audit.ProviderReport{{
+			ID: "p1", Enabled: true, HasPublicFeed: true, TotalCaptures: 3,
+			MissingRecoveries: []audit.MissingRecovery{
+				{Kind: audit.ClearedByCapture, Start: t0, ClearedAt: t0.Add(time.Hour)},
+				{Kind: audit.BoundedByHorizon, Start: t0.Add(2 * time.Hour)},
+				{Kind: audit.ClearedByCapture, Start: t0.Add(3 * time.Hour), ClearedAt: t0.Add(4 * time.Hour)},
+			},
+		}},
+	}
+
+	var buf bytes.Buffer
+	printReport(&buf, r)
+	out := buf.String()
+
+	boundedHdr := strings.Index(out, "OUTAGE WINDOW LEFT OPEN —") // position, not presence
+	if !strings.Contains(out, "MISSING RECOVERY —") || boundedHdr < 0 {
+		t.Fatalf("both headers must appear:\n%s", out)
+	}
+	// Every "cleared by" row must sit ABOVE the left-open header. Scanning from a
+	// moving offset rather than re-searching from 0, so two identical rows are
+	// not both resolved to the first one's position.
+	for off := 0; ; {
+		i := strings.Index(out[off:], "feed showed it cleared by")
+		if i < 0 {
+			break
+		}
+		at := off + i
+		if at > boundedHdr {
+			t.Errorf("a proven-cleared row was printed under the LEFT-OPEN header:\n%s", out)
+		}
+		off = at + 1
+	}
+}
+
 // TestPrintReportEvidenceTierStates: present, lost, and absent must read
 // differently. A corrupt history reported as "absent" hides an evidence LOSS as
 // an evidence gap, and the two call for different responses from the operator.

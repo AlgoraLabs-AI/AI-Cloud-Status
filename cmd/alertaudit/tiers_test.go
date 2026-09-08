@@ -75,16 +75,34 @@ func TestHasIssuesDoesNotMixTiers(t *testing.T) {
 	}
 }
 
-// TestHasIssuesIgnoresOptionalProviderCoverage: an Optional provider that
-// publishes no public feed is recorded as attempted-with-no-success by design
-// (ErrNoFeed is a skip, not a failure). It must never be reported as broken.
+// TestHasIssuesIgnoresOptionalProviderCoverage guards the HasPublicFeed guard
+// itself, so the coverage record here must be one that WOULD otherwise be a
+// fault. Building a benign entry instead makes the test pass for a reason that
+// has nothing to do with what it claims to check — it would stay green with the
+// guard deleted, leaving the real behaviour unguarded.
 func TestHasIssuesIgnoresOptionalProviderCoverage(t *testing.T) {
 	now := time.Now()
-	optional := audit.Report{HistoryPresent: true, Providers: []audit.ProviderReport{
-		{ID: "groq", Enabled: true, HasPublicFeed: false, TotalCaptures: 0, HasCoverage: true,
-			Coverage: history.CoverageEntry{LastAttempt: now}},
-	}}
-	if hasIssues(optional) {
-		t.Error("an Optional provider with no public feed was reported as a broken feed; skipping is working as designed")
+	brokenLooking := history.CoverageEntry{
+		LastAttempt: now, LastFailureClass: history.OutcomeTransport, ConsecutiveFailures: 500,
+	}
+
+	optional := audit.ProviderReport{ID: "groq", Enabled: true, HasPublicFeed: false,
+		HasCoverage: true, Coverage: brokenLooking}
+	if optional.FeedVerdict(now) != audit.FeedBroken {
+		t.Fatal("precondition: this record must look broken, or the test proves nothing about the guard")
+	}
+	if optional.FeedFault(now) {
+		t.Error("an Optional provider with no public feed was reported as a broken feed")
+	}
+	if hasIssues(audit.Report{HistoryPresent: true, Providers: []audit.ProviderReport{optional}}) {
+		t.Error("hasIssues failed the run over a provider that has no public feed to read")
+	}
+
+	// And the shape the real writer actually produces for a skipped provider —
+	// attempts, no failures, no success — must be inconclusive, not healthy.
+	skipped := audit.ProviderReport{ID: "groq", Enabled: true, HasPublicFeed: true,
+		HasCoverage: true, Coverage: history.CoverageEntry{LastAttempt: now}}
+	if got := skipped.FeedVerdict(now); got != audit.FeedUnknown {
+		t.Errorf("skipped-provider shape gave %v, want FeedUnknown", got)
 	}
 }

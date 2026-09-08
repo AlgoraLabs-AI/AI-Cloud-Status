@@ -70,7 +70,7 @@ func TestFeedVerdictThreeWay(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.pr.FeedVerdict(); got != tc.want {
+			if got := tc.pr.FeedVerdict(now); got != tc.want {
 				t.Errorf("FeedVerdict() = %v, want %v", got, tc.want)
 			}
 		})
@@ -134,10 +134,54 @@ func TestCoverageVerdictIndependentOfCaptures(t *testing.T) {
 		ID: "a", Enabled: true, HasPublicFeed: true,
 		TotalCaptures: 0, HasCoverage: true, Coverage: broken,
 	}
-	if withCaptures.FeedVerdict() != withoutCaptures.FeedVerdict() {
+	if withCaptures.FeedVerdict(now) != withoutCaptures.FeedVerdict(now) {
 		t.Error("FeedVerdict changed with the capture count; the coverage tier must not read the capture tier")
 	}
-	if withCaptures.FeedVerdict() != FeedBroken {
-		t.Errorf("FeedVerdict() = %v, want FeedBroken", withCaptures.FeedVerdict())
+	if withCaptures.FeedVerdict(now) != FeedBroken {
+		t.Errorf("FeedVerdict() = %v, want FeedBroken", withCaptures.FeedVerdict(now))
+	}
+}
+
+// TestFeedVerdictNeverInventsHealth is the regression guard for the worst class
+// this whole change set is about: reporting a reading that never happened.
+//
+// Blind and skipped attempts advance neither the failure count nor LastSuccess,
+// so a record can legitimately hold "attempted, zero failures, never succeeded".
+// A verdict keyed on ConsecutiveFailures == 0 alone calls that HEALTHY and the
+// report then prints "the feed was read" about a feed nobody has ever read.
+func TestFeedVerdictNeverInventsHealth(t *testing.T) {
+	now := time.Now()
+	neverRead := ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
+		Coverage: history.CoverageEntry{LastAttempt: now}} // no failures, no success
+
+	if got := neverRead.FeedVerdict(now); got == FeedHealthy {
+		t.Error("a feed that was never once read was reported HEALTHY")
+	} else if got != FeedUnknown {
+		t.Errorf("FeedVerdict() = %v, want FeedUnknown", got)
+	}
+}
+
+// TestFeedVerdictGoesUnknownWhenStale: a verdict nobody has re-observed in
+// months must not keep failing the run. Silence is not evidence — including
+// silence in time.
+func TestFeedVerdictGoesUnknownWhenStale(t *testing.T) {
+	now := time.Now()
+	stale := ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
+		Coverage: history.CoverageEntry{
+			LastAttempt: now.Add(-90 * 24 * time.Hour), LastFailureClass: history.OutcomeHTTP,
+			ConsecutiveFailures: 500,
+		}}
+
+	if got := stale.FeedVerdict(now); got != FeedUnknown {
+		t.Errorf("FeedVerdict() = %v on a 90-day-old record, want FeedUnknown", got)
+	}
+	if stale.FeedFault(now) {
+		t.Error("a three-month-old coverage record still failed the run")
+	}
+	// The same record, freshly observed, IS a fault.
+	fresh := stale
+	fresh.Coverage.LastAttempt = now
+	if !fresh.FeedFault(now) {
+		t.Error("a current sustained failure must still fail the run")
 	}
 }

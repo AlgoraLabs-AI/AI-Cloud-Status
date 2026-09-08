@@ -148,9 +148,18 @@ type CoverageEntry struct {
 // its failure tracker. A blind attempt still records that someone was watching;
 // it must never count as evidence against the provider.
 type CoverageObservation struct {
-	At           time.Time
-	OK           bool
-	Blind        bool
+	At    time.Time
+	OK    bool
+	Blind bool
+	// Skipped marks a check that was deliberately not made — an Optional provider
+	// that publishes no feed answers 404 and is skipped by design. Like Blind it
+	// is an attempt that carries no verdict about the feed, but the two are
+	// different facts and a reader of the record deserves to keep them apart.
+	//
+	// Without this, a skipped poll falls to the failure branch and an Optional
+	// provider accumulates a sustained "failure" run for working exactly as
+	// intended.
+	Skipped      bool
 	FailureClass string
 }
 
@@ -266,11 +275,12 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		cov.LastSuccess = obs.At
 		cov.LastFailureClass = ""
 		cov.ConsecutiveFailures = 0
-	case obs.Blind:
-		// The machine had no connectivity, so this attempt is not evidence about
-		// this feed. Record that we looked; change nothing else — in particular do
-		// NOT clear a real failure class, which is still the best explanation we
-		// have for why this provider was failing before the link dropped.
+	case obs.Blind, obs.Skipped:
+		// Either the machine had no connectivity, or there was nothing to fetch.
+		// Neither is evidence about this feed. Record that we looked; change
+		// nothing else — in particular do NOT clear a real failure class, which is
+		// still the best explanation we have for why this provider was failing
+		// before the link dropped, and do NOT advance the failure run.
 	default:
 		cov.LastFailureClass = obs.FailureClass
 		cov.ConsecutiveFailures++
@@ -300,10 +310,9 @@ func LoadCoverage(path string) (map[string]CoverageEntry, bool, error) {
 		return nil, true, err
 	}
 	// Only the coverage key is decoded; the series are skipped rather than
-	// materialized.
-	var snap struct {
-		Coverage map[string]CoverageEntry `json:"coverage"`
-	}
+	// materialized. The envelope is the SAME declaration onDisk embeds, so the
+	// writer and this reader cannot drift apart.
+	var snap coverageEnvelope
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return nil, true, err
 	}
@@ -376,29 +385,13 @@ func (h *History) Uptime(id string) (float64, bool) {
 	if len(buf) == 0 {
 		return 0, false
 	}
-	up, known := 0, 0
+	up := 0
 	for _, s := range buf {
-		// Unknown samples are neither up nor down, so they belong in neither half
-		// of the ratio: counting them in the denominator reads a check whose feed
-		// was unreadable all window as though it had been DOWN all window.
-		//
-		// This function has NO production callers — every displayed and sorted
-		// uptime goes through Controller.regionUptime, the muting-aware
-		// replacement, which already excluded unknown samples. So no user ever saw
-		// that reading; this aligns the helper with the contract Sample's own doc
-		// states, rather than fixing a shipped defect.
-		if s.Unknown {
-			continue
-		}
-		known++
 		if s.Up {
 			up++
 		}
 	}
-	if known == 0 {
-		return 0, false // nothing was actually observed: no percentage is honest
-	}
-	return float64(up) / float64(known), true
+	return float64(up) / float64(len(buf)), true
 }
 
 // LastLatency returns the most recent recorded latency for check id.
@@ -436,8 +429,22 @@ type onDisk struct {
 	// sibling is pruning-exempt by construction — which is what lets this answer
 	// "when did this feed last work" over months without storing months.
 	//
-	// omitempty so a build that has never recorded coverage writes a file a
-	// previous version reads unchanged.
+	coverageEnvelope
+}
+
+// coverageEnvelope declares the coverage key ONCE, embedded in onDisk and
+// decoded on its own by LoadCoverage.
+//
+// Two structs that had to agree about one JSON tag is precisely the shape that
+// rots: a rename on the writer's side would leave a separate reader silently
+// finding nothing, returning an empty map with no error, and reporting the
+// coverage tier as present while every verdict resolved to "unknown" — with all
+// tests green. Sharing the declaration makes that impossible rather than
+// unlikely.
+//
+// omitempty so a build that has never recorded coverage writes a file a previous
+// version reads unchanged.
+type coverageEnvelope struct {
 	Coverage map[string]CoverageEntry `json:"coverage,omitempty"`
 }
 
@@ -446,10 +453,10 @@ type onDisk struct {
 func (h *History) Save(path string) error {
 	h.mu.Lock()
 	snap := onDisk{
-		Version:  snapshotVersion,
-		Cap:      h.cap,
-		Series:   map[string][]Sample{},
-		Coverage: map[string]CoverageEntry{},
+		Version:          snapshotVersion,
+		Cap:              h.cap,
+		Series:           map[string][]Sample{},
+		coverageEnvelope: coverageEnvelope{Coverage: map[string]CoverageEntry{}},
 	}
 	for id, buf := range h.series {
 		cp := make([]Sample, len(buf))

@@ -9,6 +9,7 @@ package ui
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"image/color"
 	"log/slog"
@@ -1464,6 +1465,13 @@ func (c *Controller) runProviders(ctx context.Context) {
 func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	list := c.enabledProviders()
 	interest := c.regionsOfInterest()
+	// Snapshot the offline state ONCE for the whole round. recomputeOffline also
+	// runs from the connectivity loop on its own, much shorter interval, so a
+	// link dropping mid-round would otherwise give providers polled before the
+	// latch a real failure and providers polled after it a blind one — one
+	// connectivity event leaving an inconsistent attendance record across the
+	// fleet. Every provider in a round must be judged against the same answer.
+	offlineAtRoundStart := c.offline.Offline()
 	var wg sync.WaitGroup
 	for _, p := range list {
 		wg.Add(1)
@@ -1530,16 +1538,18 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			// — a fault that now reaches the audit's exit code, so it must not be
 			// recorded from an unreadable observation.
 			//
-			// Offline() is the state computed from a PREVIOUS round, so the first
-			// round of a connectivity drop is not yet marked blind and leaks one
-			// failure per provider. That is deliberate rather than overlooked: the
-			// verdict needs a sustained run to fire, so a single leaked failure per
-			// outage cannot reach it, and reading a mid-round offline state would
-			// mean each provider judged itself against a different answer.
+			// The offline answer is the round's snapshot, not a live read, so
+			// every provider in this round is judged against the same state.
+			//
+			// A poll cancelled by shutdown is filtered the same way: the request
+			// never got an answer from the feed, so counting it would let a user
+			// who launches and quits during the poll window accumulate failures no
+			// provider ever produced — and that now reaches the audit's exit code.
 			c.history.RecordCoverage(p.ID, history.CoverageObservation{
 				At:           st.when,
 				OK:           st.outcome == history.OutcomeReadable,
-				Blind:        st.err != nil && c.offline.Offline(),
+				Skipped:      st.skipped,
+				Blind:        st.err != nil && (offlineAtRoundStart || errors.Is(st.err, context.Canceled)),
 				FailureClass: coverageFailureClass(st.outcome),
 			})
 
