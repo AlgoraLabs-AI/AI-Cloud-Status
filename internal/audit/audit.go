@@ -234,6 +234,13 @@ func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
 	switch {
 	case !r.HasCoverage || cov.LastAttempt.IsZero():
 		return FeedUnknown
+	case cov.LastAttempt.After(now.Add(coverageFutureSlack)):
+		// A record stamped ahead of now is clock damage, not an observation. It
+		// matters here and not only at load because the staleness escape below
+		// measures elapsed time: against a future stamp that value is negative,
+		// so an arbitrarily old verdict would be asserted as current forever with
+		// no way out.
+		return FeedUnknown
 	case cov.LastInformative.IsZero():
 		// Attempts were made and every single one was blind or skipped, so
 		// nothing was ever learned about this feed. Calling that healthy would
@@ -262,6 +269,10 @@ func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
 // the present. Past it the audit reports "unknown" rather than repeating a
 // months-old verdict about a provider nobody has polled since.
 const coverageFreshness = 7 * 24 * time.Hour
+
+// coverageFutureSlack is how far ahead of the audit's clock a coverage stamp may
+// be before it is read as clock damage rather than as an observation.
+const coverageFutureSlack = time.Hour
 
 // FeedFault reports a coverage-tier fault worth failing the run over.
 //
@@ -332,6 +343,12 @@ type Report struct {
 	HistoryPresent bool
 	HistoryFound   bool
 	HistoryErr     string
+	// DiagnosticsEnabled is config.json's own answer, so a report never has to
+	// infer "diagnostics are off" from an empty corpus. The two causes of an
+	// empty capture tier — never switched on, or switched on and genuinely quiet
+	// — need different responses from a reader, and the config distinguishes them
+	// without guessing.
+	DiagnosticsEnabled bool
 }
 
 // transition is one alert-log line for a provider, restricted to the
@@ -458,8 +475,9 @@ func Run(dir string) (Report, error) {
 		GeneratedAt:    time.Now(),
 		AlertLogStart:  alertStart,
 		HistoryPresent: histFound && herr == nil && len(coverage) > 0,
-		HistoryFound:   histFound,
-		HistoryErr:     histErr,
+		HistoryFound:       histFound,
+		HistoryErr:         histErr,
+		DiagnosticsEnabled: cfg.DebugLogging,
 	}
 	for _, p := range providers.Default() {
 		captures, err := loadCaptures(filepath.Join(feedSamplesDir, p.ID), p, cfg.Regions)

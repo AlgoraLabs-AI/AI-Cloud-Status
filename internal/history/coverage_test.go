@@ -311,6 +311,97 @@ func TestLoadCoverageDistinguishesAbsentFromUnreadable(t *testing.T) {
 	}
 }
 
+// TestLoadCoverageDropsFutureDatedEntries proves the future-timestamp guard can
+// actually FIRE.
+//
+// It is at Load and not at record time for a reason worth pinning: obs.At comes
+// from the same process and the same clock as any check inside RecordCoverage
+// would, so a guard there can never trigger — it reads as protection and gives
+// none. The damage arrives from DISK, written by a run whose clock was wrong.
+//
+// And the entry must be DROPPED rather than kept, because coverage is monotonic:
+// a future stamp refuses every later observation, successes included, so keeping
+// it freezes that provider's record permanently.
+func TestLoadCoverageDropsFutureDatedEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.json")
+	future := time.Now().Add(48 * time.Hour)
+
+	h := New(100)
+	h.RecordCoverage("skewed", CoverageObservation{At: future, OK: true})
+	h.RecordCoverage("sane", CoverageObservation{At: time.Now().Add(-time.Hour), OK: true})
+	if err := h.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	cov, _, err := LoadCoverage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := cov["skewed"]; present {
+		t.Error("a future-dated entry survived Load; it would refuse every later observation forever")
+	}
+	if _, present := cov["sane"]; !present {
+		t.Error("the guard took a sane entry with it")
+	}
+}
+
+// TestBlindAttemptsDoNotBreakAFailureRun: the contiguity rule asks "did the
+// looking stop", and a blind attempt is still someone looking.
+//
+// Keying it on the last INFORMATIVE observation made a connectivity blip read as
+// a break and silently reset a genuine failure streak — blind polls counting
+// against the feed through the back door, which is the opposite of what marking
+// them blind is for.
+func TestBlindAttemptsDoNotBreakAFailureRun(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-2 * time.Hour)
+	gap := 10 * time.Minute
+
+	// Five real failures, a stretch of blind polls well past the gap, then more
+	// real failures. The blind stretch is contiguous in ATTEMPTS.
+	at := t0
+	for range 5 {
+		h.RecordCoverage("p", CoverageObservation{At: at, FailureClass: OutcomeHTTP, RunGap: gap})
+		at = at.Add(time.Minute)
+	}
+	for range 30 {
+		h.RecordCoverage("p", CoverageObservation{At: at, Blind: true, RunGap: gap})
+		at = at.Add(time.Minute)
+	}
+	for range 5 {
+		h.RecordCoverage("p", CoverageObservation{At: at, FailureClass: OutcomeHTTP, RunGap: gap})
+		at = at.Add(time.Minute)
+	}
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 10 {
+		t.Errorf("ConsecutiveFailures = %d, want 10 — the blind stretch never stopped the polling, so the run continued",
+			cov.ConsecutiveFailures)
+	}
+}
+
+// TestRunBreaksWhenPollingActuallyStops is the other half: a gap in ATTEMPTS is
+// a real break, and the run must not span it.
+func TestRunBreaksWhenPollingActuallyStops(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-72 * time.Hour)
+	gap := 10 * time.Minute
+
+	for range 9 {
+		h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeHTTP, RunGap: gap})
+		t0 = t0.Add(time.Minute)
+	}
+	// The app is closed for a month, then one failure on relaunch.
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(30 * 24 * time.Hour), FailureClass: OutcomeHTTP, RunGap: gap})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1 — nine failures and a month of silence are not a ten-poll run",
+			cov.ConsecutiveFailures)
+	}
+}
+
 // TestSkippedPollIsNotAFeedFailure: an Optional provider that publishes no feed
 // answers 404 and is skipped by design. Counting that as a failure gives a
 // provider working exactly as intended a sustained "broken feed" run.

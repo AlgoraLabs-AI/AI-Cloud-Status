@@ -180,7 +180,11 @@ type Controller struct {
 	// resets the failure counter on every failure and makes the verdict
 	// unreachable.
 	lastRoundCost time.Duration
-	connDown      bool // every enabled connectivity target is currently unreachable
+	connDown bool // every enabled connectivity target is currently unreachable
+	// connJudged is whether any connectivity target was checked at all. Without
+	// it connDown==false is ambiguous between "the link is fine" and "nothing
+	// was asked", and the second is not evidence of the first.
+	connJudged bool
 	// connDownSince is when the current total-connectivity blackout began
 	// (zero when connectivity is up). It bounds which provider observations
 	// still count as evidence that the machine has internet.
@@ -1344,6 +1348,11 @@ func (c *Controller) runConnectivity(ctx context.Context) {
 
 			c.mu.Lock()
 			down := anyChecked && allDown
+			// Whether there was a WITNESS at all, kept separate from its verdict.
+			// down is false both when the link is fine and when no connectivity
+			// target is enabled to say — and a consumer that cannot tell those
+			// apart reads "no evidence" as "evidence of a link".
+			c.connJudged = anyChecked
 			// Stamp when the blackout STARTED. recomputeOffline needs it to tell a
 			// provider fetch that proves we are online from one that merely
 			// succeeded before the network dropped — see the freshness rule there.
@@ -1555,7 +1564,14 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	// c.connDown comes from ICMP/TCP probes to the default targets. It says
 	// nothing about any provider's feed, which is exactly why it can arbitrate.
 	c.mu.Lock()
-	connDownAtRoundStart := c.connDown
+	// No witness is not a clean bill of health. With every connectivity target
+	// disabled there is nothing that can say whether the machine had a link, so
+	// a failure cannot be attributed to the feed — it is recorded as an attempt
+	// that taught nothing. The cost is that a user who turns off all
+	// connectivity checks loses the feed-not-readable verdict; the alternative is
+	// asserting a link nobody observed and blaming providers for the user's own
+	// network, which is the failure this whole record exists to avoid.
+	noLinkAtRoundStart := c.connDown || !c.connJudged
 	c.mu.Unlock()
 	// The run-gap has to exceed the real spacing between two observations of one
 	// provider, and that spacing is (previous round's cost + the interval), not
@@ -1638,7 +1654,7 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			// the error value is silent about cancellation in exactly the case
 			// this filter exists for.
 			c.history.RecordCoverage(p.ID, coverageObservation(
-				st, connDownAtRoundStart, ctx.Err() != nil, roundGap))
+				st, noLinkAtRoundStart, ctx.Err() != nil, roundGap))
 
 			// Journal every incident the feed currently lists so the detail
 			// panel can show a last-24h history after they resolve. Recorded

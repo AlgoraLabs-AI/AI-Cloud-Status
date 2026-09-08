@@ -175,14 +175,41 @@ func hasIssues(r audit.Report) bool {
 // point it at a buffer. The defect this change set exists to fix — a fabricated
 // "cleared by 0000-12-31 21:00:00" — lived HERE, in the formatting, and no test
 // could reach it.
-// captureTierPhrase describes the capture tier from a measurement, so no branch
+// captureTierPhrase describes the capture tier from a measurement, so nothing
 // can announce it without one.
-func captureTierPhrase(present bool) string {
+//
+// diagnosticsOn is the CONFIGURED state, read from config.json — not inferred
+// from the absence of captures. An empty corpus has two very different causes
+// (never switched on, or switched on and genuinely quiet) and the config says
+// which without guessing.
+func captureTierPhrase(present, diagnosticsOn bool) string {
 	if present {
-		return "CAPTURE tier present (feed-samples + alert-log, written only while diagnostics are on)"
+		return "CAPTURE tier present (feed-samples + alert-log)"
+	}
+	why := "diagnostics are OFF in config.json, so these were never written"
+	if diagnosticsOn {
+		why = "diagnostics are ON, so this corpus is genuinely empty rather than disabled"
 	}
 	return "CAPTURE tier EMPTY — no alert log and no captures, so every capture-tier verdict below is vacuous rather " +
-		"than clean (diagnostics are off by default)"
+		"than clean (" + why + ")"
+}
+
+// coverageTierPhrase describes the coverage tier, and distinguishes the three
+// ways it can fail to answer: absent, present-but-unreadable (an evidence LOSS,
+// which calls for a different response than a gap), and readable-but-empty.
+func coverageTierPhrase(r audit.Report) string {
+	switch {
+	case r.HistoryPresent:
+		return "COVERAGE tier present (history.json, always written)."
+	case r.HistoryFound && r.HistoryErr != "":
+		return fmt.Sprintf("history.json is present but could NOT be read (%s), so the coverage tier is LOST, not "+
+			"missing. No coverage verdict is given below.", r.HistoryErr)
+	case r.HistoryFound:
+		return "history.json is readable but holds no coverage record yet (it starts filling on the next save), so no " +
+			"coverage verdict can be given below."
+	default:
+		return "history.json is absent, so no coverage verdict can be given and 'no captures' below stays ambiguous."
+	}
 }
 
 func printReport(w io.Writer, r audit.Report) {
@@ -208,31 +235,13 @@ func printReport(w io.Writer, r audit.Report) {
 			break
 		}
 	}
-	switch {
-	case r.HistoryPresent && captureTier:
-		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier (feed-samples + alert-log, written only while diagnostics are on) "+
-			"and COVERAGE tier (history.json, always written). Both present.")
-	case r.HistoryPresent:
-		fmt.Fprintln(w, "Evidence tiers: COVERAGE tier only (history.json). The CAPTURE tier is EMPTY — no alert log and no "+
-			"captures — so every capture-tier verdict below is vacuous rather than clean. Diagnostics are off by default.")
-	// The three branches below say what the COVERAGE tier is doing; every one of
-	// them also has to describe the capture tier from the same measurement, or it
-	// asserts a tier it never looked at. Fixing only the pair above left three
-	// branches announcing "CAPTURE tier only" for a corpus that was empty.
-	case r.HistoryFound && r.HistoryErr != "":
-		// Present but unusable. Saying "absent" here would report an evidence
-		// LOSS as an evidence gap, and the two need different responses.
-		fmt.Fprintf(w, "Evidence tiers: %s. history.json is present but could NOT be read (%s), so the coverage tier is "+
-			"LOST, not missing. No coverage verdict is given below.\n", captureTierPhrase(captureTier), r.HistoryErr)
-	case r.HistoryFound:
-		// Readable, but carrying no coverage yet — an install upgraded to this
-		// build that has not saved since. Distinct from both "lost" and "absent".
-		fmt.Fprintf(w, "Evidence tiers: %s. history.json is readable but holds no coverage record yet (it starts filling "+
-			"on the next save), so no coverage verdict can be given below.\n", captureTierPhrase(captureTier))
-	default:
-		fmt.Fprintf(w, "Evidence tiers: %s. history.json is absent, so no coverage verdict can be given and 'no captures' "+
-			"below stays ambiguous.\n", captureTierPhrase(captureTier))
-	}
+	// One sentence per tier, each built from its OWN measurement and joined here.
+	// The previous shape was a five-branch switch that restated both facts in
+	// every arm, so a fix applied to one arm left the others asserting a tier
+	// they had never examined — twice, in two successive changes. Composing the
+	// halves makes that shape impossible rather than merely fixed.
+	fmt.Fprintf(w, "Evidence tiers: %s. %s\n",
+		captureTierPhrase(captureTier, r.DiagnosticsEnabled), coverageTierPhrase(r))
 	fmt.Fprintln(w, "Severity is re-derived from each raw capture with the CURRENTLY registered parser — a mismatch here reflects "+
 		"today's parser against the historical alert trail, not necessarily what the parser in production at capture time decided.")
 	fmt.Fprintln(w)

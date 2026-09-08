@@ -195,14 +195,28 @@ func TestPrintReportEvidenceTierStates(t *testing.T) {
 		r    audit.Report
 		want string
 	}{
-		{"both tiers really present", withCaptures, "Both present"},
+		{"both tiers really present", withCaptures, "CAPTURE tier present"},
+		{"both tiers really present, coverage half", withCaptures, "COVERAGE tier present"},
 		{
 			// The default install: diagnostics off, so the capture tier is empty.
-			// Announcing "both present" here asserts a tier the line never looked
-			// at, and an empty capture corpus reads identically to a clean one.
-			"coverage only — capture tier empty",
+			// Announcing it present here asserts a tier the line never looked at,
+			// and an empty capture corpus reads identically to a clean one.
+			"capture tier empty",
 			audit.Report{GeneratedAt: base.GeneratedAt, HistoryPresent: true, HistoryFound: true},
-			"CAPTURE tier is EMPTY",
+			"CAPTURE tier EMPTY",
+		},
+		{
+			// WHY it is empty comes from config.json, not from the emptiness. The
+			// two causes need different responses: nothing was ever recorded, or
+			// recording was on and the window really was quiet.
+			"empty because diagnostics were never on",
+			audit.Report{GeneratedAt: base.GeneratedAt, HistoryPresent: true, HistoryFound: true},
+			"diagnostics are OFF in config.json",
+		},
+		{
+			"empty although diagnostics are on",
+			audit.Report{GeneratedAt: base.GeneratedAt, HistoryPresent: true, HistoryFound: true, DiagnosticsEnabled: true},
+			"genuinely empty rather than disabled",
 		},
 		{"corrupt", audit.Report{GeneratedAt: base.GeneratedAt, HistoryFound: true, HistoryErr: "unexpected end of JSON input"}, "could NOT be read"},
 		{"absent", base, "is absent"},

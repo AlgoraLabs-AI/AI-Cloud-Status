@@ -146,9 +146,10 @@ type CoverageEntry struct {
 const failureRunGap = time.Hour
 
 // coverageFutureSlack mirrors Prune's futureSlack: how far ahead of now a
-// timestamp may be before it is treated as clock damage rather than an
-// observation. The series has guarded this since it was written; coverage,
-// which is monotonic and therefore MORE vulnerable, did not until 2026-09-08.
+// PERSISTED timestamp may be before it is treated as clock damage rather than an
+// observation. Coverage needs it more than the series does, because coverage is
+// monotonic — a future stamp does not just look odd, it refuses every later
+// observation.
 const coverageFutureSlack = time.Hour
 
 // CoverageObservation is one poll's worth of attendance, as reported by the
@@ -290,6 +291,10 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		h.coverage = map[string]CoverageEntry{}
 	}
 	cov := h.coverage[id]
+	// Captured BEFORE LastAttempt is overwritten below. The contiguity rule needs
+	// the distance from the PREVIOUS attempt, and comparing against a field this
+	// function has already advanced measures zero every time.
+	prevAttempt := cov.LastAttempt
 	// High-water mark, as the field's own doc says — so enforce it. Two polls for
 	// one provider can complete out of order: a scheduled round that started
 	// earlier can finish AFTER a manual retry that started later, and recording
@@ -299,16 +304,15 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	if !obs.At.After(cov.LastAttempt) && !cov.LastAttempt.IsZero() {
 		return
 	}
-	// ...and reject a stamp implausibly far in the FUTURE, the same way Prune
-	// guards the series with futureSlack. Without it one observation written
-	// while the clock ran fast locks this check closed forever once the clock is
-	// corrected: every later poll, successes included, fails the monotonic test
-	// and returns early. A frozen entry holding a sustained failure run would
-	// then fail the audit permanently, and the staleness escape could not free it
-	// either — the elapsed time it measures is negative.
-	if obs.At.After(time.Now().Add(coverageFutureSlack)) {
-		return
-	}
+	// The future-timestamp hazard is NOT guarded here, and the reason matters:
+	// obs.At comes from the same process and the same clock as any check against
+	// time.Now() would, so such a check can never fire. It would be a guard that
+	// reads as protection and provides none.
+	//
+	// The damage arrives from DISK — a record written while the clock ran fast,
+	// which then blocks every later observation once the clock is corrected. That
+	// is a different clock, so it can only be judged where the file is read.
+	// LoadCoverage does it.
 	cov.LastAttempt = obs.At
 	switch {
 	case obs.OK:
@@ -328,11 +332,20 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// up to ten and read as sustained — a span with a working feed in the
 		// middle of it. Only a success resets the counter otherwise, and a long
 		// silence is not a success.
+		// Measured from the last ATTEMPT, not the last informative one. The
+		// question this asks is "did the looking stop?", and a blind attempt is
+		// still someone looking. Keying it on LastInformative made a connectivity
+		// blip — a stretch of attempts that deliberately teach nothing — read as
+		// a break in the run and silently reset a genuine failure streak, which
+		// is blind polls counting against the feed through the back door.
+		//
+		// Because blind attempts DO advance LastAttempt, a gap here only opens
+		// when polling actually stopped, so the bound can be generous.
 		gap := obs.RunGap
 		if gap <= 0 {
 			gap = failureRunGap
 		}
-		if !cov.LastInformative.IsZero() && obs.At.Sub(cov.LastInformative) > gap {
+		if !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) > gap {
 			cov.ConsecutiveFailures = 0
 		}
 		cov.LastInformative = obs.At
@@ -377,6 +390,22 @@ func LoadCoverage(path string) (map[string]CoverageEntry, bool, error) {
 	}
 	if snap.Coverage == nil {
 		snap.Coverage = map[string]CoverageEntry{}
+	}
+	// Drop entries stamped implausibly far in the FUTURE. This is the only place
+	// the check can work: the timestamps were written by a different run, and
+	// possibly a different clock, so here they can be compared against this one.
+	//
+	// A record written while the clock ran fast is not merely wrong, it is
+	// absorbing: RecordCoverage only accepts observations newer than the last, so
+	// once the clock is corrected every later poll — successes included — is
+	// refused forever, and a frozen entry holding a failure run would fail the
+	// audit permanently. Discarding the entry costs one provider's history and
+	// restores a record that can move again.
+	cutoff := time.Now().Add(coverageFutureSlack)
+	for id, cov := range snap.Coverage {
+		if cov.LastAttempt.After(cutoff) {
+			delete(snap.Coverage, id)
+		}
 	}
 	return snap.Coverage, true, nil
 }
