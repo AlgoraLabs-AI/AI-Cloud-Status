@@ -181,7 +181,13 @@ const (
 	// FeedUnknown: nothing conclusive. No coverage record at all, or a run of
 	// failures too short to call sustained. NOT a fault.
 	FeedUnknown FeedVerdict = iota
-	// FeedHealthy: the most recent attempt read the feed.
+	// FeedHealthy: the last attempt that told us ANYTHING was a successful read.
+	//
+	// Not "the most recent attempt" — blind and skipped polls are attempts that
+	// carry no information, and a run of them after a real success leaves the
+	// last thing we actually learned still being that success. Staleness is what
+	// bounds how long that stays a fair answer, and it is measured from the same
+	// informative observation rather than from the attempt count.
 	FeedHealthy
 	// FeedBroken: attempts keep failing and none has succeeded since. This is the
 	// case that used to be indistinguishable from "genuinely operational all
@@ -215,31 +221,31 @@ const sustainedFailureAttempts = 10
 // It takes `now` rather than reading a clock, so a verdict is reproducible and a
 // caller cannot get a different answer than the report it is printing.
 func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
+	cov := r.Coverage
 	switch {
-	case !r.HasCoverage || r.Coverage.LastAttempt.IsZero():
+	case !r.HasCoverage || cov.LastAttempt.IsZero():
 		return FeedUnknown
-	case now.Sub(r.Coverage.LastAttempt) > coverageFreshness:
-		// Nobody has looked in a long time. Whatever the record says was true
-		// then, not now — and a verdict nobody has re-observed since is the same
-		// "silence is not evidence" error this file argues against, pointed at
-		// time instead of at captures.
+	case cov.LastInformative.IsZero():
+		// Attempts were made and every single one was blind or skipped, so
+		// nothing was ever learned about this feed. Calling that healthy would
+		// assert a reading that never happened.
 		return FeedUnknown
-	case r.Coverage.ConsecutiveFailures > 0:
-		if r.Coverage.ConsecutiveFailures >= sustainedFailureAttempts {
-			return FeedBroken
-		}
+	case now.Sub(cov.LastInformative) > coverageFreshness:
+		// Nothing has been LEARNED in a long time. Measured from the last
+		// informative observation, not the last attempt: a machine offline for
+		// months still attempts every round, so an attempt-based rule would call
+		// a months-old verdict current.
+		return FeedUnknown
+	case cov.ConsecutiveFailures >= sustainedFailureAttempts:
+		return FeedBroken
+	case cov.ConsecutiveFailures > 0:
 		// Failing, but not for long enough to assert it. One bad poll is not
 		// evidence of a broken feed.
 		return FeedUnknown
-	case r.Coverage.LastSuccess.IsZero():
-		// No failures counted AND no success ever recorded. That is not health:
-		// it is what a run of blind or skipped attempts looks like, since neither
-		// advances the failure count. Calling it healthy would assert a reading
-		// that never happened — the same fabricated-observation class this change
-		// set exists to remove.
-		return FeedUnknown
-	default:
+	case cov.LastSuccess.Equal(cov.LastInformative):
 		return FeedHealthy
+	default:
+		return FeedUnknown
 	}
 }
 
@@ -434,7 +440,12 @@ func Run(dir string) (Report, error) {
 	report := Report{
 		GeneratedAt:    time.Now(),
 		AlertLogStart:  alertStart,
-		HistoryPresent: histFound && herr == nil,
+		// PRESENT means the tier can actually answer, which needs coverage DATA,
+		// not merely a file that parsed. An upgraded install's pre-change
+		// history.json parses cleanly and holds no coverage key at all — reporting
+		// that as "coverage tier present" while every verdict resolves to unknown
+		// is exactly the contradiction the tier line exists to prevent.
+		HistoryPresent: histFound && herr == nil && len(coverage) > 0,
 		HistoryFound:   histFound,
 		HistoryErr:     histErr,
 	}

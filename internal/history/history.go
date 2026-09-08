@@ -77,23 +77,9 @@ type Sample struct {
 	DownRegions     []string      `json:"dr,omitempty"`
 	Degraded        bool          `json:"dg,omitempty"`
 	DegradedRegions []string      `json:"dgr,omitempty"`
-	// Outcome says WHY Unknown is set, which the bool alone cannot: Unknown
-	// collapses an unreadable feed and a deliberately skipped check into one
-	// value, so a reader that treats every Unknown as a broken feed misreads an
-	// Optional provider that has no feed at all.
-	//
-	// Written ONLY on Unknown samples, and only by the provider path. It is empty
-	// on every up/down sample, on samples written before the field existed, and
-	// on custom-URL Unknown samples — which DO occur: urlchecks records Unknown
-	// when a probe fails while the machine is offline. A reader must therefore
-	// treat an empty Outcome on an Unknown sample as "cause not recorded", never
-	// as a specific cause. (The older note at the top of this struct claiming
-	// custom URL checks never set Unknown is wrong; it is left alone here rather
-	// than edited from a distance, but do not rely on it.)
-	Outcome string `json:"oc,omitempty"`
 }
 
-// Outcome values for Sample.Outcome, and for CoverageEntry.LastFailureClass.
+// Outcome values for CoverageEntry.LastFailureClass.
 //
 // Plain strings rather than a typed enum borrowed from providers, for the same
 // reason Incident stores a bare severity int: this package stays decoupled from
@@ -126,6 +112,17 @@ type CoverageEntry struct {
 	// never-succeeded check would serialize a zero time rather than omit it.
 	LastSuccess      time.Time `json:"ls,omitzero"`
 	LastFailureClass string    `json:"lfc,omitempty"`
+	// LastInformative is the last attempt that actually TOLD us something — a
+	// real read or a real failure. Blind and skipped attempts advance LastAttempt
+	// but not this.
+	//
+	// The distinction is load-bearing twice over. "Was the last thing we learned
+	// a success?" is what health means, and without this field a run of blind
+	// polls after an old success is indistinguishable from a fresh success. And
+	// staleness has to be measured from the last thing we LEARNED: a machine
+	// offline for two months still records an attempt every round, so a freshness
+	// rule keyed on LastAttempt would call a two-month-old verdict current.
+	LastInformative time.Time `json:"li,omitzero"`
 	// ConsecutiveFailures counts failed attempts since the last success. It is
 	// the field that makes a verdict possible at all: LastSuccess alone says only
 	// that the feed worked ONCE, and since a working launch stamps it within a
@@ -273,6 +270,7 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	switch {
 	case obs.OK:
 		cov.LastSuccess = obs.At
+		cov.LastInformative = obs.At
 		cov.LastFailureClass = ""
 		cov.ConsecutiveFailures = 0
 	case obs.Blind, obs.Skipped:
@@ -282,6 +280,7 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// still the best explanation we have for why this provider was failing
 		// before the link dropped, and do NOT advance the failure run.
 	default:
+		cov.LastInformative = obs.At
 		cov.LastFailureClass = obs.FailureClass
 		cov.ConsecutiveFailures++
 	}
@@ -293,8 +292,13 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 // A reader that wants the ~15 attendance entries should not pay for the ring:
 // Load unmarshals every retained sample and then deep-copies each series into a
 // fresh slice, which on a mature install is megabytes of parsing and copying for
-// a map that fits in a kilobyte. alertaudit reads this file twice in one run, so
-// the difference is doubled.
+// a map that fits in a kilobyte.
+//
+// KNOWN, and not fixed here: alertaudit still reads this file twice per run,
+// because RunContinuity independently full-Loads it for the sample history it
+// genuinely needs. So this saves the materialization, NOT the second read — the
+// two audit sections should share one load, which is a change to their entry
+// points rather than to this function.
 //
 // The three returns are deliberately distinct, because a reader that cannot tell
 // them apart will report a corrupt file as an absent one:

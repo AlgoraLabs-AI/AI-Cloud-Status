@@ -10,10 +10,18 @@
 //	go run ./cmd/alertaudit               # audits the app's real config dir
 //	go run ./cmd/alertaudit -dir <path>    # audits an arbitrary directory
 //
-// Exit codes: 0 = clean; 1 = at least one Uncovered finding, a never-captured
-// provider, a provider whose captures ALL currently fail to parse, or a
-// missing recovery; 2 = the tool itself failed to run (bad -dir, unreadable
-// files).
+// Exit codes: 0 = clean; 2 = the tool itself failed to run (bad -dir,
+// unreadable files); 1 = at least one of:
+//
+//   - an Uncovered finding
+//   - a provider whose captures ALL currently fail to parse
+//   - an outage whose recovery was never logged, of either kind
+//   - a feed the coverage record shows was polled and never read (see hasIssues)
+//   - a continuity window left unclosed
+//
+// A never-captured provider is deliberately NOT in that list — zero captures is
+// an absence, and hasIssues explains at length why failing the run on it teaches
+// an operator to ignore exit 1.
 package main
 
 import (
@@ -174,11 +182,16 @@ func printReport(w io.Writer, r audit.Report) {
 	case r.HistoryPresent:
 		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier (feed-samples + alert-log, written only while diagnostics are on) "+
 			"and COVERAGE tier (history.json, always written). Both present.")
-	case r.HistoryFound:
+	case r.HistoryFound && r.HistoryErr != "":
 		// Present but unusable. Saying "absent" here would report an evidence
 		// LOSS as an evidence gap, and the two need different responses.
 		fmt.Fprintf(w, "Evidence tiers: CAPTURE tier only — history.json is present but could NOT be read (%s), "+
 			"so the coverage tier is lost, not missing. No coverage verdict is given below.\n", r.HistoryErr)
+	case r.HistoryFound:
+		// Readable, but carrying no coverage yet — an install upgraded to this
+		// build that has not saved since. Distinct from both "lost" and "absent".
+		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier only — history.json is readable but holds no coverage record yet "+
+			"(it starts filling on the next save), so no coverage verdict can be given below.")
 	default:
 		fmt.Fprintln(w, "Evidence tiers: CAPTURE tier only — history.json is absent, so no coverage verdict can be given "+
 			"and 'no captures' below stays ambiguous.")
@@ -259,7 +272,13 @@ func printReport(w io.Writer, r audit.Report) {
 	anyCleared, anyBounded := false, false
 	for _, p := range r.Providers {
 		for _, m := range p.MissingRecoveries {
-			if m.Kind != audit.ClearedByCapture {
+			// Belt and braces: ClearedByCapture is the ZERO value of Kind, so any
+			// future MissingRecovery built without naming one lands here with a
+			// zero ClearedAt and would print the fabricated timestamp all over
+			// again. The doc says "read Kind, never ClearedAt.IsZero()" — that is
+			// the right rule for a reader, and a bad thing for a FORMATTER to
+			// depend on every author remembering.
+			if m.Kind != audit.ClearedByCapture || m.ClearedAt.IsZero() {
 				continue
 			}
 			if !anyCleared {
@@ -273,7 +292,9 @@ func printReport(w io.Writer, r audit.Report) {
 	}
 	for _, p := range r.Providers {
 		for _, m := range p.MissingRecoveries {
-			if m.Kind != audit.BoundedByHorizon {
+			// The mirror of the guard above: anything without a real clearance
+			// time belongs here, whatever its Kind says.
+			if m.Kind == audit.ClearedByCapture && !m.ClearedAt.IsZero() {
 				continue
 			}
 			if !anyBounded {

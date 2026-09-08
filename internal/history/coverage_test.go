@@ -108,11 +108,6 @@ func TestLoadLegacyFileWithoutCoverage(t *testing.T) {
 	if _, ok := h.Coverage("p"); ok {
 		t.Error("Coverage reported for a legacy file that never recorded any")
 	}
-	// And a sample with no Outcome keeps the older, coarser meaning rather than
-	// being read as some specific failure class.
-	if got := h.Series("p")[0].Outcome; got != "" {
-		t.Errorf("legacy Sample.Outcome = %q, want empty", got)
-	}
 }
 
 // TestSaveOmitsEmptyCoverage keeps a build that has never recorded coverage
@@ -207,9 +202,32 @@ func TestBlindAttemptIsNotAFeedFailure(t *testing.T) {
 		t.Errorf("LastFailureClass = %q, want %q — a blind attempt must not overwrite the real explanation",
 			cov.LastFailureClass, OutcomeHTTP)
 	}
-	// It still records that somebody looked.
+	// It still records that somebody looked...
 	if !cov.LastAttempt.After(t0) {
 		t.Error("LastAttempt did not advance; a blind poll is still an attempt")
+	}
+	// ...but it must NOT advance the last thing we LEARNED. Staleness is measured
+	// from that, so if blind attempts moved it, a machine offline for months
+	// would keep a months-old verdict looking current forever.
+	if !cov.LastInformative.Equal(t0) {
+		t.Errorf("LastInformative = %v, want it pinned at the last real observation %v", cov.LastInformative, t0)
+	}
+}
+
+// TestSkippedDoesNotAdvanceLastInformative: same rule for the other
+// non-informative case.
+func TestSkippedDoesNotAdvanceLastInformative(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	h.RecordCoverage("p", CoverageObservation{At: t0, OK: true})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(time.Hour), Skipped: true})
+
+	cov, _ := h.Coverage("p")
+	if !cov.LastInformative.Equal(t0) {
+		t.Errorf("LastInformative = %v, want %v — a skipped poll teaches nothing", cov.LastInformative, t0)
+	}
+	if !cov.LastSuccess.Equal(t0) {
+		t.Errorf("LastSuccess = %v, want %v", cov.LastSuccess, t0)
 	}
 }
 

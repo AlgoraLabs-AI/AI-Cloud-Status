@@ -25,16 +25,37 @@ func TestFeedVerdictThreeWay(t *testing.T) {
 			want: FeedUnknown,
 		},
 		{
-			name: "last poll read the feed",
+			name: "the last informative poll read the feed",
 			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
-				Coverage: history.CoverageEntry{LastAttempt: now, LastSuccess: now.Add(-time.Minute)}},
+				Coverage: history.CoverageEntry{
+					LastAttempt: now, LastSuccess: now, LastInformative: now,
+				}},
 			want: FeedHealthy,
+		},
+		{
+			// Blind polls after a real read: LastAttempt keeps advancing but
+			// nothing new was learned, so the last thing we know is still that
+			// success. Honest, and bounded by the freshness rule below.
+			name: "blind polls after a recent success",
+			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
+				Coverage: history.CoverageEntry{
+					LastAttempt: now, LastSuccess: now.Add(-time.Hour), LastInformative: now.Add(-time.Hour),
+				}},
+			want: FeedHealthy,
+		},
+		{
+			// Every attempt ever made was blind or skipped: nothing was learned,
+			// so there is nothing to call healthy.
+			name: "attempts made but nothing ever learned",
+			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
+				Coverage: history.CoverageEntry{LastAttempt: now}},
+			want: FeedUnknown,
 		},
 		{
 			name: "sustained run of failures",
 			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
-				Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeHTTP,
-					ConsecutiveFailures: sustainedFailureAttempts}},
+				Coverage: history.CoverageEntry{LastAttempt: now, LastInformative: now,
+					LastFailureClass: history.OutcomeHTTP, ConsecutiveFailures: sustainedFailureAttempts}},
 			want: FeedBroken,
 		},
 		{
@@ -43,8 +64,8 @@ func TestFeedVerdictThreeWay(t *testing.T) {
 			// exists to avoid, pointed the other way.
 			name: "one failed poll is not conclusive",
 			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
-				Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeTransport,
-					ConsecutiveFailures: 1}},
+				Coverage: history.CoverageEntry{LastAttempt: now, LastInformative: now,
+					LastFailureClass: history.OutcomeTransport, ConsecutiveFailures: 1}},
 			want: FeedUnknown,
 		},
 		{
@@ -54,7 +75,7 @@ func TestFeedVerdictThreeWay(t *testing.T) {
 			name: "worked for months, now sustained failure",
 			pr: ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
 				Coverage: history.CoverageEntry{
-					LastAttempt: now, LastSuccess: now.Add(-72 * time.Hour),
+					LastAttempt: now, LastSuccess: now.Add(-72 * time.Hour), LastInformative: now,
 					LastFailureClass: history.OutcomeHTTP, ConsecutiveFailures: 500,
 				}},
 			want: FeedBroken,
@@ -123,8 +144,8 @@ func TestMissingRecoveryKindIsExplicit(t *testing.T) {
 // are on.
 func TestCoverageVerdictIndependentOfCaptures(t *testing.T) {
 	now := time.Now()
-	broken := history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeTransport,
-		ConsecutiveFailures: sustainedFailureAttempts}
+	broken := history.CoverageEntry{LastAttempt: now, LastInformative: now,
+		LastFailureClass: history.OutcomeTransport, ConsecutiveFailures: sustainedFailureAttempts}
 
 	withCaptures := ProviderReport{
 		ID: "a", Enabled: true, HasPublicFeed: true,
@@ -166,9 +187,10 @@ func TestFeedVerdictNeverInventsHealth(t *testing.T) {
 // silence in time.
 func TestFeedVerdictGoesUnknownWhenStale(t *testing.T) {
 	now := time.Now()
+	long := now.Add(-90 * 24 * time.Hour)
 	stale := ProviderReport{ID: "a", Enabled: true, HasPublicFeed: true, HasCoverage: true,
 		Coverage: history.CoverageEntry{
-			LastAttempt: now.Add(-90 * 24 * time.Hour), LastFailureClass: history.OutcomeHTTP,
+			LastAttempt: long, LastInformative: long, LastFailureClass: history.OutcomeHTTP,
 			ConsecutiveFailures: 500,
 		}}
 
@@ -178,9 +200,20 @@ func TestFeedVerdictGoesUnknownWhenStale(t *testing.T) {
 	if stale.FeedFault(now) {
 		t.Error("a three-month-old coverage record still failed the run")
 	}
-	// The same record, freshly observed, IS a fault.
+
+	// Staleness is measured from the last INFORMATIVE observation, not from the
+	// last attempt: a machine offline for months keeps attempting every round, so
+	// an attempt-based rule would call this verdict current forever.
+	stillAttempting := stale
+	stillAttempting.Coverage.LastAttempt = now
+	if stillAttempting.FeedFault(now) {
+		t.Error("blind attempts kept a months-old verdict alive; freshness must key on what was LEARNED")
+	}
+
+	// The same record, freshly learned, IS a fault.
 	fresh := stale
 	fresh.Coverage.LastAttempt = now
+	fresh.Coverage.LastInformative = now
 	if !fresh.FeedFault(now) {
 		t.Error("a current sustained failure must still fail the run")
 	}

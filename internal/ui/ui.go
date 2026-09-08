@@ -328,21 +328,6 @@ func feedOutcome(k providers.FeedFailure) string {
 	}
 }
 
-// coverageFailureClass is the failure class to persist for a poll outcome, or ""
-// when the poll is not a failure.
-//
-// A SKIPPED check is deliberately not a failure: an Optional provider that
-// publishes no feed was looked at and is working as designed. Recording it as a
-// broken feed is the single misreading the coverage record exists to prevent.
-func coverageFailureClass(outcome string) string {
-	switch outcome {
-	case history.OutcomeReadable, history.OutcomeSkipped, "":
-		return ""
-	default:
-		return outcome
-	}
-}
-
 // carryLastOK folds the previous state's lastOK into a fresh observation: a
 // readable feed stamps it now, an unreadable one inherits it. Without the
 // inherit, one failed poll erases the app's memory of when it last saw the
@@ -1471,6 +1456,15 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	// latch a real failure and providers polled after it a blind one — one
 	// connectivity event leaving an inconsistent attendance record across the
 	// fleet. Every provider in a round must be judged against the same answer.
+	//
+	// What this does NOT do, stated so nobody reads more into it: the latch is
+	// necessarily behind a drop that happens DURING the round, and it is false on
+	// the very first round of the process, so the first round of an offline
+	// episode records a real failure against every provider. That costs one
+	// failure per episode and no more — later rounds see the latch and go blind,
+	// and any successful poll resets the counter to zero — which is well inside
+	// the sustained run a verdict needs. Recording coverage after the round
+	// completes would close even that, at the cost of restructuring the hot path.
 	offlineAtRoundStart := c.offline.Offline()
 	var wg sync.WaitGroup
 	for _, p := range list {
@@ -1500,13 +1494,6 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			up := reachable && unmutedSeverity(st.res, interest) < providers.SevMajor
 			sample := history.Sample{
 				Time: st.when, Up: up, Unknown: !reachable, Latency: st.latency,
-			}
-			if !reachable {
-				// Outcome explains an Unknown. On an up/down sample there is
-				// nothing to explain, and stamping "readable" on every healthy
-				// poll would add a constant per-sample cost to a file whose whole
-				// design is "deliberately tiny, bounded by construction".
-				sample.Outcome = st.outcome
 			}
 			if !up && reachable {
 				sample.DownRegions, _ = sampleDownRegions(st.res, interest)
@@ -1550,7 +1537,9 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 				OK:           st.outcome == history.OutcomeReadable,
 				Skipped:      st.skipped,
 				Blind:        st.err != nil && (offlineAtRoundStart || errors.Is(st.err, context.Canceled)),
-				FailureClass: coverageFailureClass(st.outcome),
+				// RecordCoverage reads FailureClass only on the branch where the
+				// poll really failed, and st.outcome is already the class there.
+				FailureClass: st.outcome,
 			})
 
 			// Journal every incident the feed currently lists so the detail
@@ -1738,6 +1727,17 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		c.mu.Lock()
 		c.provStates[p.ID] = st
 		c.mu.Unlock()
+		// A manual Retry is a look, and coverage's whole question is "was anyone
+		// watching, and did the look succeed". Leaving it out let the user watch a
+		// feed read successfully while the attendance record still counted it as
+		// failing — and that record now drives the audit's exit code.
+		c.history.RecordCoverage(p.ID, history.CoverageObservation{
+			At:           st.when,
+			OK:           st.outcome == history.OutcomeReadable,
+			Skipped:      st.skipped,
+			Blind:        st.err != nil && (c.offline.Offline() || errors.Is(st.err, context.Canceled)),
+			FailureClass: st.outcome,
+		})
 		c.refresh()
 	}()
 }

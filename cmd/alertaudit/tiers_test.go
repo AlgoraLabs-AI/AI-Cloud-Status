@@ -18,18 +18,18 @@ import (
 func TestHasIssuesCoverageTier(t *testing.T) {
 	now := time.Now()
 
-	brokenFeed := audit.Report{HistoryPresent: true, Providers: []audit.ProviderReport{
+	brokenFeed := audit.Report{GeneratedAt: now, HistoryPresent: true, Providers: []audit.ProviderReport{
 		{ID: "a", Enabled: true, HasPublicFeed: true, TotalCaptures: 0, HasCoverage: true,
-			Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeHTTP,
-				ConsecutiveFailures: 25}},
+			Coverage: history.CoverageEntry{LastAttempt: now, LastInformative: now,
+				LastFailureClass: history.OutcomeHTTP, ConsecutiveFailures: 25}},
 	}}
 	if !hasIssues(brokenFeed) {
 		t.Error("hasIssues(feed polled and never read) = false; that is positive evidence of a broken feed, not an absence")
 	}
 
-	healthyNoCaptures := audit.Report{HistoryPresent: true, Providers: []audit.ProviderReport{
+	healthyNoCaptures := audit.Report{GeneratedAt: now, HistoryPresent: true, Providers: []audit.ProviderReport{
 		{ID: "a", Enabled: true, HasPublicFeed: true, TotalCaptures: 0, HasCoverage: true,
-			Coverage: history.CoverageEntry{LastAttempt: now, LastSuccess: now}},
+			Coverage: history.CoverageEntry{LastAttempt: now, LastSuccess: now, LastInformative: now}},
 	}}
 	if hasIssues(healthyNoCaptures) {
 		t.Error("hasIssues(no captures but feed read fine) = true; a healthy provider produces no captures by design")
@@ -57,10 +57,10 @@ func TestHasIssuesDoesNotMixTiers(t *testing.T) {
 	now := time.Now()
 
 	// Capture tier empty, coverage tier says broken -> must still fail.
-	onlyCoverageEvidence := audit.Report{HistoryPresent: true, Providers: []audit.ProviderReport{
+	onlyCoverageEvidence := audit.Report{GeneratedAt: now, HistoryPresent: true, Providers: []audit.ProviderReport{
 		{ID: "a", Enabled: true, HasPublicFeed: true, TotalCaptures: 0, HasCoverage: true,
-			Coverage: history.CoverageEntry{LastAttempt: now, LastFailureClass: history.OutcomeTransport,
-				ConsecutiveFailures: 25}},
+			Coverage: history.CoverageEntry{LastAttempt: now, LastInformative: now,
+				LastFailureClass: history.OutcomeTransport, ConsecutiveFailures: 25}},
 	}}
 	if !hasIssues(onlyCoverageEvidence) {
 		t.Error("a coverage-tier fault was suppressed because the capture tier was empty")
@@ -83,7 +83,8 @@ func TestHasIssuesDoesNotMixTiers(t *testing.T) {
 func TestHasIssuesIgnoresOptionalProviderCoverage(t *testing.T) {
 	now := time.Now()
 	brokenLooking := history.CoverageEntry{
-		LastAttempt: now, LastFailureClass: history.OutcomeTransport, ConsecutiveFailures: 500,
+		LastAttempt: now, LastInformative: now,
+		LastFailureClass: history.OutcomeTransport, ConsecutiveFailures: 500,
 	}
 
 	optional := audit.ProviderReport{ID: "groq", Enabled: true, HasPublicFeed: false,
@@ -94,7 +95,7 @@ func TestHasIssuesIgnoresOptionalProviderCoverage(t *testing.T) {
 	if optional.FeedFault(now) {
 		t.Error("an Optional provider with no public feed was reported as a broken feed")
 	}
-	if hasIssues(audit.Report{HistoryPresent: true, Providers: []audit.ProviderReport{optional}}) {
+	if hasIssues(audit.Report{GeneratedAt: now, HistoryPresent: true, Providers: []audit.ProviderReport{optional}}) {
 		t.Error("hasIssues failed the run over a provider that has no public feed to read")
 	}
 

@@ -87,7 +87,7 @@ func TestPrintReportShowsCoverageFaultEvenWithCaptures(t *testing.T) {
 			TotalCaptures: 5, // captures exist, so the NeverCaptured note never fires
 			HasCoverage:   true,
 			Coverage: history.CoverageEntry{
-				LastAttempt: now, LastSuccess: now.Add(-72 * time.Hour),
+				LastAttempt: now, LastSuccess: now.Add(-72 * time.Hour), LastInformative: now,
 				LastFailureClass: history.OutcomeHTTP, ConsecutiveFailures: 500,
 			},
 		}},
@@ -106,6 +106,32 @@ func TestPrintReportShowsCoverageFaultEvenWithCaptures(t *testing.T) {
 	}
 	if strings.Contains(out, "No uncovered major incidents") {
 		t.Errorf("report printed an all-clear summary while failing the run:\n%s", out)
+	}
+}
+
+// TestPrintReportSurvivesAZeroKindFinding closes the hole the Kind
+// discriminator leaves open on its own.
+//
+// ClearedByCapture is the ZERO value of MissingRecoveryKind, so any future
+// construction that omits Kind — or any decode/copy path that zeroes it — lands
+// on the branch that prints ClearedAt, with ClearedAt zero. That is the original
+// fabricated-timestamp defect, verbatim, reachable without anyone writing a bug.
+// The formatter must not depend on every author remembering the doc.
+func TestPrintReportSurvivesAZeroKindFinding(t *testing.T) {
+	r := audit.Report{
+		GeneratedAt:    time.Now(),
+		HistoryPresent: true,
+		Providers: []audit.ProviderReport{{
+			ID: "p1", Enabled: true, HasPublicFeed: true, TotalCaptures: 1,
+			// Kind deliberately omitted: this is what a careless caller writes.
+			MissingRecoveries: []audit.MissingRecovery{{Start: time.Date(2026, 9, 4, 9, 53, 4, 0, time.Local)}},
+		}},
+	}
+
+	var buf bytes.Buffer
+	printReport(&buf, r)
+	if out := buf.String(); strings.Contains(out, "0000-") {
+		t.Errorf("a zero-Kind finding printed a fabricated clearance time:\n%s", out)
 	}
 }
 
