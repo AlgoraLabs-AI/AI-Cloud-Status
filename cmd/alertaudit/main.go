@@ -95,6 +95,11 @@ func printContinuity(w io.Writer, r audit.ContinuityReport) {
 		fmt.Fprintf(w, "  Sample history reaches back to %s; nothing older can be judged here.\n",
 			r.HistoryHorizon.Local().Format("2006-01-02 15:04"))
 	}
+	if r.HistoryErr != "" {
+		fmt.Fprintf(w, "  history.json is present but could NOT be read (%s): the sample witness is LOST, so every\n"+
+			"  window below that needed it reads as no evidence; the connectivity windows come from the journal alone.\n",
+			r.HistoryErr)
+	}
 	if len(r.Checked) == 0 {
 		fmt.Fprintln(w, "  No custom URL or connectivity alerts on record.")
 		return
@@ -195,11 +200,19 @@ func captureTierPhrase(present, diagnosticsOn bool) string {
 // which calls for a different response than a gap), and readable-but-empty.
 func coverageTierPhrase(r audit.Report) string {
 	switch {
+	case r.HistoryPresent && r.CoverageDropped > 0:
+		return fmt.Sprintf("COVERAGE tier present (history.json, always written), but %d of its entries were stamped in "+
+			"the future and discarded as clock damage — those providers resolve to unknown below for a LOSS, not a gap.",
+			r.CoverageDropped)
 	case r.HistoryPresent:
 		return "COVERAGE tier present (history.json, always written)."
 	case r.HistoryFound && r.HistoryErr != "":
 		return fmt.Sprintf("history.json is present but could NOT be read (%s), so the coverage tier is LOST, not "+
 			"missing. No coverage verdict is given below.", r.HistoryErr)
+	case r.HistoryFound && r.CoverageDropped > 0:
+		return fmt.Sprintf("history.json is readable but EVERY coverage entry (%d) was stamped in the future and "+
+			"discarded as clock damage, so the coverage tier is LOST, not missing — the clock ran fast while this "+
+			"record was written. No coverage verdict is given below.", r.CoverageDropped)
 	case r.HistoryFound:
 		return "history.json is readable but holds no coverage record yet (it starts filling on the next save), so no " +
 			"coverage verdict can be given below."

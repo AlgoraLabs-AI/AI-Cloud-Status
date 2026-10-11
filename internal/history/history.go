@@ -142,8 +142,9 @@ type CoverageEntry struct {
 	// fact it is about ("was this provider observed in every round between?")
 	// instead of by wall-clock distances that merely proxy for it.
 	//
-	// Zero means the entry predates round numbering, or was last touched by a
-	// caller that has none; the round rules then abstain for that one judgement.
+	// Zero means no round-carrying observation has ever been recorded for this
+	// entry — it predates round numbering. An observation without a round
+	// leaves this field as it was; the round rules abstain for that observation.
 	LastRound uint64 `json:"lr,omitempty"`
 	// LastFailureRound is the round whose failure the run last COUNTED. A round
 	// counts at most one failure however many times it is polled, and this is
@@ -229,8 +230,10 @@ type CoverageObservation struct {
 	// this provider being observed. Both are exact, and neither cares how long a
 	// round took.
 	//
-	// Zero means the caller has no round — a manual retry, or a reader older than
-	// this field — and the round rules abstain for that observation.
+	// Zero means the caller has no round — a producer older than this field, or a
+	// poll before the scheduler minted its first round — and the round rules
+	// abstain for that observation. A manual retry is NOT round-less: it records
+	// under the round in progress, which is what keeps it from counting twice.
 	Round uint64
 	// RunGap is how long attempts may be apart before the polling is considered
 	// to have stopped — the app closed, the machine asleep. It only matters across
@@ -373,12 +376,16 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	// function has already advanced measures zero every time.
 	prevAttempt := cov.LastAttempt
 	prevRound := cov.LastRound
-	// High-water mark, as the field's own doc says — so enforce it. Two polls for
-	// one provider can complete out of order: a scheduled round that started
-	// earlier can finish AFTER a manual retry that started later, and recording
-	// its older result would move LastInformative backward, resurrect a failure
-	// run the user just watched clear, and drop the verdict from healthy to
-	// inconclusive about a feed they are looking at working.
+	// High-water mark, as the field's own doc says — so enforce it: an
+	// observation not newer than the last recorded one is refused. What this
+	// orders by is COMPLETION, because At is stamped when the poll finishes, not
+	// when it starts — so "a poll that started earlier finishing later" is not
+	// what gets refused; its stamp is the later one and it is accepted. What is
+	// refused is the loser of a race between two completions within the same
+	// clock tick, or an observation replayed from a reader behind this one.
+	// The record cannot move backward in time either way; which of two
+	// same-instant polls it keeps is arbitrary, and said so here rather than
+	// dressed up as an ordering it does not enforce.
 	if !obs.At.After(cov.LastAttempt) && !cov.LastAttempt.IsZero() {
 		return
 	}
@@ -522,20 +529,26 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 //   - (nil, false, nil)  the file does not exist
 //   - (nil, true, err)   it exists and could not be read or parsed
 //   - (map, true, nil)   it was read; the map may still be empty
-func LoadCoverage(path string) (map[string]CoverageEntry, bool, error) {
+//
+// dropped counts the entries discarded as clock damage (see dropFutureDated). It
+// is returned, not just logged, because a reader that sees an empty map cannot
+// otherwise tell "nothing was ever recorded" from "everything recorded was
+// discarded" — a gap from a loss, which the audit's tier line exists to keep
+// apart.
+func LoadCoverage(path string) (coverage map[string]CoverageEntry, found bool, dropped int, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, false, nil
+			return nil, false, 0, nil
 		}
-		return nil, true, err
+		return nil, true, 0, err
 	}
 	// Only the coverage key is decoded; the series are skipped rather than
 	// materialized. The envelope is the SAME declaration onDisk embeds, so the
 	// writer and this reader cannot drift apart.
 	var snap coverageEnvelope
 	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil, true, err
+		return nil, true, 0, err
 	}
 	if snap.Coverage == nil {
 		snap.Coverage = map[string]CoverageEntry{}
@@ -550,8 +563,8 @@ func LoadCoverage(path string) (map[string]CoverageEntry, bool, error) {
 	// refused forever, and a frozen entry holding a failure run would fail the
 	// audit permanently. Discarding the entry costs one provider's history and
 	// restores a record that can move again.
-	dropFutureDated(snap.Coverage)
-	return snap.Coverage, true, nil
+	dropped = dropFutureDated(snap.Coverage)
+	return snap.Coverage, true, dropped, nil
 }
 
 // dropFutureDated removes entries stamped implausibly far ahead of now.
@@ -565,15 +578,17 @@ func LoadCoverage(path string) (map[string]CoverageEntry, bool, error) {
 // Each drop is logged: a discarded record is evidence LOST, and without a line
 // here the next reader — the app's own save, the audit — reports it as evidence
 // that never existed.
-func dropFutureDated(m map[string]CoverageEntry) {
+func dropFutureDated(m map[string]CoverageEntry) (dropped int) {
 	cutoff := time.Now().Add(CoverageFutureSlack)
 	for id, cov := range m {
 		if cov.LastAttempt.After(cutoff) {
 			slog.Warn("history: coverage entry stamped in the future, discarded as clock damage",
 				"id", id, "last_attempt", cov.LastAttempt, "cutoff", cutoff)
 			delete(m, id)
+			dropped++
 		}
 	}
+	return dropped
 }
 
 // Coverage returns check id's attendance record and whether one exists.
@@ -792,7 +807,7 @@ func Load(path string, capacity int) (*History, error) {
 		// loads this same file and moved the running app's data out from under
 		// it, turning its own "present but unreadable" into "absent" one run
 		// later.
-		return New(capacity), fmt.Errorf("%w: %v", ErrCorrupt, err)
+		return h, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	for id, buf := range snap.Series {
 		if len(buf) > h.cap {

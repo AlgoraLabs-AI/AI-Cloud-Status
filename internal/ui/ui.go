@@ -115,6 +115,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // blip is tolerated without a tight retry loop.
 const providerRetryAttempts = 3
 
+// firstProbeWait bounds how long the first provider round waits for the
+// connectivity probe's first answer. The probe runs 3s-timeout checks against a
+// handful of targets, so it is normally done within a few seconds of the startup
+// delay; the bound exists for the case where it never answers at all.
+const firstProbeWait = 10 * time.Second
+
 // historySaveEvery is how many countdown ticks (seconds) elapse between
 // background saves of the on-disk history ring buffer.
 const historySaveEvery = 60
@@ -229,6 +235,12 @@ type Controller struct {
 	// triggers force an immediate poll, bypassing the sleep (Refresh now).
 	providerTrigger chan struct{}
 	connTrigger     chan struct{}
+	// probeJudged is closed once the connectivity probe has answered for the
+	// first time, so the first provider round is judged against a witness that
+	// exists instead of against "nobody has said yet" — which read as no link
+	// and filed the first round of every launch as blind.
+	probeJudged chan struct{}
+	probeOnce   sync.Once
 
 	// filter/sort state for the status table.
 	filter  string
@@ -374,6 +386,7 @@ func feedOutcome(k providers.FeedFailure) string {
 // against a single snapshot; reading them per provider lets a link dropping
 // mid-round give some a real failure and others a blind one.
 func coverageObservation(st provState, noLink, cancelled bool, round uint64, runGap time.Duration) history.CoverageObservation {
+	blind := st.err != nil && (noLink || cancelled)
 	return history.CoverageObservation{
 		At:      st.when,
 		OK:      st.outcome == history.OutcomeReadable,
@@ -396,19 +409,25 @@ func coverageObservation(st provState, noLink, cancelled bool, round uint64, run
 		// answers 200 with a login page, which parses as garbage, and the
 		// exemption would file that as positive evidence against every provider
 		// at once.
-		Blind: st.err != nil && (noLink || cancelled),
-		// Only set when the poll actually FAILED. RecordCoverage happens to read
-		// this field on that branch alone today, but the field's own doc says it
-		// is a failure class or empty — so passing "readable" or "skipped" here
-		// violates the contract and quietly waits for someone to hoist the
-		// assignment out of the failure branch, at which point a healthy feed
-		// persists LastFailureClass="readable".
-		FailureClass: failureClassOf(st),
+		Blind: blind,
+		// Only set when the poll actually FAILED and the failure is the feed's to
+		// answer for — the field's own contract: a failure class, or empty on a
+		// success, a skip and a blind attempt alike. RecordCoverage happens to
+		// read it on the failure branch alone today; filling it on another branch
+		// would quietly wait for someone to hoist the assignment, at which point a
+		// healthy feed persists LastFailureClass="readable" or a blind poll's
+		// transport error is filed against the provider.
+		FailureClass: failureClassOf(st, blind),
 	}
 }
 
-// failureClassOf is st.outcome when the poll failed, and empty otherwise.
-func failureClassOf(st provState) string {
+// failureClassOf is st.outcome when the poll failed and the failure can be laid
+// at the feed's door, and empty otherwise — on a success, a skip, and a blind
+// attempt, whose error describes the machine's link, not the provider.
+func failureClassOf(st provState, blind bool) string {
+	if blind {
+		return ""
+	}
 	switch st.outcome {
 	case history.OutcomeReadable, history.OutcomeSkipped, "":
 		return ""
@@ -543,6 +562,7 @@ func New() *Controller {
 		urlStates:              map[string]urlState{},
 		providerTrigger:        make(chan struct{}, 1),
 		connTrigger:            make(chan struct{}, 1),
+		probeJudged:            make(chan struct{}),
 		sortKey:                cfg.Sort.Column,
 		sortAsc:                cfg.Sort.Ascending,
 	}
@@ -1371,6 +1391,9 @@ func (c *Controller) runConnectivity(ctx context.Context) {
 			// target is enabled to say — and a consumer that cannot tell those
 			// apart reads "no evidence" as "evidence of a link".
 			c.connJudged = anyChecked
+			// Closed on the first pass whatever the answer — including "no target
+			// enabled to say", which is itself the witness's answer.
+			c.probeOnce.Do(func() { close(c.probeJudged) })
 			// Stamp when the blackout STARTED. recomputeOffline needs it to tell a
 			// provider fetch that proves we are online from one that merely
 			// succeeded before the network dropped — see the freshness rule there.
@@ -1532,6 +1555,18 @@ func (c *Controller) runProviders(ctx context.Context) {
 	if !sleepCtx(ctx, startupDelay) {
 		return
 	}
+	// Both loops wake from the same startup delay and the probe takes seconds to
+	// answer, so without this the first round snapshots an unjudged witness and
+	// is filed blind against every provider — one real failure dropped per
+	// launch, and an app opened and closed inside one round never accumulating
+	// evidence against a broken feed. Wait for the probe's first answer, bounded:
+	// a probe that never answers (no engine) must not hold polling hostage.
+	select {
+	case <-c.probeJudged:
+	case <-time.After(firstProbeWait):
+	case <-ctx.Done():
+		return
+	}
 	// The round number is minted by the TIMER, not by the poll. "Refresh now"
 	// wakes this loop through providerTrigger and re-polls inside the round in
 	// progress, so the coverage record sees it as the same round and does not
@@ -1596,16 +1631,12 @@ func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	// before the probe notices record a real failure, and that costs one failure
 	// per episode and no more — later rounds see the probe's answer and go blind,
 	// and any successful poll resets the counter to zero — which is well inside
-	// the sustained run a verdict needs. And on the FIRST round of a process the
-	// probe has not answered yet (both loops wake from the same startup delay,
-	// and the probes take seconds), so connJudged is false and that round is
-	// recorded BLIND against every provider: no witness is not a clean bill of
-	// health, see below. The cost is the mirror image — one real failure
-	// dropped per launch, and an app opened and closed inside a single round
-	// accumulates no evidence against a broken feed. Recording coverage after
-	// the probe has answered would close both, at the cost of restructuring the
-	// hot path. The witness for "this poll could not see anything" is the
-	// CONNECTIVITY PROBE, not the offline latch.
+	// the sustained run a verdict needs. The first round of a process used to be
+	// the mirror image — snapshotted before the probe had answered, so filed
+	// blind against every provider — and runProviders now waits for the probe's
+	// first answer before that round (see probeJudged). The witness for "this
+	// poll could not see anything" is the CONNECTIVITY PROBE, not the offline
+	// latch.
 	//
 	// monitor.Evaluate mixes two very different things into that latch: the ping
 	// result, which is independent evidence, and "every provider was

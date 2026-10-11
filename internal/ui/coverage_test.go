@@ -42,7 +42,7 @@ func TestCoverageObservation(t *testing.T) {
 			name:   "transport failure with NO LINK is blind",
 			st:     provState{when: at, outcome: history.OutcomeTransport, err: errors.New("no such host")},
 			noLink: true,
-			want:   history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeTransport},
+			want:   history.CoverageObservation{At: at, Blind: true},
 		},
 		{
 			// THE case the record exists for, and the reason blindness must key
@@ -63,13 +63,13 @@ func TestCoverageObservation(t *testing.T) {
 			name:   "HTTP failure with no link is blind — an answer may not be the provider's",
 			st:     provState{when: at, outcome: history.OutcomeHTTP, err: errors.New("unexpected status 405")},
 			noLink: true,
-			want:   history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeHTTP},
+			want:   history.CoverageObservation{At: at, Blind: true},
 		},
 		{
 			name:   "parse failure with no link is blind — this is what a portal looks like",
 			st:     provState{when: at, outcome: history.OutcomeParse, err: errors.New("bad json")},
 			noLink: true,
-			want:   history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeParse},
+			want:   history.CoverageObservation{At: at, Blind: true},
 		},
 		{
 			// Cancellation comes from the CALLER's ctx, not from st.err:
@@ -78,7 +78,7 @@ func TestCoverageObservation(t *testing.T) {
 			name:      "cancelled at shutdown is blind even with a link, and even with a non-context error",
 			st:        provState{when: at, outcome: history.OutcomeTransport, err: errors.New("no such host")},
 			cancelled: true,
-			want:      history.CoverageObservation{At: at, Blind: true, FailureClass: history.OutcomeTransport},
+			want:      history.CoverageObservation{At: at, Blind: true},
 		},
 		{
 			name: "skipped is neither success nor failure, and carries no failure class",
@@ -99,6 +99,32 @@ func TestCoverageObservation(t *testing.T) {
 			got := coverageObservation(tc.st, tc.noLink, tc.cancelled, 0, 0)
 			if got != tc.want {
 				t.Errorf("coverageObservation() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNoLinkWitness pins the one function that decides blindness. It is a pure
+// function of three Controller fields and needs no window, and inverting any
+// term compiles and passes everything else — while the next wifi drop then files
+// real failures against all fifteen providers, which sets the audit's exit code.
+func TestNoLinkWitness(t *testing.T) {
+	cases := []struct {
+		name                              string
+		connDown, connJudged, lastRoundOK bool
+		want                              bool
+	}{
+		{"probe says down, nothing read last round: no link", true, true, false, true},
+		{"probe says up: link", false, true, false, false},
+		{"no witness at all (first round, or all targets disabled): no link", false, false, false, true},
+		{"no witness, but a provider read its feed last round: link", false, false, true, false},
+		{"probe says down, but a provider read its feed last round: link (blocked probe targets)", true, true, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Controller{connDown: tc.connDown, connJudged: tc.connJudged, lastRoundAnyOK: tc.lastRoundOK}
+			if got := c.noLinkLocked(); got != tc.want {
+				t.Errorf("noLinkLocked() = %v, want %v", got, tc.want)
 			}
 		})
 	}

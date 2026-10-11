@@ -348,6 +348,11 @@ type Report struct {
 	HistoryPresent bool
 	HistoryFound   bool
 	HistoryErr     string
+	// CoverageDropped counts entries the reader discarded as clock damage
+	// (stamped beyond CoverageFutureSlack). Without it an install whose every
+	// entry was dropped reads as "no coverage record yet" — a LOSS reported as a
+	// gap, the confusion the tier line exists to prevent.
+	CoverageDropped int
 	// DiagnosticsEnabled is config.json's own answer, so a report never has to
 	// infer "diagnostics are off" from an empty corpus. The two causes of an
 	// empty capture tier — never switched on, or switched on and genuinely quiet
@@ -469,7 +474,7 @@ func Run(dir string) (Report, error) {
 	// audit reads none of it. Failures are non-fatal but must not be silent: a
 	// present-but-corrupt file has to report as unreadable, not as absent, and
 	// certainly not as "coverage tier present" while yielding no verdicts.
-	coverage, histFound, herr := history.LoadCoverage(filepath.Join(dir, "history.json"))
+	coverage, histFound, dropped, herr := history.LoadCoverage(filepath.Join(dir, "history.json"))
 	histErr := ""
 	if herr != nil {
 		histErr = herr.Error()
@@ -482,6 +487,7 @@ func Run(dir string) (Report, error) {
 		HistoryPresent:     histFound && herr == nil && len(coverage) > 0,
 		HistoryFound:       histFound,
 		HistoryErr:         histErr,
+		CoverageDropped:    dropped,
 		DiagnosticsEnabled: cfg.DebugLogging,
 	}
 	for _, p := range providers.Default() {

@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"errors"
 	"path/filepath"
 	"sort"
 	"time"
@@ -86,6 +87,11 @@ type ContinuityReport struct {
 	// HistoryHorizon is the oldest sample retained across the audited series,
 	// i.e. how far back any claim here can reach.
 	HistoryHorizon time.Time
+	// HistoryErr is set when history.json was there and could not be read. The
+	// section still runs — the connectivity windows come from the journal alone
+	// and need no samples — but every window that needed a sample is then "no
+	// evidence" for a reason the reader must see: a LOSS, not a quiet period.
+	HistoryErr string
 }
 
 // Unclosed returns only the windows that are real defects.
@@ -113,8 +119,16 @@ func RunContinuity(dir string) (ContinuityReport, error) {
 		return rep, err
 	}
 	hist, err := history.Load(filepath.Join(dir, "history.json"), history.DefaultCapacity)
-	if err != nil {
+	if err != nil && !errors.Is(err, history.ErrCorrupt) {
 		return rep, err
+	}
+	if err != nil {
+		// Unreadable is not fatal here: Load hands back an empty History and the
+		// section degrades to "no evidence" where it needed samples, which is
+		// what it always did for a file that was never written. The difference
+		// is named on the report, and the file is left exactly where it is —
+		// this is a read-only diagnostic of the running app's data.
+		rep.HistoryErr = err.Error()
 	}
 
 	// Only checks that still exist: a deleted URL leaves an orphan series and an

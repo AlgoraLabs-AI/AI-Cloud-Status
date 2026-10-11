@@ -308,7 +308,7 @@ func TestSaveThenLoadCoverageRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cov, found, err := LoadCoverage(path)
+	cov, found, _, err := LoadCoverage(path)
 	if err != nil || !found {
 		t.Fatalf("LoadCoverage = (_, %v, %v), want (map, true, nil)", found, err)
 	}
@@ -327,7 +327,7 @@ func TestSaveThenLoadCoverageRoundTrip(t *testing.T) {
 func TestLoadCoverageDistinguishesAbsentFromUnreadable(t *testing.T) {
 	dir := t.TempDir()
 
-	_, found, err := LoadCoverage(filepath.Join(dir, "nope.json"))
+	_, found, _, err := LoadCoverage(filepath.Join(dir, "nope.json"))
 	if found || err != nil {
 		t.Errorf("missing file = (found %v, err %v), want (false, nil)", found, err)
 	}
@@ -336,7 +336,7 @@ func TestLoadCoverageDistinguishesAbsentFromUnreadable(t *testing.T) {
 	if err := os.WriteFile(corrupt, []byte(`{"version":1,"series":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, found, err = LoadCoverage(corrupt)
+	_, found, _, err = LoadCoverage(corrupt)
 	if !found {
 		t.Error("a corrupt file must report as FOUND; calling it absent hides an evidence loss")
 	}
@@ -368,12 +368,15 @@ func TestLoadCoverageDropsFutureDatedEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cov, _, err := LoadCoverage(path)
+	cov, _, dropped, err := LoadCoverage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, present := cov["skewed"]; present {
 		t.Error("a future-dated entry survived Load; it would refuse every later observation forever")
+	}
+	if dropped != 1 {
+		t.Errorf("dropped = %d, want 1 — the loss must be countable, or the audit reports it as a gap", dropped)
 	}
 	if _, present := cov["sane"]; !present {
 		t.Error("the guard took a sane entry with it")
