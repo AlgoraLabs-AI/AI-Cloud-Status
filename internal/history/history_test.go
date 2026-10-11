@@ -1,6 +1,7 @@
 package history
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -202,11 +203,14 @@ func TestLoadCorruptReturnsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, err := Load(path, 50)
-	if err != nil {
-		t.Fatalf("Load corrupt should be non-fatal: %v", err)
+	// Non-fatal — a usable History comes back — but NAMED: the caller has to
+	// know the file was there and unreadable, or its next save silently
+	// overwrites months of coverage record with a fresh one.
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Load corrupt: err = %v, want ErrCorrupt", err)
 	}
-	if len(h.IDs()) != 0 {
-		t.Error("corrupt file should yield empty history")
+	if h == nil || len(h.IDs()) != 0 {
+		t.Error("corrupt file should yield a usable, empty history")
 	}
 }
 

@@ -268,11 +268,19 @@ func printReport(w io.Writer, r audit.Report) {
 			// Zero captures used to be a three-way ambiguity the archive could not
 			// resolve. The coverage tier resolves it directly — it records whether
 			// the feed was ever READ, rather than inferring health from an absence.
-			switch p.FeedVerdict(r.GeneratedAt) {
-			case audit.FeedBroken:
+			verdict := p.FeedVerdict(r.GeneratedAt)
+			switch {
+			case verdict == audit.FeedBroken && p.FeedFault(r.GeneratedAt):
 				note = fmt.Sprintf("  <- FEED NOT READABLE: %d consecutive failures (last: %s) — see the section below",
 					p.Coverage.ConsecutiveFailures, p.Coverage.LastFailureClass)
-			case audit.FeedHealthy:
+			case verdict == audit.FeedBroken:
+				// Broken on the record, but the section below and the exit code
+				// are keyed on FeedFault, which also needs the provider enabled
+				// with a public feed. Pointing at a section that will not list it
+				// is a dangling reference; say what is true instead.
+				note = fmt.Sprintf("  <- feed was not readable when last polled: %d consecutive failures (last: %s); disabled or no public feed, so not failing the run",
+					p.Coverage.ConsecutiveFailures, p.Coverage.LastFailureClass)
+			case verdict == audit.FeedHealthy:
 				// States what the record actually holds, and nothing more. The
 				// coverage entry is a high-water mark with no history — a success
 				// clears the failure run behind it — so "no captures BECAUSE it was

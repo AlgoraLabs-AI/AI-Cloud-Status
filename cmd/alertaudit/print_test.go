@@ -186,9 +186,12 @@ func TestPrintReportKeepsTheTwoKindsApart(t *testing.T) {
 // 739,000 days — a fabricated timestamp rendered as a measurement, which is
 // exactly what "cleared by 0000-12-31" was.
 //
-// The verdict should not produce this state (see the audit-side test), and the
-// formatter must not depend on that: three rounds apart, one change made the
-// unreachable reachable and nothing failed.
+// The verdict does not produce this state — FeedHealthy requires a success equal
+// to a non-zero LastInformative — so through FeedVerdict this record resolves
+// to the inconclusive advisory, and THAT is what this test asserts: a record
+// with no success on file must never read as healthy, and must never print an
+// age. The formatter's own zero guard is defence in depth that this test cannot
+// reach through the public path; it is not what passes here.
 func TestPrintReportNeverAgesAZeroSuccess(t *testing.T) {
 	now := time.Now()
 	r := audit.Report{
@@ -207,6 +210,12 @@ func TestPrintReportNeverAgesAZeroSuccess(t *testing.T) {
 		if strings.Contains(out, absurd) {
 			t.Errorf("a never-succeeded record rendered %q as an age:\n%s", absurd, out)
 		}
+	}
+	if strings.Contains(out, "DID read the feed") {
+		t.Errorf("a record with no success on file rendered as healthy:\n%s", out)
+	}
+	if !strings.Contains(out, "nothing conclusive in the coverage record") {
+		t.Errorf("a record with no success on file must render as inconclusive:\n%s", out)
 	}
 }
 

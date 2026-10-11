@@ -2,6 +2,7 @@ package history
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -493,6 +494,104 @@ func TestABlindRoundThenARealFailureInItCountsOnce(t *testing.T) {
 	}
 	if cov.LastFailureClass != OutcomeHTTP {
 		t.Errorf("LastFailureClass = %q, want the counted failure's %q", cov.LastFailureClass, OutcomeHTTP)
+	}
+}
+
+// TestABlindRoundThenARealFailureContinuesTheRun is the same shape with a run
+// already standing, which is what tells "counted" from "reset, then counted":
+// the contiguity rule compared the round against prevRound+1 with !=, so a
+// failure in the SAME round as a blind attempt read as a skipped round and
+// reset nine failures to one. Every first round after a relaunch is blind.
+func TestABlindRoundThenARealFailureContinuesTheRun(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	for r := range uint64(9) {
+		h.RecordCoverage("p", CoverageObservation{
+			At: t0.Add(time.Duration(r) * time.Minute), FailureClass: OutcomeHTTP, Round: r + 1,
+		})
+	}
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(9 * time.Minute), Blind: true, Round: 10})
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(9*time.Minute + 10*time.Second), FailureClass: OutcomeHTTP, Round: 10,
+	})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 10 {
+		t.Errorf("ConsecutiveFailures = %d, want 10 — the blind attempt and the failure are one round, not a gap",
+			cov.ConsecutiveFailures)
+	}
+}
+
+// TestAFailureAfterASuccessInTheSameRoundIsRecorded: a success ends the round's
+// counted failure, so a later failure in that round is a new fact. Keeping
+// LastFailureRound across the success dropped it entirely, and the verdict read
+// healthy from a LastInformative that pointed at the older success.
+func TestAFailureAfterASuccessInTheSameRoundIsRecorded(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+
+	h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeHTTP, Round: 5})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(10 * time.Second), OK: true, Round: 5})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(20 * time.Second), FailureClass: OutcomeHTTP, Round: 5})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1", cov.ConsecutiveFailures)
+	}
+	if !cov.LastInformative.Equal(t0.Add(20 * time.Second)) {
+		t.Errorf("LastInformative = %v, want the failure at +20s — the last thing learned was a failure", cov.LastInformative)
+	}
+	if cov.LastFailureClass != OutcomeHTTP {
+		t.Errorf("LastFailureClass = %q, want %q", cov.LastFailureClass, OutcomeHTTP)
+	}
+}
+
+// TestAnObservationWithNoOutcomeAssertsNothing: a zero-value observation names
+// no outcome, and must not be counted as a failure with an empty class.
+func TestAnObservationWithNoOutcomeAssertsNothing(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	for r := range uint64(10) {
+		h.RecordCoverage("p", CoverageObservation{At: t0.Add(time.Duration(r) * time.Minute), Round: r + 1})
+	}
+	cov, ok := h.Coverage("p")
+	if !ok || cov.LastAttempt.IsZero() {
+		t.Fatal("the attempts must still be recorded")
+	}
+	if cov.ConsecutiveFailures != 0 || cov.LastFailureClass != "" || !cov.LastInformative.IsZero() {
+		t.Errorf("an outcome-less observation moved the record: cf=%d lfc=%q li=%v",
+			cov.ConsecutiveFailures, cov.LastFailureClass, cov.LastInformative)
+	}
+}
+
+// TestLoadReportsACorruptFileAndLeavesItInPlace: Load is shared with a read-only
+// reader, so it must name the loss and touch nothing; moving the file is the
+// app's decision, through SetAside.
+func TestLoadReportsACorruptFileAndLeavesItInPlace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Load(path, 10)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Load() err = %v, want ErrCorrupt", err)
+	}
+	if h == nil || h.Len("p") != 0 {
+		t.Fatal("Load must still return a usable, empty History")
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("Load moved or removed the file: %v", statErr)
+	}
+	aside, mvErr := SetAside(path)
+	if mvErr != nil {
+		t.Fatal(mvErr)
+	}
+	if _, statErr := os.Stat(aside); statErr != nil {
+		t.Fatalf("SetAside did not leave the file at %s: %v", aside, statErr)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatal("SetAside left the original in the way of the next save")
 	}
 }
 

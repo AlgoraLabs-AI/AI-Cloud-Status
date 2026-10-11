@@ -7,6 +7,7 @@ package history
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -400,6 +401,10 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		cov.LastInformative = obs.At
 		cov.LastFailureClass = ""
 		cov.ConsecutiveFailures = 0
+		// A success ends the round's failure, so a failure AFTER it in the same
+		// round is a new fact and must be recorded — otherwise the last thing
+		// learned is a failure the record shows as a success.
+		cov.LastFailureRound = 0
 	case obs.Skipped:
 		// Nothing was fetched because there was nothing to fetch. Unlike a blind
 		// attempt, this DOES say something: whatever the feed used to fail with no
@@ -419,6 +424,13 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// nothing else — in particular do NOT clear a real failure class, which is
 		// still the best explanation we have for why this provider was failing
 		// before the link dropped, and do NOT advance the failure run.
+	case obs.FailureClass == "":
+		// Neither a success, a skip, a blind attempt, nor a classified failure:
+		// an observation that names no outcome asserts nothing about the feed.
+		// Left to fall through it would be COUNTED as a failure with an empty
+		// class, which the report prints as "(last: )" — a zero value asserting
+		// a fact, the hazard MissingRecoveryKind's zero was made to avoid. The
+		// attempt stands; nothing else moves.
 	default:
 		// A "run" has to be contiguous to mean anything. Without this, nine
 		// failures, a month with the app closed, and one failure on relaunch add
@@ -467,7 +479,10 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		if obs.Round != 0 && obs.Round == cov.LastFailureRound {
 			break
 		}
-		roundSkipped := obs.Round != 0 && prevRound != 0 && obs.Round != prevRound+1
+		// Strictly GREATER: a failure in the same round as an earlier blind or
+		// skipped attempt is the round's first failure, not a skipped round, and
+		// "!= prevRound+1" reset a nine-round run to one on exactly that path.
+		roundSkipped := obs.Round != 0 && prevRound != 0 && obs.Round > prevRound+1
 		stoppedGap := max(obs.RunGap, failureRunGap)
 		informativeWindow := max(informativeRunGapFactor*obs.RunGap, minInformativeWindow)
 		pollingStopped := roundSkipped ||
@@ -728,8 +743,28 @@ func writeFileAtomic(path string, data []byte) error {
 	return atomicfile.Write(path, data, 0o600)
 }
 
+// ErrCorrupt reports a history file that exists but could not be parsed. Load
+// returns it wrapped, beside a fresh History, so the caller can both carry on
+// and decide what the damaged file is worth.
+var ErrCorrupt = errors.New("history: file exists but could not be parsed")
+
+// SetAside moves a history file the app could not read out of the way of its
+// next save, to <path>.corrupt — one fixed name, replaced each time, so the
+// evidence of the LAST loss is kept without a pile of files growing beside the
+// data. It is the app's move at Load time, not Load's: the 60s ticker and
+// shutdown both save, so it must happen before either, and a read-only reader
+// of the same file must never do it.
+//
+// A failed move is reported, not retried: the caller's next save then DOES
+// overwrite the file, and the log line is what remains of it.
+func SetAside(path string) (string, error) {
+	aside := path + ".corrupt"
+	return aside, os.Rename(path, aside)
+}
+
 // Load reads a history file, returning an empty History (not an error) when the
-// file does not yet exist. capacity overrides the persisted cap so changing the
+// file does not yet exist, and an empty History WITH ErrCorrupt when the file is
+// there but cannot be parsed. capacity overrides the persisted cap so changing the
 // build's retention re-bounds existing data on the next save; each loaded series
 // is trimmed to the new cap immediately.
 func Load(path string, capacity int) (*History, error) {
@@ -743,22 +778,21 @@ func Load(path string, capacity int) (*History, error) {
 	}
 	var snap onDisk
 	if err := json.Unmarshal(data, &snap); err != nil {
-		// A corrupt history file is non-fatal: start fresh rather than refuse to
-		// launch. History is best-effort, not authoritative state.
+		// A corrupt history file is non-fatal: a fresh History comes back so the
+		// app can launch. History is best-effort, not authoritative state.
 		//
-		// But starting fresh over the file DESTROYS it: the next Save rewrites it
-		// without the coverage record, which is the one part of this file that
-		// is never pruned and is meant to answer "when did this feed last work"
-		// months later. A silent fresh start turns months of attendance into a
-		// record that reads as if the install were new. So the damaged file is
-		// moved aside, named for when it was found, and the loss is logged —
-		// the evidence is kept for a human, and the audit can tell "no record
-		// yet" from "a record was here and could not be read".
-		aside := fmt.Sprintf("%s.corrupt-%s", path, time.Now().UTC().Format("20060102-150405"))
-		renameErr := os.Rename(path, aside)
-		slog.Warn("history: file unreadable, starting fresh",
-			"path", path, "err", err, "moved_to", aside, "rename_err", renameErr)
-		return New(capacity), nil
+		// But it is NOT silent, because starting fresh over the file destroys
+		// it: the app's next Save rewrites it without the coverage record, the
+		// one part of this file that is never pruned and is meant to answer
+		// "when did this feed last work" months later. The caller gets
+		// ErrCorrupt beside the fresh History and decides what the file is
+		// worth — the app sets it aside (SetAside) before its first save, a
+		// read-only reader such as alertaudit reports it and leaves it where it
+		// is. Moving the file from HERE was tried and was wrong: the audit
+		// loads this same file and moved the running app's data out from under
+		// it, turning its own "present but unreadable" into "absent" one run
+		// later.
+		return New(capacity), fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	for id, buf := range snap.Series {
 		if len(buf) > h.cap {

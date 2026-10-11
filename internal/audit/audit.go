@@ -334,11 +334,7 @@ type Report struct {
 	// A reader that cannot see which tier a verdict came from will trust a green
 	// report whose entire capture corpus was empty.
 	//
-	// HistoryPresent means the coverage tier can actually ANSWER — NOT that the
-	// file exists, which is HistoryFound's job. Three conditions, all required:
-	// the file was there, it parsed, AND it holds at least one coverage entry.
-	//
-	// The third matters because an install upgraded to this build has a clean,
+	// The third condition matters because an install upgraded to this build has a clean,
 	// parseable history.json with no coverage key at all, and calling that "tier
 	// present" while every verdict resolves to unknown is the contradiction the
 	// tier line exists to prevent.

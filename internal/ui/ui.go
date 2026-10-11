@@ -9,6 +9,7 @@ package ui
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"image/color"
 	"log/slog"
@@ -174,6 +175,10 @@ type Controller struct {
 	// from History.NextRound. A manual retry records under it so the coverage
 	// record counts it as this round's observation, never as a round of its own.
 	round uint64
+	// runCtx is the app's run context, so work started by a user action — a
+	// manual retry — ends when the app does instead of recording into a History
+	// that will never be saved again.
+	runCtx context.Context
 	// lastRoundAnyOK is whether ANY provider read its feed in the previous round.
 	// It is the independent proof of connectivity for machines whose networks
 	// block the probe targets — and it is not circular, because it is a DIFFERENT
@@ -462,7 +467,12 @@ func New() *Controller {
 		histPath = filepath.Join(dir, "history.json")
 	}
 	hist, err := history.Load(histPath, history.DefaultCapacity)
-	if err != nil {
+	if errors.Is(err, history.ErrCorrupt) {
+		// Starting empty over the file would have the next save overwrite the
+		// never-pruned coverage record. Keep the damaged file for a human first.
+		aside, mvErr := history.SetAside(histPath)
+		slog.Warn("history unreadable; starting empty", "err", err, "moved_to", aside, "move_err", mvErr)
+	} else if err != nil {
 		slog.Warn("history restore failed; starting empty", "err", err)
 	}
 	hist.Prune(providerUptimeWindow+time.Hour, time.Now())
@@ -595,6 +605,9 @@ func (c *Controller) Run() {
 	c.lastUIBeat.Store(c.startedAt.UnixNano())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	c.mu.Lock()
+	c.runCtx = ctx
+	c.mu.Unlock()
 	go c.runConnectivity(ctx)
 	go c.runProviders(ctx)
 	go c.runCountdownTicker(ctx)
@@ -1553,6 +1566,21 @@ func (c *Controller) runProviders(ctx context.Context) {
 	}
 }
 
+// noLinkLocked is the connectivity witness a coverage observation is judged
+// against: the probe said the machine had no link — or nobody was there to say
+// — and no provider proved otherwise by reading its feed last round. Caller
+// holds c.mu. One definition for the scheduled poll and the manual retry: the
+// next term added to this rule must land in both, or the two paths judge the
+// same link differently and a blind retry counts as evidence.
+func (c *Controller) noLinkLocked() bool {
+	return (c.connDown || !c.connJudged) && !c.lastRoundAnyOK
+}
+
+// coverageRunGap is how far apart attempts may be before the polling is deemed
+// stopped — the configured cadence, doubled; the record floors it at an hour.
+// Takes c.mu, so call it unlocked.
+func (c *Controller) coverageRunGap() time.Duration { return 2 * c.providerInterval() }
+
 func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	list := c.enabledProviders()
 	interest := c.regionsOfInterest()
@@ -1604,7 +1632,7 @@ func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	// silent about being inert. A successful HTTPS fetch from ANY provider proves
 	// the machine was online, and it is not circular: it is a different provider
 	// succeeding, never the failing one excusing itself.
-	noLinkAtRoundStart := (c.connDown || !c.connJudged) && !c.lastRoundAnyOK
+	noLinkAtRoundStart := c.noLinkLocked()
 	c.mu.Unlock()
 	// Within a process, whether this provider was looked at every round is
 	// answered by the round number, exactly. The run-gap only has to say when
@@ -1613,7 +1641,7 @@ func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	// no round costs. The measured round cost that used to feed this, doubled
 	// and clamped, was a proxy for the round number, and every threshold derived
 	// from it moved when a round got slow.
-	roundGap := 2 * c.providerInterval()
+	roundGap := c.coverageRunGap()
 	var wg sync.WaitGroup
 	for _, p := range list {
 		wg.Add(1)
@@ -1878,9 +1906,24 @@ func (c *Controller) forceRefreshNow() {
 // the Retry affordance on error rows).
 func (c *Controller) recheckProvider(p providers.Provider) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Derived from the app's run context so a quit cancels a retry in
+		// flight: an observation recorded after the shutdown save never reaches
+		// disk, and a refresh after teardown touches a UI that is gone. The 30s
+		// deadline on top is the retry's own patience.
+		c.mu.Lock()
+		base := c.runCtx
+		c.mu.Unlock()
+		if base == nil {
+			base = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(base, 30*time.Second)
 		defer cancel()
 		st := c.checkProviderWithRetry(ctx, p)
+		// Cancelled means the APP ended, not that the feed was slow: a deadline
+		// is a transport failure the record should count.
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return
+		}
 		c.mu.Lock()
 		// carryLastOK, exactly as the scheduled path does. Without it a FAILED
 		// retry drops lastOK to the zero time, and the detail panel uses lastOK
@@ -1899,14 +1942,13 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		// direction, where a lucky click on a flapping feed reset a nine-round
 		// run while ten failed clicks changed nothing.
 		//
-		// cancelled is false: this context's 30s deadline is the retry's own
-		// patience, not a shutdown, and a feed that does not answer in 30s is a
-		// transport failure, not a blind attempt.
+		// cancelled is false here by construction: a cancelled retry returned
+		// above, and a 30s deadline is a transport failure, not a blind attempt.
 		round := c.round
-		noLink := (c.connDown || !c.connJudged) && !c.lastRoundAnyOK
+		noLink := c.noLinkLocked()
 		c.mu.Unlock()
 		c.history.RecordCoverage(p.ID, coverageObservation(
-			st, noLink, false, round, 2*c.providerInterval()))
+			st, noLink, false, round, c.coverageRunGap()))
 		c.refresh()
 	}()
 }
