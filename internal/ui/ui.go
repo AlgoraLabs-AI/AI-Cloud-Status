@@ -486,13 +486,16 @@ func New() *Controller {
 		histPath = filepath.Join(dir, "history.json")
 	}
 	hist, err := history.Load(histPath, history.DefaultCapacity)
-	if errors.Is(err, history.ErrCorrupt) {
-		// Starting empty over the file would have the next save overwrite the
-		// never-pruned coverage record. Keep the damaged file for a human first.
+	if err != nil {
+		// Load returns an error only when the file EXISTS and could not be
+		// loaded — unparseable (ErrCorrupt), or unreadable (a sharing violation
+		// from a scanner holding it, a permission error). Either way starting
+		// empty over it would have the 60s save overwrite the never-pruned
+		// coverage record, so the file is set aside first, whatever the cause;
+		// the aside may itself fail for the same reason, and then the log line
+		// is what remains.
 		aside, mvErr := history.SetAside(histPath)
-		slog.Warn("history unreadable; starting empty", "err", err, "moved_to", aside, "move_err", mvErr)
-	} else if err != nil {
-		slog.Warn("history restore failed; starting empty", "err", err)
+		slog.Warn("history could not be loaded; starting empty", "err", err, "moved_to", aside, "move_err", mvErr)
 	}
 	hist.Prune(providerUptimeWindow+time.Hour, time.Now())
 
@@ -1567,12 +1570,18 @@ func (c *Controller) runProviders(ctx context.Context) {
 	case <-ctx.Done():
 		return
 	}
-	// The round number is minted by the TIMER, not by the poll. "Refresh now"
-	// wakes this loop through providerTrigger and re-polls inside the round in
-	// progress, so the coverage record sees it as the same round and does not
-	// count it twice — that is what makes a failure run count rounds and not
-	// clicks, with no rate limit anywhere.
+	// The round number is minted on the CADENCE: the next round is due one
+	// interval after the last mint, whatever woke the loop. "Refresh now" wakes
+	// it through providerTrigger and re-polls inside the round in progress, so
+	// the coverage record sees the same round and does not count it twice —
+	// that is what makes a failure run count rounds and not clicks. Minting on
+	// the timer OBJECT instead, re-armed after every poll, let a click that
+	// raced the tick run the cadence poll under the old number, and clicks
+	// closer together than one interval stalled minting altogether — a user
+	// hitting Refresh through an outage could keep the run from ever reaching
+	// the sustained threshold.
 	round := c.nextRound()
+	lastMint := time.Now()
 	for {
 		c.pruneExpiredRegionMutes() // expire timed region deactivations + notify "resumed"
 		c.pruneExpiredSilences()    // expire timed per-check silences (silently)
@@ -1587,16 +1596,20 @@ func (c *Controller) runProviders(ctx context.Context) {
 		// c.mu). Reusing the same value also keeps the displayed countdown in sync
 		// with the actual wait if the interval changes between calls.
 		interval := c.providerInterval()
+		due := lastMint.Add(interval)
 		c.mu.Lock()
-		c.nextProviderPoll = time.Now().Add(interval)
+		c.nextProviderPoll = due
 		c.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(interval):
-			round = c.nextRound()
+		case <-time.After(time.Until(due)):
 		case <-c.providerTrigger:
+		}
+		if !time.Now().Before(due) {
+			round = c.nextRound()
+			lastMint = time.Now()
 		}
 	}
 }
@@ -1949,6 +1962,14 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		}
 		ctx, cancel := context.WithTimeout(base, 30*time.Second)
 		defer cancel()
+		// The round and the connectivity witness are snapshotted at the START,
+		// exactly as the scheduled path snapshots them at round start: a link
+		// that drops during the retry is the same event it is for a scheduled
+		// poll, judged against the state the poll was launched under.
+		c.mu.Lock()
+		round := c.round
+		noLink := c.noLinkLocked()
+		c.mu.Unlock()
 		st := c.checkProviderWithRetry(ctx, p)
 		// Cancelled means the APP ended, not that the feed was slow: a deadline
 		// is a transport failure the record should count.
@@ -1975,8 +1996,14 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		//
 		// cancelled is false here by construction: a cancelled retry returned
 		// above, and a 30s deadline is a transport failure, not a blind attempt.
-		round := c.round
-		noLink := c.noLinkLocked()
+		//
+		// A retry that READ its feed is the same proof of a link the scheduled
+		// path takes from any successful poll, and it must count as one: on a
+		// network that blocks the probe targets, a successful retry is what
+		// stops the next round filing every failure as blind.
+		if st.outcome == history.OutcomeReadable {
+			c.lastRoundAnyOK = true
+		}
 		c.mu.Unlock()
 		c.history.RecordCoverage(p.ID, coverageObservation(
 			st, noLink, false, round, c.coverageRunGap()))

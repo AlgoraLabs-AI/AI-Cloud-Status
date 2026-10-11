@@ -598,6 +598,83 @@ func TestLoadReportsACorruptFileAndLeavesItInPlace(t *testing.T) {
 	}
 }
 
+// TestALateRetryFromAnOlderRoundCannotRegressTheRecord: a manual retry started
+// under round N can complete after round N+1's scheduled poll was recorded.
+// Writing N back over LastRound made round N+2 look like it skipped one, and
+// counting the retry again double-counted round N.
+func TestALateRetryFromAnOlderRoundCannotRegressTheRecord(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	for r := range uint64(8) {
+		h.RecordCoverage("p", CoverageObservation{
+			At: t0.Add(time.Duration(r) * time.Minute), FailureClass: OutcomeHTTP, Round: r + 1,
+		})
+	}
+	// Round 8 is on the record (cf 8). A retry launched under round 7 lands now.
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(7*time.Minute + 20*time.Second), FailureClass: OutcomeHTTP, Round: 7,
+	})
+	cov, _ := h.Coverage("p")
+	if cov.LastRound != 8 || cov.ConsecutiveFailures != 8 {
+		t.Fatalf("after a late round-7 retry: lr=%d cf=%d, want lr=8 cf=8 (already counted)", cov.LastRound, cov.ConsecutiveFailures)
+	}
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(8 * time.Minute), FailureClass: OutcomeHTTP, Round: 9,
+	})
+	cov, _ = h.Coverage("p")
+	if cov.ConsecutiveFailures != 9 {
+		t.Errorf("ConsecutiveFailures = %d after round 9, want 9 — the late retry must not make round 9 look like a gap",
+			cov.ConsecutiveFailures)
+	}
+}
+
+// TestLoadDropsFutureDatedAndSeedsTheRoundCounter is the app-side twin of the
+// LoadCoverage test: Load is the path that rewrites the file, so it must drop
+// clock-damaged entries itself and seed the round counter from what survives.
+func TestLoadDropsFutureDatedAndSeedsTheRoundCounter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.json")
+	h := New(10)
+	h.RecordCoverage("skewed", CoverageObservation{At: time.Now().Add(48 * time.Hour), OK: true, Round: 900})
+	h.RecordCoverage("sane", CoverageObservation{At: time.Now().Add(-time.Hour), OK: true, Round: 5})
+	if err := h.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	h2, err := Load(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := h2.Coverage("skewed"); present {
+		t.Error("Load kept a future-dated entry; the app would refuse every later observation for it")
+	}
+	if got := h2.NextRound(); got != 6 {
+		t.Errorf("NextRound() after Load = %d, want 6 — seeded from the surviving entries, not the dropped one", got)
+	}
+}
+
+// TestABackwardClockStepDoesNotFreezeTheRecord: a stamp ahead of now but inside
+// the slack is a clock step, not damage. Left as it was, the high-water-mark
+// guard refused every observation until the clock caught up — silently.
+func TestABackwardClockStepDoesNotFreezeTheRecord(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.json")
+	h := New(10)
+	h.RecordCoverage("p", CoverageObservation{At: time.Now().Add(40 * time.Minute), FailureClass: OutcomeHTTP, Round: 3})
+	if err := h.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	h2, err := Load(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2.RecordCoverage("p", CoverageObservation{At: time.Now().Add(time.Second), FailureClass: OutcomeHTTP, Round: 4})
+	cov, _ := h2.Coverage("p")
+	if cov.ConsecutiveFailures != 2 {
+		t.Errorf("ConsecutiveFailures = %d, want 2 — the observation after a small backward clock step must be accepted",
+			cov.ConsecutiveFailures)
+	}
+}
+
 // TestSkippedPollEndsAFailureRun: a run is attempts that keep failing, and a poll
 // that fetched nothing by design is not a failing attempt. Clearing the class
 // while keeping the count produced a "sustained failure" with no cause.

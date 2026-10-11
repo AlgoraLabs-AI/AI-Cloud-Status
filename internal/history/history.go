@@ -399,9 +399,11 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	// is a different clock, so it can only be judged where the file is read.
 	// LoadCoverage does it.
 	cov.LastAttempt = obs.At
-	if obs.Round != 0 {
-		cov.LastRound = obs.Round
-	}
+	// High-water mark too. A manual retry started under round N can complete
+	// after the scheduled poll of round N+1 has already been recorded; writing
+	// its older number back would make the next scheduled round look like it
+	// skipped one and reset a genuine run.
+	cov.LastRound = max(cov.LastRound, obs.Round)
 	switch {
 	case obs.OK:
 		cov.LastSuccess = obs.At
@@ -425,19 +427,17 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// verdict falls to unknown rather than to healthy.
 		cov.LastFailureClass = ""
 		cov.ConsecutiveFailures = 0
-	case obs.Blind:
-		// Either the machine had no connectivity, or there was nothing to fetch.
-		// Neither is evidence about this feed. Record that we looked; change
-		// nothing else — in particular do NOT clear a real failure class, which is
-		// still the best explanation we have for why this provider was failing
-		// before the link dropped, and do NOT advance the failure run.
-	case obs.FailureClass == "":
-		// Neither a success, a skip, a blind attempt, nor a classified failure:
-		// an observation that names no outcome asserts nothing about the feed.
-		// Left to fall through it would be COUNTED as a failure with an empty
-		// class, which the report prints as "(last: )" — a zero value asserting
-		// a fact, the hazard MissingRecoveryKind's zero was made to avoid. The
-		// attempt stands; nothing else moves.
+	case obs.Blind || obs.FailureClass == "":
+		// An attempt that asserts nothing about the feed: the machine had no
+		// connectivity (Blind), or the observation names no outcome at all. Record
+		// that we looked; change nothing else — in particular do NOT clear a real
+		// failure class, which is still the best explanation we have for why this
+		// provider was failing before the link dropped, and do NOT advance the
+		// failure run. The empty-class half is what keeps a zero-value
+		// observation from falling through and being COUNTED as a failure the
+		// report then prints as "(last: )" — a zero value asserting a fact, the
+		// hazard MissingRecoveryKind's zero was made to avoid. One arm, so a
+		// future non-informative case has one place to be added.
 	default:
 		// A "run" has to be contiguous to mean anything. Without this, nine
 		// failures, a month with the app closed, and one failure on relaunch add
@@ -483,7 +483,10 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// separate events. The latter is deliberately looser: a blind stretch is
 		// an expected state, the app polling through a network outage, and only
 		// becomes disqualifying when the run is no longer one continuous episode.
-		if obs.Round != 0 && obs.Round == cov.LastFailureRound {
+		// "<=", not "==": a retry that completes late carries a round number
+		// BELOW the last counted one, and is still an observation of a round
+		// whose failure is already on the record.
+		if obs.Round != 0 && obs.Round <= cov.LastFailureRound {
 			break
 		}
 		// Strictly GREATER: a failure in the same round as an earlier blind or
@@ -578,14 +581,28 @@ func LoadCoverage(path string) (coverage map[string]CoverageEntry, found bool, d
 // Each drop is logged: a discarded record is evidence LOST, and without a line
 // here the next reader — the app's own save, the audit — reports it as evidence
 // that never existed.
+//
+// An entry stamped ahead of now but INSIDE the slack is not discarded — it is a
+// small clock step, not damage — but it is clamped to now, because the
+// high-water-mark guard in RecordCoverage refuses anything not newer than the
+// stamp: left alone, a 40-minute backward step between two runs would silently
+// refuse every observation for every provider for 40 minutes, with nothing to
+// tell that window from a quiet one.
 func dropFutureDated(m map[string]CoverageEntry) (dropped int) {
-	cutoff := time.Now().Add(CoverageFutureSlack)
+	now := time.Now()
+	cutoff := now.Add(CoverageFutureSlack)
 	for id, cov := range m {
-		if cov.LastAttempt.After(cutoff) {
+		switch {
+		case cov.LastAttempt.After(cutoff):
 			slog.Warn("history: coverage entry stamped in the future, discarded as clock damage",
 				"id", id, "last_attempt", cov.LastAttempt, "cutoff", cutoff)
 			delete(m, id)
 			dropped++
+		case cov.LastAttempt.After(now):
+			slog.Warn("history: coverage entry stamped slightly ahead of now, clamped so the record can move",
+				"id", id, "last_attempt", cov.LastAttempt, "now", now)
+			cov.LastAttempt = now
+			m[id] = cov
 		}
 	}
 	return dropped

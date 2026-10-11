@@ -250,10 +250,9 @@ func printReport(w io.Writer, r audit.Report) {
 		}
 	}
 	// One sentence per tier, each built from its OWN measurement and joined here.
-	// The previous shape was a five-branch switch that restated both facts in
-	// every arm, so a fix applied to one arm left the others asserting a tier
-	// they had never examined — twice, in two successive changes. Composing the
-	// halves makes that shape impossible rather than merely fixed.
+	// A single switch over both tiers restates both facts in every arm, so a fix
+	// applied to one arm leaves the others asserting a tier they never examined.
+	// Composing the halves makes that shape impossible rather than merely fixed.
 	fmt.Fprintf(w, "Evidence tiers: %s. %s\n",
 		captureTierPhrase(captureTier, r.DiagnosticsEnabled), coverageTierPhrase(r))
 	fmt.Fprintln(w, "Severity is re-derived from each raw capture with the CURRENTLY registered parser — a mismatch here reflects "+

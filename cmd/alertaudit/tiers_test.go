@@ -46,8 +46,8 @@ func TestHasIssuesCoverageTier(t *testing.T) {
 	}
 }
 
-// TestHasIssuesDoesNotMixTiers is the regression guard for the failure mode the
-// architecture review named: on a DEFAULT install diagnostics are off, so
+// TestHasIssuesDoesNotMixTiers guards the failure mode the two tiers exist to
+// keep apart: on a DEFAULT install diagnostics are off, so
 // alert-log.jsonl and feed-samples/ are absent and every capture-tier verdict is
 // vacuous. If the coverage tier were folded into the capture tier, an empty
 // capture corpus would read as "all clear" next to a feed that had not been
