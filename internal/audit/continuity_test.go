@@ -245,3 +245,20 @@ func TestContinuityConnectivityIsNeverAssertedFromSamples(t *testing.T) {
 		t.Errorf("Unclosed = %d, want 0 — connectivity is journal-only evidence", n)
 	}
 }
+
+// TestContinuitySurvivesAnUnreadableHistory: a history.json that could not be
+// READ (not merely parsed) must degrade this section the way a corrupt one
+// does, not drop it. Returning the error skipped the whole section in
+// alertaudit, and with it an unclosed connectivity window from the exit code,
+// while the provider section reported the same file as a loss and went on.
+func TestContinuitySurvivesAnUnreadableHistory(t *testing.T) {
+	dir := stage(t, nil, nil)
+	unreadable := HistoryFile{Hist: history.New(history.DefaultCapacity), Found: true, Err: os.ErrPermission}
+	rep, err := RunContinuity(dir, unreadable)
+	if err != nil {
+		t.Fatalf("RunContinuity returned %v for an unreadable history; want the section to run and name the loss", err)
+	}
+	if rep.HistoryErr == "" {
+		t.Error("HistoryErr is empty: the loss must be named on the report")
+	}
+}

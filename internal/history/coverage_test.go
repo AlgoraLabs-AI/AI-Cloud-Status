@@ -377,8 +377,8 @@ func TestLoadFileCountsDroppedFutureDatedEntries(t *testing.T) {
 	if _, present := h2.Coverage("skewed"); present {
 		t.Error("a future-dated entry survived the load; it would refuse every later observation forever")
 	}
-	if dropped != 1 {
-		t.Errorf("dropped = %d, want 1 — the loss must be countable, or the audit reports it as a gap", dropped)
+	if len(dropped) != 1 || dropped[0] != "skewed" {
+		t.Errorf("dropped = %v, want [skewed] — the loss must be NAMED, or the audit reports it as a gap on an unknown row", dropped)
 	}
 	if _, present := h2.Coverage("sane"); !present {
 		t.Error("the guard took a sane entry with it")
@@ -485,7 +485,9 @@ func TestABlindRoundThenARealFailureInItCountsOnce(t *testing.T) {
 	h.RecordCoverage("p", CoverageObservation{
 		At: t0.Add(10 * time.Second), FailureClass: OutcomeHTTP, Round: 1,
 	})
-	// A second refresh in the same round changes nothing more.
+	// A second refresh in the same round adds nothing to the COUNT. What it
+	// learned — a different failure, later — is still recorded: the class and
+	// the informative stamp follow the latest failure, not the counted one.
 	h.RecordCoverage("p", CoverageObservation{
 		At: t0.Add(20 * time.Second), FailureClass: OutcomeTransport, Round: 1,
 	})
@@ -494,11 +496,11 @@ func TestABlindRoundThenARealFailureInItCountsOnce(t *testing.T) {
 	if cov.ConsecutiveFailures != 1 {
 		t.Errorf("ConsecutiveFailures = %d, want 1 — one round, one failure, however many polls", cov.ConsecutiveFailures)
 	}
-	if !cov.LastInformative.Equal(t0.Add(10 * time.Second)) {
-		t.Errorf("LastInformative = %v, want the counted failure at +10s", cov.LastInformative)
+	if !cov.LastInformative.Equal(t0.Add(20 * time.Second)) {
+		t.Errorf("LastInformative = %v, want the latest failure at +20s", cov.LastInformative)
 	}
-	if cov.LastFailureClass != OutcomeHTTP {
-		t.Errorf("LastFailureClass = %q, want the counted failure's %q", cov.LastFailureClass, OutcomeHTTP)
+	if cov.LastFailureClass != OutcomeTransport {
+		t.Errorf("LastFailureClass = %q, want the latest failure's %q", cov.LastFailureClass, OutcomeTransport)
 	}
 }
 
@@ -846,5 +848,27 @@ func TestAClampedEntryHasNoStampInTheFuture(t *testing.T) {
 		if at.After(now) {
 			t.Errorf("%s = %v is still in the future after the clamp (now %v)", name, at, now)
 		}
+	}
+}
+
+// TestASameRoundFailureOfAnotherClassUpdatesTheClass: the once-per-round rule
+// deduplicates the COUNT, not what was learned. A retry that fails for a new
+// reason must leave that reason on the record, or the report names a failure the
+// feed no longer has.
+func TestASameRoundFailureOfAnotherClassUpdatesTheClass(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeTransport, Round: 3})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(5 * time.Second), FailureClass: OutcomeHTTP, Round: 3})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1 — the second failure is the same round", cov.ConsecutiveFailures)
+	}
+	if cov.LastFailureClass != OutcomeHTTP {
+		t.Errorf("LastFailureClass = %q, want %q — the newer failure is what the feed has now", cov.LastFailureClass, OutcomeHTTP)
+	}
+	if !cov.LastInformative.Equal(t0.Add(5 * time.Second)) {
+		t.Error("LastInformative must advance to the retry: something was learned at that instant")
 	}
 }

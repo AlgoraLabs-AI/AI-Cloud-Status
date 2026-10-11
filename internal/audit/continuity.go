@@ -1,7 +1,6 @@
 package audit
 
 import (
-	"errors"
 	"path/filepath"
 	"sort"
 	"time"
@@ -121,17 +120,20 @@ func RunContinuity(dir string, hist HistoryFile) (ContinuityReport, error) {
 	if err != nil {
 		return rep, err
 	}
-	if hist.Err != nil && !errors.Is(hist.Err, history.ErrCorrupt) {
-		return rep, hist.Err
-	}
 	if hist.Err != nil {
-		// Unreadable is not fatal here: the load hands back an empty History and
-		// the section degrades to "no evidence" where it needed samples, which
-		// is what it always did for a file that was never written. The
-		// difference is named on the report, and the file is left exactly where
-		// it is — this is a read-only diagnostic of the running app's data.
+		// Unreadable is not fatal here, whatever the cause — corrupt or a read
+		// error: the load hands back an empty History and the section degrades
+		// to "no evidence" where it needed samples, which is what it always did
+		// for a file that was never written. The connectivity windows come from
+		// the journal alone and are still judged. Returning the error instead
+		// dropped the whole section, and with it an unclosed window from the
+		// exit code — the provider section reports the same file as a LOSS and
+		// goes on. The difference is named on the report, and the file is left
+		// exactly where it is: this is a read-only diagnostic of the running
+		// app's data.
 		rep.HistoryErr = hist.Err.Error()
 	}
+	samples := hist.hist()
 
 	// Only checks that still exist: a deleted URL leaves an orphan series and an
 	// unclosable window, and accusing the app over a check the user removed is
@@ -174,7 +176,7 @@ func RunContinuity(dir string, hist HistoryFile) (ContinuityReport, error) {
 	sort.Strings(rep.Checked)
 
 	for _, id := range rep.Checked {
-		series := hist.Hist.Series(id)
+		series := samples.Series(id)
 		if len(series) > 0 {
 			if rep.HistoryHorizon.IsZero() || series[0].Time.Before(rep.HistoryHorizon) {
 				rep.HistoryHorizon = series[0].Time

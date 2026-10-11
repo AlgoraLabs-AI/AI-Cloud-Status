@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
@@ -181,6 +182,10 @@ type ProviderReport struct {
 	// always written. Keep the two apart when reporting — see Report.
 	Coverage    history.CoverageEntry
 	HasCoverage bool
+	// CoverageDropped says this provider HAD a coverage entry and the reader
+	// discarded it as clock damage: HasCoverage is false for a LOSS, not a gap,
+	// and the row must say so rather than "never polled".
+	CoverageDropped bool
 }
 
 // FeedVerdict is the three-way answer NeverCaptured could never give.
@@ -331,10 +336,21 @@ func (r ProviderReport) AllCapturesUnparseable() bool {
 // Hist is never nil; it is empty when the file is absent or unreadable, and
 // Found and Err say which (see history.LoadFile for the three states).
 type HistoryFile struct {
-	Hist    *history.History
-	Found   bool
-	Dropped int
+	Hist  *history.History
+	Found bool
+	// Dropped names the checks whose coverage entry was discarded as clock
+	// damage, so the report can mark THEIR rows as a loss.
+	Dropped []string
 	Err     error
+}
+
+// hist returns the History to read, never nil: a zero HistoryFile reads as an
+// absent file rather than dereferencing nothing.
+func (f HistoryFile) hist() *history.History {
+	if f.Hist == nil {
+		return history.New(history.DefaultCapacity)
+	}
+	return f.Hist
 }
 
 // LoadHistory reads dir's history.json for the audit. Nothing here is fatal —
@@ -511,10 +527,10 @@ func Run(dir string, hist HistoryFile) (Report, error) {
 	report := Report{
 		GeneratedAt:        time.Now(),
 		AlertLogStart:      alertStart,
-		HistoryPresent:     hist.Found && hist.Err == nil && hist.Hist.CoverageCount() > 0,
+		HistoryPresent:     hist.Found && hist.Err == nil && hist.hist().CoverageCount() > 0,
 		HistoryFound:       hist.Found,
 		HistoryErr:         histErr,
-		CoverageDropped:    hist.Dropped,
+		CoverageDropped:    len(hist.Dropped),
 		DiagnosticsEnabled: cfg.DebugLogging,
 	}
 	for _, p := range providers.Default() {
@@ -534,7 +550,8 @@ func Run(dir string, hist HistoryFile) (Report, error) {
 			LastAlertTime:     lastAlertByID[p.ID],
 			MissingRecoveries: missing,
 		}
-		pr.Coverage, pr.HasCoverage = hist.Hist.Coverage(p.ID)
+		pr.Coverage, pr.HasCoverage = hist.hist().Coverage(p.ID)
+		pr.CoverageDropped = slices.Contains(hist.Dropped, p.ID)
 		for _, c := range captures {
 			if c.Time.After(pr.LastCaptureTime) {
 				pr.LastCaptureTime = c.Time

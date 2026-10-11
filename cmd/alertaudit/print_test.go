@@ -272,3 +272,23 @@ func TestPrintReportEvidenceTierStates(t *testing.T) {
 		})
 	}
 }
+
+// TestPrintReportNamesTheRowWhoseCoverageWasDropped: the tier line says the
+// dropped entries resolve to unknown for a LOSS; the row must be the one place
+// that says WHICH provider, not the generic "never polled" note.
+func TestPrintReportNamesTheRowWhoseCoverageWasDropped(t *testing.T) {
+	r := audit.Report{
+		GeneratedAt: time.Now(), HistoryPresent: true, HistoryFound: true, CoverageDropped: 1,
+		Providers: []audit.ProviderReport{
+			{ID: "x", Enabled: true, HasPublicFeed: true, CoverageDropped: true},
+		},
+	}
+	var buf bytes.Buffer
+	printReport(&buf, r)
+	if !strings.Contains(buf.String(), "discarded as clock damage: a LOSS") {
+		t.Errorf("the dropped provider's row does not name the loss:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "never polled") {
+		t.Error("the dropped provider's row reports the loss as a gap")
+	}
+}

@@ -115,6 +115,17 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // blip is tolerated without a tight retry loop.
 const providerRetryAttempts = 3
 
+// historyLoadRetryAfter is the pause before the one retry of a history.json read
+// that failed for a reason other than corruption (see New).
+const historyLoadRetryAfter = time.Second
+
+// retryDeadline bounds a manual Retry. It covers what the scheduled path may
+// spend — providerRetryAttempts attempts at the client's own 15s timeout, plus
+// backoff — so a slow feed that reads fine on schedule cannot accrue failures
+// only through clicks; a retry cut short by this deadline is then a feed slower
+// than any scheduled poll tolerates, a transport failure the record counts.
+const retryDeadline = 50 * time.Second
+
 // firstProbeWait bounds how long the first provider round waits for the
 // connectivity probe's first answer. The probe runs 3s-timeout checks against a
 // handful of targets, so it is normally done within a few seconds of the startup
@@ -486,14 +497,22 @@ func New() *Controller {
 		histPath = filepath.Join(dir, "history.json")
 	}
 	hist, err := history.Load(histPath, history.DefaultCapacity)
+	if err != nil && !errors.Is(err, history.ErrCorrupt) {
+		// A read error is not proof the bytes are unusable: a scanner or a
+		// backup tool holding the file for a moment fails the read and is gone
+		// a second later. One retry before the aside, so a one-second hold does
+		// not move months of coverage record out of the app's way.
+		time.Sleep(historyLoadRetryAfter)
+		hist, err = history.Load(histPath, history.DefaultCapacity)
+	}
 	if err != nil {
 		// Load returns an error only when the file EXISTS and could not be
-		// loaded — unparseable (ErrCorrupt), or unreadable (a sharing violation
-		// from a scanner holding it, a permission error). Either way starting
-		// empty over it would have the 60s save overwrite the never-pruned
-		// coverage record, so the file is set aside first, whatever the cause;
-		// the aside may itself fail for the same reason, and then the log line
-		// is what remains.
+		// loaded — unparseable (ErrCorrupt), or still unreadable after the
+		// retry (a permission error, a lock that outlasts it). Either way
+		// starting empty over it would have the 60s save overwrite the
+		// never-pruned coverage record, so the file is set aside first, whatever
+		// the cause; the aside may itself fail for the same reason, and then the
+		// log line is what remains.
 		aside, mvErr := history.SetAside(histPath)
 		slog.Warn("history could not be loaded; starting empty", "err", err, "moved_to", aside, "move_err", mvErr)
 	}
@@ -1580,6 +1599,11 @@ func (c *Controller) runProviders(ctx context.Context) {
 	case <-c.providerTrigger:
 	default:
 	}
+	// The probe may have answered well inside the bound: the countdown reads
+	// "now" from here, not a wait that is over.
+	c.mu.Lock()
+	c.nextProviderPoll = time.Now()
+	c.mu.Unlock()
 	// The round number is minted on the CADENCE: the next round is due one
 	// interval after the last mint, whatever woke the loop. "Refresh now" wakes
 	// it through providerTrigger and re-polls inside the round in progress, so
@@ -2009,7 +2033,7 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		if base == nil {
 			base = context.Background()
 		}
-		ctx, cancel := context.WithTimeout(base, 30*time.Second)
+		ctx, cancel := context.WithTimeout(base, retryDeadline)
 		defer cancel()
 		// The round and the connectivity witness are snapshotted at the START,
 		// exactly as the scheduled path snapshots them at round start: a link
@@ -2020,11 +2044,6 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		noLink := c.noLinkLocked()
 		c.mu.Unlock()
 		st := c.checkProviderWithRetry(ctx, p)
-		// Cancelled means the APP ended, not that the feed was slow: a deadline
-		// is a transport failure the record should count.
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return
-		}
 		// A manual retry is filed exactly as a scheduled poll is — the same
 		// sample, coverage, journal and outage bookkeeping, through the same
 		// function — under the round in progress and against the same
@@ -2038,10 +2057,16 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		// direction, where a lucky click on a flapping feed reset a nine-round
 		// run while ten failed clicks changed nothing.
 		//
-		// cancelled is false here by construction: a cancelled retry returned
-		// above, and a 30s deadline is a transport failure, not a blind attempt.
-		c.recordPoll(p, st, c.regionsOfInterest(), noLink, false, round, c.staleAfter())
-		c.refresh()
+		// Cancelled means the APP ended, not that the feed was slow: it is
+		// filed as a blind attempt exactly as a scheduled poll cut by shutdown
+		// is — one rule for one event — while the deadline (retryDeadline) is a
+		// transport failure the record counts. What a cancelled retry skips is
+		// the refresh: the UI it would touch is being torn down.
+		cancelled := errors.Is(ctx.Err(), context.Canceled)
+		c.recordPoll(p, st, c.regionsOfInterest(), noLink, cancelled, round, c.staleAfter())
+		if !cancelled {
+			c.refresh()
+		}
 	}()
 }
 

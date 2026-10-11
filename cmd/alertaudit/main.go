@@ -290,17 +290,15 @@ func printReport(w io.Writer, r audit.Report) {
 			verdict := p.FeedVerdict(r.GeneratedAt)
 			switch {
 			case p.FeedFault(r.GeneratedAt):
-				// FeedFault is FeedBroken plus enabled with a public feed, so it
-				// goes first and the next arm is the remainder.
+				// Inside NeverCaptured the provider is enabled with a public feed,
+				// so FeedBroken here IS FeedFault; there is no broken-but-not-fault
+				// remainder to print.
 				note = fmt.Sprintf("  <- FEED NOT READABLE: %d consecutive failures (last: %s) — see the section below",
 					p.Coverage.ConsecutiveFailures, p.Coverage.LastFailureClass)
-			case verdict == audit.FeedBroken:
-				// Broken on the record, but the section below and the exit code
-				// are keyed on FeedFault, which also needs the provider enabled
-				// with a public feed. Pointing at a section that will not list it
-				// is a dangling reference; say what is true instead.
-				note = fmt.Sprintf("  <- feed was not readable when last polled: %d consecutive failures (last: %s); disabled or no public feed, so not failing the run",
-					p.Coverage.ConsecutiveFailures, p.Coverage.LastFailureClass)
+			case p.CoverageDropped:
+				// The tier line above says the dropped entries resolve to unknown
+				// for a LOSS; this is the row it means.
+				note = "  <- no captures, and the coverage entry was discarded as clock damage: a LOSS, not a gap"
 			case verdict == audit.FeedHealthy:
 				// States what the record actually holds, and nothing more. The
 				// coverage entry is a high-water mark with no history — a success

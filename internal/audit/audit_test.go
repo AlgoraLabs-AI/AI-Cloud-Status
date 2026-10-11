@@ -611,3 +611,16 @@ func TestBoundOpenIntervals_LeavesGenuinelyOngoingOpen(t *testing.T) {
 		t.Errorf("End = %v, want zero (still genuinely open)", out[0].End)
 	}
 }
+
+// TestRun_ZeroHistoryFileDoesNotPanic: the doc says Hist is never nil, and the
+// code must make that true rather than trust it — a zero HistoryFile reads as
+// an absent file.
+func TestRun_ZeroHistoryFileDoesNotPanic(t *testing.T) {
+	report, err := Run(t.TempDir(), HistoryFile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.HistoryFound || report.HistoryPresent {
+		t.Errorf("zero HistoryFile reported found=%v present=%v, want neither", report.HistoryFound, report.HistoryPresent)
+	}
+}

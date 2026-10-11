@@ -491,6 +491,12 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// BELOW the last counted one, and is still an observation of a round
 		// whose failure is already on the record.
 		if obs.Round != 0 && obs.Round <= cov.LastFailureRound {
+			// Only the COUNT is deduplicated. The class and the informative
+			// stamp still advance: a retry that fails for a different reason
+			// than the round's first poll has learned something, and the report
+			// must name the failure the feed has now, not the one it had.
+			cov.LastInformative = obs.At
+			cov.LastFailureClass = obs.FailureClass
 			break
 		}
 		// Strictly GREATER: a failure in the same round as an earlier blind or
@@ -541,7 +547,7 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 // stamp: left alone, a 40-minute backward step between two runs would silently
 // refuse every observation for every provider for 40 minutes, with nothing to
 // tell that window from a quiet one.
-func dropFutureDated(m map[string]CoverageEntry) (dropped int) {
+func dropFutureDated(m map[string]CoverageEntry) (dropped []string) {
 	now := time.Now()
 	cutoff := now.Add(CoverageFutureSlack)
 	for id, cov := range m {
@@ -550,7 +556,7 @@ func dropFutureDated(m map[string]CoverageEntry) (dropped int) {
 			slog.Warn("history: coverage entry stamped in the future, discarded as clock damage",
 				"id", id, "last_attempt", cov.LastAttempt, "cutoff", cutoff)
 			delete(m, id)
-			dropped++
+			dropped = append(dropped, id)
 		case cov.LastAttempt.After(now):
 			slog.Warn("history: coverage entry stamped slightly ahead of now, clamped so the record can move",
 				"id", id, "last_attempt", cov.LastAttempt, "now", now)
@@ -775,19 +781,20 @@ func Load(path string, capacity int) (*History, error) {
 //   - found=true,  err!=nil  it exists and could not be read or parsed
 //   - found=true,  err=nil   it was read; the History may still be empty
 //
-// dropped counts the coverage entries discarded as clock damage (see
-// dropFutureDated). It is returned, not just logged, because a reader that sees
-// no coverage cannot otherwise tell "nothing was ever recorded" from
+// dropped names the checks whose coverage entry was discarded as clock damage
+// (see dropFutureDated). It is returned, not just logged, because a reader that
+// sees no coverage cannot otherwise tell "nothing was ever recorded" from
 // "everything recorded was discarded" — a gap from a loss, which the audit's
-// tier line exists to keep apart.
-func LoadFile(path string, capacity int) (h *History, found bool, dropped int, err error) {
+// tier line exists to keep apart — and it names them, because a count alone
+// leaves the report unable to say WHICH row is the loss.
+func LoadFile(path string, capacity int) (h *History, found bool, dropped []string, err error) {
 	h = New(capacity)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return h, false, 0, nil
+			return h, false, nil, nil
 		}
-		return h, true, 0, err
+		return h, true, nil, err
 	}
 	var snap onDisk
 	if err := json.Unmarshal(data, &snap); err != nil {
@@ -805,7 +812,7 @@ func LoadFile(path string, capacity int) (h *History, found bool, dropped int, e
 		// loads this same file and moved the running app's data out from under
 		// it, turning its own "present but unreadable" into "absent" one run
 		// later.
-		return h, true, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
+		return h, true, nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	for id, buf := range snap.Series {
 		if len(buf) > h.cap {
