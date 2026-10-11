@@ -919,3 +919,29 @@ func TestAStaleRetryCannotUndoARecovery(t *testing.T) {
 		t.Error("LastInformative must stay at the success: the stale retry is not newer information")
 	}
 }
+
+// TestAStaleRetrySuccessCannotClearARun is the mirror of the stale failure: a
+// retry launched under round N that completes OK after round N+1's scheduled
+// poll FAILED is older information. Letting it through the OK arm cleared a run
+// the newest scheduled read had just extended, and the audit flipped a broken
+// feed to healthy on it.
+func TestAStaleRetrySuccessCannotClearARun(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	for r := range uint64(9) {
+		h.RecordCoverage("p", CoverageObservation{At: t0.Add(time.Duration(r) * time.Minute), FailureClass: OutcomeHTTP, Round: r + 1})
+	}
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(9 * time.Minute), FailureClass: OutcomeHTTP, Round: 10})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(9*time.Minute + 20*time.Second), OK: true, Round: 9})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 10 || cov.LastFailureClass != OutcomeHTTP || cov.LastFailureRound != 10 {
+		t.Errorf("after a stale round-9 success: cf=%d class=%q lfr=%d, want 10, %q, 10", cov.ConsecutiveFailures, cov.LastFailureClass, cov.LastFailureRound, OutcomeHTTP)
+	}
+	if !cov.LastSuccess.IsZero() {
+		t.Error("LastSuccess was set by a stale retry: the newest scheduled read failed")
+	}
+	if !cov.LastAttempt.Equal(t0.Add(9*time.Minute + 20*time.Second)) {
+		t.Error("the stale retry was still an attempt and LastAttempt must say so")
+	}
+}

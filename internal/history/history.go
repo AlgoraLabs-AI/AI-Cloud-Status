@@ -404,6 +404,17 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	// its older number back would make the next scheduled round look like it
 	// skipped one and reset a genuine run.
 	cov.LastRound = max(cov.LastRound, obs.Round)
+	// A poll from a round OLDER than the latest on the record is a stale retry:
+	// a manual poll launched under round N that completed after round N+1 was
+	// recorded. It is an attempt (above) and nothing more, WHATEVER it found —
+	// a failure that counted flipped a just-recovered record back to failing
+	// and renamed the failure the newest scheduled read had seen; a success
+	// that counted cleared a run the newest scheduled read had just extended.
+	// One rule for every outcome, ahead of the switch, so no arm can forget it.
+	if obs.Round != 0 && prevRound != 0 && obs.Round < prevRound {
+		h.coverage[id] = cov
+		return
+	}
 	switch {
 	case obs.OK:
 		cov.LastSuccess = obs.At
@@ -487,21 +498,12 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// separate events. The latter is deliberately looser: a blind stretch is
 		// an expected state, the app polling through a network outage, and only
 		// becomes disqualifying when the run is no longer one continuous episode.
-		// A failure from a round OLDER than the latest on the record is a stale
-		// retry: a manual poll launched under round N that completed after round
-		// N+1 was recorded — possibly after a SUCCESS in N+1. It is an attempt
-		// (LastAttempt moved above) and nothing more. Counting it flipped a
-		// just-recovered record back to failing, and naming its class reported a
-		// failure the newest scheduled read did not see.
-		if obs.Round != 0 && prevRound != 0 && obs.Round < prevRound {
-			break
-		}
 		// The same round as the failure already counted: only the COUNT is
 		// deduplicated. The class and the informative stamp still advance — a
 		// retry that fails for a different reason than the round's first poll
 		// has learned something, and the report must name the failure the feed
-		// has now, not the one it had. (A round below the counted one was
-		// handled above; it cannot be newer information.)
+		// has now, not the one it had. (A round below the latest was returned
+		// ahead of the switch; it cannot be newer information.)
 		if obs.Round != 0 && obs.Round == cov.LastFailureRound {
 			cov.LastInformative = obs.At
 			cov.LastFailureClass = obs.FailureClass

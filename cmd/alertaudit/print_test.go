@@ -278,17 +278,19 @@ func TestPrintReportEvidenceTierStates(t *testing.T) {
 // that says WHICH provider, not the generic "never polled" note.
 func TestPrintReportNamesTheRowWhoseCoverageWasDropped(t *testing.T) {
 	r := audit.Report{
-		GeneratedAt: time.Now(), HistoryPresent: true, HistoryFound: true, CoverageDropped: 1,
+		GeneratedAt: time.Now(), HistoryPresent: true, HistoryFound: true, CoverageDropped: 2,
 		Providers: []audit.ProviderReport{
 			{ID: "x", Enabled: true, HasPublicFeed: true, CoverageDropped: true},
+			// The loss is in the coverage tier; a row WITH captures must say it too.
+			{ID: "y", Enabled: true, HasPublicFeed: true, TotalCaptures: 40, CoverageDropped: true},
 		},
 	}
 	var buf bytes.Buffer
 	printReport(&buf, r)
-	if !strings.Contains(buf.String(), "discarded as clock damage: a LOSS") {
-		t.Errorf("the dropped provider's row does not name the loss:\n%s", buf.String())
+	if n := strings.Count(buf.String(), "discarded as clock damage: a LOSS"); n != 2 {
+		t.Errorf("rows naming the loss = %d, want 2 (with and without captures):\n%s", n, buf.String())
 	}
 	if strings.Contains(buf.String(), "never polled") {
-		t.Error("the dropped provider's row reports the loss as a gap")
+		t.Error("a dropped provider's row reports the loss as a gap")
 	}
 }

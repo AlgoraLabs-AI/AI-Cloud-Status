@@ -122,7 +122,7 @@ A normal install writes these five things there, all of them your own state:
 | `open-outages.json` | Outages still open at shutdown, so their recovery alert is not swallowed |
 | `instance.lock` | The single-instance guard |
 
-One more can appear: if `history.json` cannot be read at launch (it was corrupt, or another program held it open), the app moves it to `history.json.corrupt` and starts a fresh one rather than overwrite it. That file is only kept for you to look at; it is safe to delete. If it cannot even be moved, the app leaves it untouched and does not save history for that run, so the next launch reads it whole.
+One more can appear: if `history.json` is corrupt at launch, the app moves it to `history.json.corrupt` and starts a fresh one rather than overwrite it. That file is only kept for you to look at; it is safe to delete. If the file is intact but cannot be read at that moment (another program held it open), the app leaves it untouched and does not save history for that run, so the next launch reads it whole.
 
 **Nothing is sent anywhere.** The app talks to the services it monitors and to
 GitHub's release API (for the update check) and to nobody else. There is no

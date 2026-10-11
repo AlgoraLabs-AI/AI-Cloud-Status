@@ -404,11 +404,16 @@ func feedOutcome(k providers.FeedFailure) string {
 // against a single snapshot; reading them per provider lets a link dropping
 // mid-round give some a real failure and others a blind one.
 func coverageObservation(st provState, noLink, cancelled bool, round uint64, runGap time.Duration) history.CoverageObservation {
-	blind := st.err != nil && (noLink || cancelled)
+	// A skip is a LIVE 403/404 answer (providers.Check returns ErrNoFeed on
+	// those for an Optional provider) and reaches here with no error, so it
+	// must be judged against the witness like a failure is: a captive portal
+	// answers 403 to everything, and filing that as skipped-by-design ended an
+	// Optional provider's failure run every round through the portal.
+	blind := (st.err != nil || st.skipped) && (noLink || cancelled)
 	return history.CoverageObservation{
 		At:      st.when,
 		OK:      st.outcome == history.OutcomeReadable,
-		Skipped: st.skipped,
+		Skipped: st.skipped && !blind,
 		Round:   round,
 		RunGap:  runGap,
 		// A poll that never got an answer from the feed — because the machine had
@@ -512,23 +517,29 @@ func New() *Controller {
 		time.Sleep(historyLoadRetryAfter)
 		hist, err = history.Load(histPath, history.DefaultCapacity)
 	}
-	if err != nil {
-		// Load returns an error only when the file EXISTS and could not be
-		// loaded — unparseable (ErrCorrupt), or still unreadable after the
-		// retry (a permission error, a lock that outlasts it). Either way
-		// starting empty over it would have the 60s save overwrite the
-		// never-pruned coverage record, so the file is set aside first, whatever
-		// the cause; the aside may itself fail for the same reason, and then the
-		// log line is what remains.
+	switch {
+	case errors.Is(err, history.ErrCorrupt):
+		// The bytes are unusable — the one case that PROVES the file is not
+		// worth keeping in place. Starting empty over it would have the 60s
+		// save overwrite the never-pruned coverage record, so it is set aside
+		// first; the aside may itself fail, and then the log line is what
+		// remains.
 		aside, mvErr := history.SetAside(histPath)
-		slog.Warn("history could not be loaded; starting empty", "err", err, "moved_to", aside, "move_err", mvErr)
+		slog.Warn("history is corrupt; starting empty", "err", err, "moved_to", aside, "move_err", mvErr)
 		if mvErr != nil {
-			// The aside failed for the reason the read did: the file is still
-			// held, or not ours to touch. The record on disk is then the one
-			// thing this run must not write over — with no path there is no
-			// save, and the next launch reads the file whole.
 			histPath = ""
 		}
+	case err != nil:
+		// Still unreadable after the retry — a permission state, a lock that
+		// outlasts a second. That proves nothing about the bytes: moving a
+		// valid record aside over a transient state, as this once did, lost
+		// months of coverage to a sync tool's mode flip. The file stays where
+		// it is, and this run does not save over it — with no path there is no
+		// save, and the next launch reads the file whole. The cost is this
+		// run's own record, which is lost (TASK-9: recover persistence once
+		// the hold ends).
+		slog.Warn("history could not be read; running without persistence", "err", err)
+		histPath = ""
 	}
 	hist.Prune(providerUptimeWindow+time.Hour, time.Now())
 
@@ -1748,10 +1759,13 @@ func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	//
 	// What this does NOT do, stated so nobody reads more into it. The witness is
 	// necessarily behind a drop that happens DURING the round: providers polled
-	// before the probe notices record a real failure, and that costs one failure
-	// per episode and no more — later rounds see the probe's answer and go blind,
-	// and any successful poll resets the counter to zero — which is well inside
-	// the sustained run a verdict needs. The first round of a process used to be
+	// before the probe notices record a real failure, and that costs up to TWO
+	// failures per episode and no more: the round of the drop, and the next
+	// one when a provider polled before the drop read its feed, because that
+	// read is the proof of a link (lastRoundAnyOK) the next round is judged
+	// against. From there the rounds go blind until a poll succeeds, which
+	// resets the counter to zero — well inside the sustained run a verdict
+	// needs. The first round of a process used to be
 	// the mirror image — snapshotted before the probe had answered, so filed
 	// blind against every provider — and runProviders now waits for the probe's
 	// first answer before that round (see probeJudged). The witness for "this

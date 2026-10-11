@@ -86,6 +86,15 @@ func TestCoverageObservation(t *testing.T) {
 			want: history.CoverageObservation{At: at, Skipped: true},
 		},
 		{
+			// A skip is a live 403/404; through a captive portal that answers 403
+			// to everything it says nothing about the feed and must not end an
+			// Optional provider's failure run.
+			name:   "a skip while the probe says no link is blind, not skipped",
+			st:     provState{when: at, outcome: history.OutcomeSkipped, skipped: true},
+			noLink: true,
+			want:   history.CoverageObservation{At: at, Blind: true},
+		},
+		{
 			// A dead link must not turn a SUCCESS into a blind attempt.
 			name:   "a successful read while the probe says no link is still a success",
 			st:     provState{when: at, outcome: history.OutcomeReadable},
