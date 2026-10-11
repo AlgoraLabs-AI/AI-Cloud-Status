@@ -79,3 +79,21 @@ func TestARetryIsFiledLikeAScheduledPoll(t *testing.T) {
 		t.Error("a retry that read its feed is proof of a link and must say so")
 	}
 }
+
+// TestEveryQuitRunsTheShutdownSave pins the main menu's Quit as OUR quit item.
+// Without one, Fyne appends its own — App → Quit and Cmd+Q on macOS — bound
+// straight to the driver, and the shutdown save and the poll drain never run:
+// measured on darwin, a round completed eight seconds before that Quit was
+// never written.
+func TestEveryQuitRunsTheShutdownSave(t *testing.T) {
+	c := &Controller{}
+	menu := c.buildMainMenu()
+	if len(menu.Items) == 0 || len(menu.Items[0].Items) == 0 {
+		t.Fatal("main menu is empty")
+	}
+	last := menu.Items[0].Items[len(menu.Items[0].Items)-1]
+	if !last.IsQuit || last.Action == nil {
+		t.Errorf("the first menu's last item is %q (IsQuit %v, action set %v); want our own Quit, flagged, with c.quit bound",
+			last.Label, last.IsQuit, last.Action != nil)
+	}
+}

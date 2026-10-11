@@ -823,6 +823,13 @@ func (c *Controller) buildMainMenu() *fyne.MainMenu {
 		fyne.NewMenuItem(t.RefreshNow, c.forceRefreshNow),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem(t.TrayHide, c.hideToTray),
+		// Our own Quit, flagged IsQuit (see quitMenuItem): without it Fyne
+		// appends a Quit of its own to this menu — App → Quit and Cmd+Q on
+		// macOS — bound straight to the driver, which skipped c.quit and with
+		// it the shutdown save and the poll drain. Measured on the darwin soak
+		// of 4a43a30: a round completed eight seconds before that Quit was never
+		// written, and only the 60s periodic save had reached disk.
+		quitMenuItem(t.TrayQuit, c.quit),
 	)
 	help := fyne.NewMenu("Help",
 		fyne.NewMenuItem(t.CheckForUpdates, func() {
@@ -1318,7 +1325,8 @@ func (c *Controller) openURL(raw string) {
 	}
 }
 
-// quitMenuItem builds the tray's Quit entry, flagged as THE quit item.
+// quitMenuItem builds a Quit entry — the tray's and the main menu's — flagged as
+// THE quit item, so every way out of the app runs c.quit.
 //
 // Fyne's addMissingQuitForMenu appends its own Quit unless the last item is
 // already marked IsQuit — and it only sets that flag itself when the label
