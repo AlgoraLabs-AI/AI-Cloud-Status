@@ -397,7 +397,7 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	// The damage arrives from DISK — a record written while the clock ran fast,
 	// which then blocks every later observation once the clock is corrected. That
 	// is a different clock, so it can only be judged where the file is read.
-	// LoadCoverage does it.
+	// LoadFile does it.
 	cov.LastAttempt = obs.At
 	// High-water mark too. A manual retry started under round N can complete
 	// after the scheduled poll of round N+1 has already been recorded; writing
@@ -514,69 +514,18 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	h.coverage[id] = cov
 }
 
-// LoadCoverage reads ONLY the coverage map from a history file.
-//
-// A reader that wants the ~15 attendance entries should not pay for the ring:
-// Load unmarshals every retained sample and then deep-copies each series into a
-// fresh slice, which on a mature install is megabytes of parsing and copying for
-// a map that fits in a kilobyte.
-//
-// KNOWN, and not fixed here: alertaudit still reads this file twice per run,
-// because RunContinuity independently full-Loads it for the sample history it
-// genuinely needs. So this saves the materialization, NOT the second read — the
-// two audit sections should share one load, which is a change to their entry
-// points rather than to this function.
-//
-// The three returns are deliberately distinct, because a reader that cannot tell
-// them apart will report a corrupt file as an absent one:
-//   - (nil, false, nil)  the file does not exist
-//   - (nil, true, err)   it exists and could not be read or parsed
-//   - (map, true, nil)   it was read; the map may still be empty
-//
-// dropped counts the entries discarded as clock damage (see dropFutureDated). It
-// is returned, not just logged, because a reader that sees an empty map cannot
-// otherwise tell "nothing was ever recorded" from "everything recorded was
-// discarded" — a gap from a loss, which the audit's tier line exists to keep
-// apart.
-func LoadCoverage(path string) (coverage map[string]CoverageEntry, found bool, dropped int, err error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, 0, nil
-		}
-		return nil, true, 0, err
-	}
-	// Only the coverage key is decoded; the series are skipped rather than
-	// materialized. The envelope is the SAME declaration onDisk embeds, so the
-	// writer and this reader cannot drift apart.
-	var snap coverageEnvelope
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil, true, 0, err
-	}
-	if snap.Coverage == nil {
-		snap.Coverage = map[string]CoverageEntry{}
-	}
-	// Drop entries stamped implausibly far in the FUTURE. This is the only place
-	// the check can work: the timestamps were written by a different run, and
-	// possibly a different clock, so here they can be compared against this one.
-	//
-	// A record written while the clock ran fast is not merely wrong, it is
-	// absorbing: RecordCoverage only accepts observations newer than the last, so
-	// once the clock is corrected every later poll — successes included — is
-	// refused forever, and a frozen entry holding a failure run would fail the
-	// audit permanently. Discarding the entry costs one provider's history and
-	// restores a record that can move again.
-	dropped = dropFutureDated(snap.Coverage)
-	return snap.Coverage, true, dropped, nil
-}
-
 // dropFutureDated removes entries stamped implausibly far ahead of now.
 //
-// Shared by BOTH read paths on purpose. Guarding only the audit's reader left
-// the app's own Load unprotected, which is the path that matters more: the app
-// is what then refuses every later observation for that provider and rewrites
-// the file. A guard that covers one of two readers of the same file is not a
-// guard, it is a coin toss on which one sees the damage first.
+// This is the only place the check can work: the timestamps were written by a
+// different run, and possibly a different clock, so here they can be compared
+// against this one. A guard at record time reads as protection and gives none.
+//
+// A record written while the clock ran fast is not merely wrong, it is
+// absorbing: RecordCoverage only accepts observations newer than the last, so
+// once the clock is corrected every later poll — successes included — is
+// refused forever, and a frozen entry holding a failure run would fail the
+// audit permanently. Discarding the entry costs one provider's history and
+// restores a record that can move again.
 //
 // Each drop is logged: a discarded record is evidence LOST, and without a line
 // here the next reader — the app's own save, the audit — reports it as evidence
@@ -618,6 +567,16 @@ func (h *History) Coverage(id string) (CoverageEntry, bool) {
 	defer h.mu.Unlock()
 	cov, ok := h.coverage[id]
 	return cov, ok
+}
+
+// CoverageCount is how many checks have an attendance record at all. Zero on a
+// parseable file is a real state, not an error: an install upgraded to a build
+// that records coverage has a clean history.json with no coverage key yet, and
+// the audit must not call that tier "present" while every verdict is unknown.
+func (h *History) CoverageCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.coverage)
 }
 
 // Prune drops samples outside the plausible display range from every series:
@@ -715,22 +674,8 @@ type onDisk struct {
 	// sibling is pruning-exempt by construction — which is what lets this answer
 	// "when did this feed last work" over months without storing months.
 	//
-	coverageEnvelope
-}
-
-// coverageEnvelope declares the coverage key ONCE, embedded in onDisk and
-// decoded on its own by LoadCoverage.
-//
-// Two structs that had to agree about one JSON tag is precisely the shape that
-// rots: a rename on the writer's side would leave a separate reader silently
-// finding nothing, returning an empty map with no error, and reporting the
-// coverage tier as present while every verdict resolved to "unknown" — with all
-// tests green. Sharing the declaration makes that impossible rather than
-// unlikely.
-//
-// omitempty so a build that has never recorded coverage writes a file a previous
-// version reads unchanged.
-type coverageEnvelope struct {
+	// omitempty so a build that has never recorded coverage writes a file a
+	// previous version reads unchanged.
 	Coverage map[string]CoverageEntry `json:"coverage,omitempty"`
 }
 
@@ -739,10 +684,10 @@ type coverageEnvelope struct {
 func (h *History) Save(path string) error {
 	h.mu.Lock()
 	snap := onDisk{
-		Version:          snapshotVersion,
-		Cap:              h.cap,
-		Series:           map[string][]Sample{},
-		coverageEnvelope: coverageEnvelope{Coverage: map[string]CoverageEntry{}},
+		Version:  snapshotVersion,
+		Cap:      h.cap,
+		Series:   map[string][]Sample{},
+		Coverage: map[string]CoverageEntry{},
 	}
 	for id, buf := range h.series {
 		cp := make([]Sample, len(buf))
@@ -799,14 +744,36 @@ func SetAside(path string) (string, error) {
 // there but cannot be parsed. capacity overrides the persisted cap so changing the
 // build's retention re-bounds existing data on the next save; each loaded series
 // is trimmed to the new cap immediately.
+//
+// It is LoadFile for the app, which needs the History and nothing about the
+// file: the app sets a corrupt file aside on the error alone.
 func Load(path string, capacity int) (*History, error) {
-	h := New(capacity)
+	h, _, _, err := LoadFile(path, capacity)
+	return h, err
+}
+
+// LoadFile is Load for a reader that must also know what became of the FILE —
+// the audit, which reports on it.
+//
+// The facts beside the History are deliberately distinct, because a reader that
+// cannot tell them apart reports a corrupt file as an absent one:
+//   - found=false, err=nil   the file does not exist
+//   - found=true,  err!=nil  it exists and could not be read or parsed
+//   - found=true,  err=nil   it was read; the History may still be empty
+//
+// dropped counts the coverage entries discarded as clock damage (see
+// dropFutureDated). It is returned, not just logged, because a reader that sees
+// no coverage cannot otherwise tell "nothing was ever recorded" from
+// "everything recorded was discarded" — a gap from a loss, which the audit's
+// tier line exists to keep apart.
+func LoadFile(path string, capacity int) (h *History, found bool, dropped int, err error) {
+	h = New(capacity)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return h, nil
+			return h, false, 0, nil
 		}
-		return h, err
+		return h, true, 0, err
 	}
 	var snap onDisk
 	if err := json.Unmarshal(data, &snap); err != nil {
@@ -824,7 +791,7 @@ func Load(path string, capacity int) (*History, error) {
 		// loads this same file and moved the running app's data out from under
 		// it, turning its own "present but unreadable" into "absent" one run
 		// later.
-		return h, fmt.Errorf("%w: %v", ErrCorrupt, err)
+		return h, true, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	for id, buf := range snap.Series {
 		if len(buf) > h.cap {
@@ -835,14 +802,14 @@ func Load(path string, capacity int) (*History, error) {
 		h.series[id] = cp
 	}
 	// Symmetric with Save: coverage read into the snapshot has to be copied onto
-	// the History itself, or the next Save rebuilds the file without it. And the
-	// same clock-damage guard the audit's reader applies — this is the path that
-	// matters more, since the app is what refuses later observations and rewrites
-	// the file.
-	dropFutureDated(snap.Coverage)
+	// the History itself, or the next Save rebuilds the file without it. The
+	// clock-damage guard runs here, on the one read path, so the app — which is
+	// what refuses later observations and rewrites the file — and the audit see
+	// the same record.
+	dropped = dropFutureDated(snap.Coverage)
 	maps.Copy(h.coverage, snap.Coverage)
 	for _, cov := range h.coverage {
 		h.round = max(h.round, cov.LastRound)
 	}
-	return h, nil
+	return h, true, dropped, nil
 }

@@ -289,45 +289,47 @@ func TestRapidRepeatsCannotManufactureARun(t *testing.T) {
 	}
 }
 
-// TestSaveThenLoadCoverageRoundTrip pins the writer and the coverage-only reader
-// against each other.
+// TestSaveThenLoadCoverageRoundTrip pins the writer and the reader against each
+// other on the coverage key.
 //
-// Save and LoadCoverage are two code paths over one JSON key. Nothing else makes
-// them agree — and if they drift, LoadCoverage finds nothing, returns an empty
-// map with NO error, and the audit reports the coverage tier as present while
-// every verdict resolves to "unknown". The feature would be dead and silent.
+// If they drift, LoadFile finds nothing, returns an empty record with NO error,
+// and the audit reports the coverage tier as present while every verdict
+// resolves to "unknown". The feature would be dead and silent.
 func TestSaveThenLoadCoverageRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "history.json")
 	at := time.Now().Truncate(time.Second)
 
 	h := New(100)
-	h.Add("p", Sample{Time: at, Up: true}) // a series too, so the reader must skip it
+	h.Add("p", Sample{Time: at, Up: true})
 	h.RecordCoverage("p", CoverageObservation{At: at, FailureClass: OutcomeHTTP})
 	if err := h.Save(path); err != nil {
 		t.Fatal(err)
 	}
 
-	cov, found, _, err := LoadCoverage(path)
+	h2, found, _, err := LoadFile(path, 100)
 	if err != nil || !found {
-		t.Fatalf("LoadCoverage = (_, %v, %v), want (map, true, nil)", found, err)
+		t.Fatalf("LoadFile = (_, %v, %v), want (history, true, nil)", found, err)
 	}
-	got, ok := cov["p"]
+	got, ok := h2.Coverage("p")
 	if !ok {
-		t.Fatal("LoadCoverage found no entry that Save had just written — the writer and this reader have drifted")
+		t.Fatal("LoadFile found no entry that Save had just written — the writer and the reader have drifted")
 	}
 	if got.ConsecutiveFailures != 1 || got.LastFailureClass != OutcomeHTTP {
 		t.Errorf("entry = %+v, want 1 failure of class %q", got, OutcomeHTTP)
 	}
+	if n := h2.CoverageCount(); n != 1 {
+		t.Errorf("CoverageCount = %d, want 1", n)
+	}
 }
 
-// TestLoadCoverageDistinguishesAbsentFromUnreadable: a corrupt file must not
-// report as a missing one. They are different facts calling for different
-// responses, and reporting the loss as a gap is how evidence loss goes unseen.
-func TestLoadCoverageDistinguishesAbsentFromUnreadable(t *testing.T) {
+// TestLoadFileDistinguishesAbsentFromUnreadable: a corrupt file must not report
+// as a missing one. They are different facts calling for different responses,
+// and reporting the loss as a gap is how evidence loss goes unseen.
+func TestLoadFileDistinguishesAbsentFromUnreadable(t *testing.T) {
 	dir := t.TempDir()
 
-	_, found, _, err := LoadCoverage(filepath.Join(dir, "nope.json"))
+	_, found, _, err := LoadFile(filepath.Join(dir, "nope.json"), 10)
 	if found || err != nil {
 		t.Errorf("missing file = (found %v, err %v), want (false, nil)", found, err)
 	}
@@ -336,19 +338,19 @@ func TestLoadCoverageDistinguishesAbsentFromUnreadable(t *testing.T) {
 	if err := os.WriteFile(corrupt, []byte(`{"version":1,"series":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, found, _, err = LoadCoverage(corrupt)
+	_, found, _, err = LoadFile(corrupt, 10)
 	if !found {
 		t.Error("a corrupt file must report as FOUND; calling it absent hides an evidence loss")
 	}
 	if err == nil {
-		t.Error("a corrupt file must report its error, not return an empty map silently")
+		t.Error("a corrupt file must report its error, not return an empty record silently")
 	}
 }
 
-// TestLoadCoverageDropsFutureDatedEntries proves the future-timestamp guard can
-// actually FIRE.
+// TestLoadFileCountsDroppedFutureDatedEntries proves the future-timestamp guard
+// can actually FIRE, and that the loss is countable.
 //
-// It is at Load and not at record time for a reason worth pinning: obs.At comes
+// It is at load and not at record time for a reason worth pinning: obs.At comes
 // from the same process and the same clock as any check inside RecordCoverage
 // would, so a guard there can never trigger — it reads as protection and gives
 // none. The damage arrives from DISK, written by a run whose clock was wrong.
@@ -356,7 +358,7 @@ func TestLoadCoverageDistinguishesAbsentFromUnreadable(t *testing.T) {
 // And the entry must be DROPPED rather than kept, because coverage is monotonic:
 // a future stamp refuses every later observation, successes included, so keeping
 // it freezes that provider's record permanently.
-func TestLoadCoverageDropsFutureDatedEntries(t *testing.T) {
+func TestLoadFileCountsDroppedFutureDatedEntries(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "history.json")
 	future := time.Now().Add(48 * time.Hour)
@@ -368,17 +370,17 @@ func TestLoadCoverageDropsFutureDatedEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cov, _, dropped, err := LoadCoverage(path)
+	h2, _, dropped, err := LoadFile(path, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, present := cov["skewed"]; present {
-		t.Error("a future-dated entry survived Load; it would refuse every later observation forever")
+	if _, present := h2.Coverage("skewed"); present {
+		t.Error("a future-dated entry survived the load; it would refuse every later observation forever")
 	}
 	if dropped != 1 {
 		t.Errorf("dropped = %d, want 1 — the loss must be countable, or the audit reports it as a gap", dropped)
 	}
-	if _, present := cov["sane"]; !present {
+	if _, present := h2.Coverage("sane"); !present {
 		t.Error("the guard took a sane entry with it")
 	}
 }
@@ -629,7 +631,7 @@ func TestALateRetryFromAnOlderRoundCannotRegressTheRecord(t *testing.T) {
 }
 
 // TestLoadDropsFutureDatedAndSeedsTheRoundCounter is the app-side twin of the
-// LoadCoverage test: Load is the path that rewrites the file, so it must drop
+// LoadFile test: Load is the path that rewrites the file, so it must drop
 // clock-damaged entries itself and seed the round counter from what survives.
 func TestLoadDropsFutureDatedAndSeedsTheRoundCounter(t *testing.T) {
 	dir := t.TempDir()

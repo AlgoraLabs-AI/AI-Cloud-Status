@@ -318,6 +318,32 @@ func (r ProviderReport) AllCapturesUnparseable() bool {
 	return r.TotalCaptures > 0 && r.ParseErrors == r.TotalCaptures
 }
 
+// HistoryFile is history.json as both audit sections see it: read once, by
+// LoadHistory, and handed to Run and RunContinuity.
+//
+// One read, not one per section, for two reasons. The file is megabytes on a
+// mature install — every retained sample — and the provider section used to
+// decode only the coverage key while the continuity section decoded the whole
+// thing, so the audit parsed it twice. And the running app rewrites the file on
+// every save: two reads can see two different versions, and then the two
+// sections of one report describe two different files.
+//
+// Hist is never nil; it is empty when the file is absent or unreadable, and
+// Found and Err say which (see history.LoadFile for the three states).
+type HistoryFile struct {
+	Hist    *history.History
+	Found   bool
+	Dropped int
+	Err     error
+}
+
+// LoadHistory reads dir's history.json for the audit. Nothing here is fatal —
+// each section decides what an unreadable file means for its own evidence.
+func LoadHistory(dir string) HistoryFile {
+	h, found, dropped, err := history.LoadFile(filepath.Join(dir, "history.json"), history.DefaultCapacity)
+	return HistoryFile{Hist: h, Found: found, Dropped: dropped, Err: err}
+}
+
 // Report is the full audit result.
 type Report struct {
 	GeneratedAt   time.Time
@@ -417,7 +443,10 @@ func (iv interval) distance(t time.Time) time.Duration {
 // TODAY's region configuration for captures of any age; an older capture
 // audited against a since-changed region list is a known limitation (no
 // historical config snapshots exist to do better).
-func Run(dir string) (Report, error) {
+//
+// hist is dir's history.json, loaded ONCE by the caller (LoadHistory) and shared
+// with RunContinuity, which needs the same file for its sample series.
+func Run(dir string, hist HistoryFile) (Report, error) {
 	if fi, err := os.Stat(dir); err != nil {
 		return Report{}, fmt.Errorf("app data directory: %w", err)
 	} else if !fi.IsDir() {
@@ -465,29 +494,27 @@ func Run(dir string) (Report, error) {
 		}
 	}
 
-	// The coverage tier. history.json is read separately from the capture and
+	// The coverage tier. history.json is a separate witness from the capture and
 	// alert-log corpora above and stays separate all the way to the exit code: it
 	// is user state written on every poll, so it is the only witness that exists
 	// on an install with diagnostics off.
 	//
-	// Only the coverage map is decoded — the sample ring is megabytes and this
-	// audit reads none of it. Failures are non-fatal but must not be silent: a
-	// present-but-corrupt file has to report as unreadable, not as absent, and
-	// certainly not as "coverage tier present" while yielding no verdicts.
-	coverage, histFound, dropped, herr := history.LoadCoverage(filepath.Join(dir, "history.json"))
+	// A failed read is non-fatal but must not be silent: a present-but-corrupt
+	// file has to report as unreadable, not as absent, and certainly not as
+	// "coverage tier present" while yielding no verdicts.
 	histErr := ""
-	if herr != nil {
-		histErr = herr.Error()
+	if hist.Err != nil {
+		histErr = hist.Err.Error()
 	}
 
 	feedSamplesDir := filepath.Join(dir, "feed-samples")
 	report := Report{
 		GeneratedAt:        time.Now(),
 		AlertLogStart:      alertStart,
-		HistoryPresent:     histFound && herr == nil && len(coverage) > 0,
-		HistoryFound:       histFound,
+		HistoryPresent:     hist.Found && hist.Err == nil && hist.Hist.CoverageCount() > 0,
+		HistoryFound:       hist.Found,
 		HistoryErr:         histErr,
-		CoverageDropped:    dropped,
+		CoverageDropped:    hist.Dropped,
 		DiagnosticsEnabled: cfg.DebugLogging,
 	}
 	for _, p := range providers.Default() {
@@ -507,7 +534,7 @@ func Run(dir string) (Report, error) {
 			LastAlertTime:     lastAlertByID[p.ID],
 			MissingRecoveries: missing,
 		}
-		pr.Coverage, pr.HasCoverage = coverage[p.ID]
+		pr.Coverage, pr.HasCoverage = hist.Hist.Coverage(p.ID)
 		for _, c := range captures {
 			if c.Time.After(pr.LastCaptureTime) {
 				pr.LastCaptureTime = c.Time

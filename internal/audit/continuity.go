@@ -107,7 +107,10 @@ func (r ContinuityReport) Unclosed() []OpenWindow {
 
 // RunContinuity audits the alert sources that have no capture corpus: custom URL
 // checks and the app-wide connectivity alerts.
-func RunContinuity(dir string) (ContinuityReport, error) {
+//
+// hist is dir's history.json, loaded ONCE by the caller (LoadHistory) and shared
+// with Run; this section reads its sample series.
+func RunContinuity(dir string, hist HistoryFile) (ContinuityReport, error) {
 	var rep ContinuityReport
 
 	cfg, err := loadConfig(dir)
@@ -118,17 +121,16 @@ func RunContinuity(dir string) (ContinuityReport, error) {
 	if err != nil {
 		return rep, err
 	}
-	hist, err := history.Load(filepath.Join(dir, "history.json"), history.DefaultCapacity)
-	if err != nil && !errors.Is(err, history.ErrCorrupt) {
-		return rep, err
+	if hist.Err != nil && !errors.Is(hist.Err, history.ErrCorrupt) {
+		return rep, hist.Err
 	}
-	if err != nil {
-		// Unreadable is not fatal here: Load hands back an empty History and the
-		// section degrades to "no evidence" where it needed samples, which is
-		// what it always did for a file that was never written. The difference
-		// is named on the report, and the file is left exactly where it is —
-		// this is a read-only diagnostic of the running app's data.
-		rep.HistoryErr = err.Error()
+	if hist.Err != nil {
+		// Unreadable is not fatal here: the load hands back an empty History and
+		// the section degrades to "no evidence" where it needed samples, which
+		// is what it always did for a file that was never written. The
+		// difference is named on the report, and the file is left exactly where
+		// it is — this is a read-only diagnostic of the running app's data.
+		rep.HistoryErr = hist.Err.Error()
 	}
 
 	// Only checks that still exist: a deleted URL leaves an orphan series and an
@@ -172,7 +174,7 @@ func RunContinuity(dir string) (ContinuityReport, error) {
 	sort.Strings(rep.Checked)
 
 	for _, id := range rep.Checked {
-		series := hist.Series(id)
+		series := hist.Hist.Series(id)
 		if len(series) > 0 {
 			if rep.HistoryHorizon.IsZero() || series[0].Time.Before(rep.HistoryHorizon) {
 				rep.HistoryHorizon = series[0].Time

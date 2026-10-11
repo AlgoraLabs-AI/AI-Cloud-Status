@@ -98,7 +98,7 @@ func TestRun_MatchedMajorIncident(t *testing.T) {
 		{Time: ts.Add(2 * time.Hour), ID: testProviderID, Title: "Provider recovered", Recovery: true, Body: "..."},
 	})
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestRun_UncoveredMajorIncident(t *testing.T) {
 		{Time: ts.Add(-48 * time.Hour), ID: "some-other-provider", Title: "Provider outage"},
 	})
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestRun_SuppressedMajorIncident(t *testing.T) {
 		{Time: ts.Add(time.Hour), ID: testProviderID, Title: "Provider recovered", Recovery: true, Suppressed: "offline"},
 	})
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestRun_PreAlertlogCapture(t *testing.T) {
 		{Time: logStart.Add(time.Hour), ID: testProviderID, Title: "Provider recovered", Recovery: true},
 	})
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestRun_StillOpenIncidentMatches(t *testing.T) {
 		// no recovery — still open as of "now"
 	})
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestRun_MinorNeverFlagged(t *testing.T) {
 	writeCapture(t, dir, testProviderID, ts, "minor",
 		statuspageFixture("minor", "minor", "Just a minor blip"))
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestRun_MinorNeverFlagged(t *testing.T) {
 func TestRun_NeverCapturedFlagsEnabledFeedBackedProvider(t *testing.T) {
 	dir := t.TempDir() // nothing written at all — no config.json, no feed-samples, no alert-log
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestRun_RegionScopingMatchesLiveAlerting(t *testing.T) {
 		{Time: ts.Add(time.Hour), ID: testProviderID, Title: "Provider recovered", Recovery: true},
 	})
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestRun_ParseErrorCaptureSkippedNotCrashed(t *testing.T) {
 	ts := time.Date(2026, 7, 29, 16, 50, 24, 0, time.Local)
 	writeCapture(t, dir, testProviderID, ts, "major", []byte("this is not json"))
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestRun_MalformedCaptureFilenameSkipped(t *testing.T) {
 		}
 	}
 
-	report, err := Run(dir) // must not panic or error on unparseable filenames
+	report, err := Run(dir, LoadHistory(dir)) // must not panic or error on unparseable filenames
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +343,7 @@ func TestRun_MalformedAlertLogLineSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +475,8 @@ func TestWorstSummary_PicksHighestSeverityIncident(t *testing.T) {
 }
 
 func TestRun_NonexistentDirReturnsError(t *testing.T) {
-	if _, err := Run(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+	dir := filepath.Join(t.TempDir(), "does-not-exist")
+	if _, err := Run(dir, LoadHistory(dir)); err == nil {
 		t.Error("Run on a nonexistent directory should error, not silently report an empty-but-valid audit")
 	}
 }
@@ -512,7 +513,7 @@ func TestRun_MissingRecoveryDoesNotMaskLaterIncident(t *testing.T) {
 		// no recovery line, ever — the missing-recovery scenario
 	})
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +545,7 @@ func TestRun_AllCapturesUnparseableFlagged(t *testing.T) {
 	writeCapture(t, dir, testProviderID, ts, "major", []byte("not json at all"))
 	writeCapture(t, dir, testProviderID, ts.Add(time.Minute), "major", []byte("{also not valid"))
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +565,7 @@ func TestRun_OneOfManyParseErrorsNotFlaggedAsAllUnparseable(t *testing.T) {
 	writeCapture(t, dir, testProviderID, ts.Add(time.Minute), "minor",
 		statuspageFixture("minor", "minor", "A perfectly fine capture"))
 
-	report, err := Run(dir)
+	report, err := Run(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}

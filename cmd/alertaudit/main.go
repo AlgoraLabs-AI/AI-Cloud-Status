@@ -52,7 +52,11 @@ func main() {
 		dir = d
 	}
 
-	report, err := audit.Run(dir)
+	// history.json is read once and shared: both sections report on the same
+	// file, and the running app rewrites it on every save.
+	hist := audit.LoadHistory(dir)
+
+	report, err := audit.Run(dir, hist)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "alertaudit:", err)
 		os.Exit(2)
@@ -63,7 +67,7 @@ func main() {
 	// The capture-less sources — custom URL checks and the app-wide
 	// connectivity alerts — are audited separately because the EVIDENCE is of a
 	// different kind, and conflating the two would overstate what was verified.
-	cont, cerr := audit.RunContinuity(dir)
+	cont, cerr := audit.RunContinuity(dir, hist)
 	if cerr != nil {
 		fmt.Fprintln(os.Stderr, "alertaudit: continuity section:", cerr)
 	} else {

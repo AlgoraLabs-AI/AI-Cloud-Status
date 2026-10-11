@@ -84,7 +84,7 @@ func TestContinuityCatchesTheUnclosedWindow(t *testing.T) {
 		series(start, 10, 2, true),
 	)
 
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestContinuityCleanWhenPaired(t *testing.T) {
 		{Time: down.Add(2 * time.Minute), ID: fixtureID, Title: monitor.TitleProviderRecovered, Recovery: true},
 	}, series(start, 10, 2, true))
 
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestContinuityIgnoresAnOngoingOutage(t *testing.T) {
 		[]alertlog.Entry{{Time: down, ID: fixtureID, Title: monitor.TitleProviderOutage}},
 		series(start, 10, 5, false), // never recovers, and the tail is fresh
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestContinuityIgnoresAnUnobservedRecovery(t *testing.T) {
 		[]alertlog.Entry{{Time: down, ID: fixtureID, Title: monitor.TitleProviderOutage}},
 		series(start, 10, 3, false), // stops while down, hours ago
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestContinuityIgnoresATruncatedRun(t *testing.T) {
 		[]alertlog.Entry{{Time: start, ID: fixtureID, Title: monitor.TitleProviderOutage}},
 		series(start, 0, 3, true), // opens mid-outage: nothing healthy precedes it
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestContinuityDropsDeletedChecks(t *testing.T) {
 		}},
 		series(start, 10, 2, true),
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestContinuityCountsStaleClosures(t *testing.T) {
 			Recovery: true, Suppressed: "stale-across-restart"},
 	}, series(start, 10, 2, true))
 
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestContinuityConnectivityIsNeverAssertedFromSamples(t *testing.T) {
 		[]alertlog.Entry{{Time: start, Title: monitor.TitleTotalLoss, Body: "no internet"}},
 		series(start, 10, 2, true),
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
