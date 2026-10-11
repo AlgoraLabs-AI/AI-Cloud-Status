@@ -1624,10 +1624,13 @@ func (c *Controller) noLinkLocked() bool {
 	return (c.connDown || !c.connJudged) && !c.lastRoundAnyOK
 }
 
-// coverageRunGap is how far apart attempts may be before the polling is deemed
-// stopped — the configured cadence, doubled; the record floors it at an hour.
-// Takes c.mu, so call it unlocked.
-func (c *Controller) coverageRunGap() time.Duration { return 2 * c.providerInterval() }
+// staleAfter is how old a provider observation may be before it says nothing
+// about now: the configured cadence, doubled, so one poll that ran long is
+// absorbed. The offline detector uses it as its freshness bound and the coverage
+// record as its run gap (floored at an hour there) — ONE definition, or the two
+// disagree about whether the same observation is current. Takes c.mu, so call
+// it unlocked.
+func (c *Controller) staleAfter() time.Duration { return 2 * c.providerInterval() }
 
 func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	list := c.enabledProviders()
@@ -1685,7 +1688,7 @@ func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	// no round costs. The measured round cost that used to feed this, doubled
 	// and clamped, was a proxy for the round number, and every threshold derived
 	// from it moved when a round got slow.
-	roundGap := c.coverageRunGap()
+	roundGap := c.staleAfter()
 	var wg sync.WaitGroup
 	for _, p := range list {
 		wg.Add(1)
@@ -1868,19 +1871,16 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 // recomputeOffline folds the latest connectivity and provider observations into
 // the offline detector and refreshes the banner on a transition.
 func (c *Controller) recomputeOffline() {
-	c.mu.Lock()
-	connDown := c.connDown
 	// Only FRESH provider observations count. provStates persists between
 	// provider polls (a minute by default) while this runs from the 1s
 	// connectivity loop, and Evaluate now treats a reachable feed as proof the
 	// machine is online. Without a freshness bound, a successful poll from a
 	// minute ago would keep vetoing the offline banner for a full provider
 	// interval after the network actually dropped — trading one wrong answer for
-	// a slower right one. Two intervals of slack absorbs a poll that ran long.
-	fresh := 2 * time.Duration(c.cfg.IntervalSeconds) * time.Second
-	if fresh <= 0 {
-		fresh = 2 * time.Duration(config.DefaultIntervalSeconds) * time.Second
-	}
+	// a slower right one. Resolved before the lock: staleAfter takes c.mu.
+	fresh := c.staleAfter()
+	c.mu.Lock()
+	connDown := c.connDown
 	// ...and only observations made AFTER the connectivity probes went dark. A
 	// successful HTTPS fetch is proof the machine was online WHEN IT HAPPENED,
 	// not now. Freshness alone is a 2-minute window, so a poll that landed
@@ -2006,7 +2006,7 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		}
 		c.mu.Unlock()
 		c.history.RecordCoverage(p.ID, coverageObservation(
-			st, noLink, false, round, c.coverageRunGap()))
+			st, noLink, false, round, c.staleAfter()))
 		c.refresh()
 	}()
 }
