@@ -261,17 +261,18 @@ func TestConsecutiveFailuresIsWhatMakesAVerdictPossible(t *testing.T) {
 
 // TestRapidRepeatsCannotManufactureARun: the counter advances per polling ROUND,
 // not per call. Anything that re-enters the poll on demand — Retry, "Refresh
-// now", any future trigger — would otherwise let a user click their way to the
-// sustained run the verdict is supposed to require.
+// now", any future trigger — re-polls inside the round in progress, and would
+// otherwise let a user click their way to the sustained run the verdict is
+// supposed to require.
 func TestRapidRepeatsCannotManufactureARun(t *testing.T) {
 	h := New(10)
 	t0 := time.Now().Add(-time.Hour)
-	gap := time.Hour
 
-	// Twenty failures one second apart, as fast as someone can click.
+	// Twenty failures one second apart, as fast as someone can click — all of
+	// them observations of the one round the scheduler is in.
 	for i := range 20 {
 		h.RecordCoverage("p", CoverageObservation{
-			At: t0.Add(time.Duration(i) * time.Second), FailureClass: OutcomeHTTP, RunGap: gap,
+			At: t0.Add(time.Duration(i) * time.Second), FailureClass: OutcomeHTTP, Round: 1,
 		})
 	}
 
@@ -433,6 +434,115 @@ func TestRunBreaksWhenPollingActuallyStops(t *testing.T) {
 	if cov.ConsecutiveFailures != 1 {
 		t.Errorf("ConsecutiveFailures = %d, want 1 — nine failures and a month of silence are not a ten-poll run",
 			cov.ConsecutiveFailures)
+	}
+}
+
+// TestFastFailureAfterSlowRoundStillCounts pins the defect the round number
+// exists to remove. Under the clock heuristics, the rate limit was a fraction of
+// the PREVIOUS round's measured cost, so a provider that went from timing out
+// (the round's bottleneck) to failing instantly produced two observations closer
+// together than the limit — and a genuine failure was discarded as a click,
+// precisely on the transition the record exists to catch.
+func TestFastFailureAfterSlowRoundStillCounts(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+
+	// Round 1: the provider was the slow one and answered at t0+45s. Round 2
+	// started 30s later and the provider failed instantly — 30s after its
+	// previous observation, with the configured cadence being 30s.
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(45 * time.Second), FailureClass: OutcomeTransport, Round: 1, RunGap: time.Minute,
+	})
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(75 * time.Second), FailureClass: OutcomeHTTP, Round: 2, RunGap: time.Minute,
+	})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 2 {
+		t.Errorf("ConsecutiveFailures = %d, want 2 — two rounds, two failures; how long the first round took is irrelevant",
+			cov.ConsecutiveFailures)
+	}
+	if cov.LastFailureClass != OutcomeHTTP {
+		t.Errorf("LastFailureClass = %q, want the second round's %q", cov.LastFailureClass, OutcomeHTTP)
+	}
+}
+
+// TestARoundWithNoObservationBreaksTheRun: a provider disabled for a few rounds
+// and re-enabled was not watched in between, and the failures on either side are
+// not one episode — regardless of how much wall-clock time that took.
+func TestARoundWithNoObservationBreaksTheRun(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+
+	for r := range uint64(3) {
+		h.RecordCoverage("p", CoverageObservation{
+			At: t0.Add(time.Duration(r) * time.Minute), FailureClass: OutcomeHTTP, Round: r + 1,
+		})
+	}
+	// Rounds 4, 5 and 6 went by with the provider disabled; round 7 fails.
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(7 * time.Minute), FailureClass: OutcomeHTTP, Round: 7,
+	})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1 — three rounds passed with nobody looking", cov.ConsecutiveFailures)
+	}
+}
+
+// TestContiguousRoundsStillBreakAcrossASleep: the one thing a round number
+// cannot see is time the process was not running — a laptop lid closed for an
+// afternoon produces rounds N and N+1 hours apart. That is a stopped poll.
+func TestContiguousRoundsStillBreakAcrossASleep(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-8 * time.Hour)
+
+	h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeHTTP, Round: 1, RunGap: time.Minute})
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(3 * time.Hour), FailureClass: OutcomeHTTP, Round: 2, RunGap: time.Minute,
+	})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1 — consecutive round numbers three hours apart are not continuous polling",
+			cov.ConsecutiveFailures)
+	}
+}
+
+// TestRoundNumbersContinueAcrossRestart pins the counter's seed. A counter
+// restarting at one would collide with the persisted LastRound, and the first
+// failure after every relaunch would be refused as a repeat of the round before
+// the restart — which is the opposite of what a relaunch means.
+func TestRoundNumbersContinueAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.json")
+	t0 := time.Now().Add(-10 * time.Minute)
+
+	h := New(10)
+	for range 3 {
+		h.NextRound()
+	}
+	h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeHTTP, Round: 3})
+	if err := h.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	h2, err := Load(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round := h2.NextRound()
+	if round != 4 {
+		t.Fatalf("NextRound() after reload = %d, want 4 — numbering continues from the persisted record", round)
+	}
+	// A quick restart is not a stopped poll: the run carries across it.
+	h2.RecordCoverage("p", CoverageObservation{At: t0.Add(time.Minute), FailureClass: OutcomeHTTP, Round: round})
+	cov, _ := h2.Coverage("p")
+	if cov.ConsecutiveFailures != 2 {
+		t.Errorf("ConsecutiveFailures = %d after a one-minute restart, want 2", cov.ConsecutiveFailures)
+	}
+	if cov.LastRound != 4 {
+		t.Errorf("LastRound = %d, want 4", cov.LastRound)
 	}
 }
 

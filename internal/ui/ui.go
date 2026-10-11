@@ -114,14 +114,6 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // blip is tolerated without a tight retry loop.
 const providerRetryAttempts = 3
 
-// maxRoundCostEstimate caps how much of a measured round duration may feed the
-// coverage run-gap. A real round is bounded by the retry attempts times the
-// client timeout plus the URL checks; anything far past that is a suspended
-// machine or a pathological stall, not a cadence, and letting it through would
-// stretch the "is this run continuous" window by however long the laptop was
-// asleep.
-const maxRoundCostEstimate = 5 * time.Minute
-
 // historySaveEvery is how many countdown ticks (seconds) elapse between
 // background saves of the on-disk history ring buffer.
 const historySaveEvery = 60
@@ -178,16 +170,6 @@ type Controller struct {
 	cfg        config.Config
 	engine     *monitor.Engine
 	provStates map[string]provState
-	// lastRoundCost is how long the previous provider round actually took, wall
-	// clock. It is MEASURED rather than derived from the configured interval
-	// because a round in which providers are timing out costs several times a
-	// healthy one — three retries against a 15s client timeout, plus backoff,
-	// plus the URL checks — so the configured cadence understates the real
-	// spacing between two observations of one provider by a wide and variable
-	// margin. Coverage's run-gap rule needs the real spacing; guessing it short
-	// resets the failure counter on every failure and makes the verdict
-	// unreachable.
-	lastRoundCost time.Duration
 	// lastRoundAnyOK is whether ANY provider read its feed in the previous round.
 	// It is the independent proof of connectivity for machines whose networks
 	// block the probe targets — and it is not circular, because it is a DIFFERENT
@@ -370,18 +352,24 @@ func feedOutcome(k providers.FeedFailure) string {
 //	          inspecting st.err: monitor.Retry returns the LAST ATTEMPT's error
 //	          when cancellation lands during a backoff, so the error value is
 //	          silent about cancellation exactly when it matters.
-//	runGap    how far apart consecutive observations of one provider actually
-//	          are — measured, not derived from the configured cadence, because a
-//	          failing round costs several times a healthy one.
+//	round     the scheduled polling round this poll belongs to, from
+//	          History.NextRound — zero for a poll outside any round, such as a
+//	          manual retry. The record counts rounds, not polls, so an
+//	          on-demand re-poll must carry the round in progress, not a new one.
+//	runGap    how long attempts may be apart before the polling is deemed to
+//	          have stopped — the app closed, the machine asleep. Derived from
+//	          the configured cadence, which is all that matters for it: within a
+//	          process the round number decides, however long a round took.
 //
 // Taking them as parameters also lets one poll round judge every provider
 // against a single snapshot; reading them per provider lets a link dropping
 // mid-round give some a real failure and others a blind one.
-func coverageObservation(st provState, noLink, cancelled bool, runGap time.Duration) history.CoverageObservation {
+func coverageObservation(st provState, noLink, cancelled bool, round uint64, runGap time.Duration) history.CoverageObservation {
 	return history.CoverageObservation{
 		At:      st.when,
 		OK:      st.outcome == history.OutcomeReadable,
 		Skipped: st.skipped,
+		Round:   round,
 		RunGap:  runGap,
 		// A poll that never got an answer from the feed — because the machine had
 		// no link, or because shutdown cancelled it — is an attempt that carries
@@ -1517,10 +1505,16 @@ func (c *Controller) runProviders(ctx context.Context) {
 	if !sleepCtx(ctx, startupDelay) {
 		return
 	}
+	// The round number is minted by the TIMER, not by the poll. "Refresh now"
+	// wakes this loop through providerTrigger and re-polls inside the round in
+	// progress, so the coverage record sees it as the same round and does not
+	// count it twice — that is what makes a failure run count rounds and not
+	// clicks, with no rate limit anywhere.
+	round := c.history.NextRound()
 	for {
 		c.pruneExpiredRegionMutes() // expire timed region deactivations + notify "resumed"
 		c.pruneExpiredSilences()    // expire timed per-check silences (silently)
-		c.pollProvidersOnce(ctx)
+		c.pollProvidersOnce(ctx, round)
 		c.pollURLChecksOnce(ctx)
 		c.recomputeOffline()
 		c.refresh()
@@ -1539,12 +1533,13 @@ func (c *Controller) runProviders(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(interval):
+			round = c.history.NextRound()
 		case <-c.providerTrigger:
 		}
 	}
 }
 
-func (c *Controller) pollProvidersOnce(ctx context.Context) {
+func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	list := c.enabledProviders()
 	interest := c.regionsOfInterest()
 	// Snapshot the offline state ONCE for the whole round. recomputeOffline also
@@ -1592,21 +1587,14 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	// succeeding, never the failing one excusing itself.
 	noLinkAtRoundStart := (c.connDown || !c.connJudged) && !c.lastRoundAnyOK
 	c.mu.Unlock()
-	// The run-gap has to exceed the real spacing between two observations of one
-	// provider, and that spacing is (previous round's cost + the interval), not
-	// the interval alone. Measured, generously doubled: erring long only delays a
-	// verdict, while erring short prevents one entirely — every failure would
-	// land past the gap, reset the counter, and pin it at one forever.
-	roundStart := time.Now()
-	c.mu.Lock()
-	prevRoundCost := c.lastRoundCost
-	c.mu.Unlock()
-	// Clamped, because it is an unbounded wall-clock measurement: a machine
-	// suspended mid-round, or one pathological round, would otherwise widen the
-	// "is this run continuous" window by however long that took — and the
-	// informative window is a multiple of it, so the distortion multiplies.
-	prevRoundCost = min(prevRoundCost, maxRoundCostEstimate)
-	roundGap := 2 * (prevRoundCost + c.providerInterval())
+	// Within a process, whether this provider was looked at every round is
+	// answered by the round number, exactly. The run-gap only has to say when
+	// the polling STOPPED — the app closed, the machine asleep — so the
+	// configured cadence is all it needs; the record floors it at an hour, which
+	// no round costs. The measured round cost that used to feed this, doubled
+	// and clamped, was a proxy for the round number, and every threshold derived
+	// from it moved when a round got slow.
+	roundGap := 2 * c.providerInterval()
 	var wg sync.WaitGroup
 	for _, p := range list {
 		wg.Add(1)
@@ -1678,7 +1666,7 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 			// the error value is silent about cancellation in exactly the case
 			// this filter exists for.
 			c.history.RecordCoverage(p.ID, coverageObservation(
-				st, noLinkAtRoundStart, ctx.Err() != nil, roundGap))
+				st, noLinkAtRoundStart, ctx.Err() != nil, round, roundGap))
 
 			// Journal every incident the feed currently lists so the detail
 			// panel can show a last-24h history after they resolve. Recorded
@@ -1727,7 +1715,6 @@ func (c *Controller) pollProvidersOnce(ctx context.Context) {
 	}
 	wg.Wait()
 	c.mu.Lock()
-	c.lastRoundCost = time.Since(roundStart)
 	c.lastRoundAnyOK = false
 	for _, p := range list {
 		if st, ok := c.provStates[p.ID]; ok && st.outcome == history.OutcomeReadable {
@@ -1891,11 +1878,11 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		// ten clicks in a minute manufacture exactly the "sustained run" the
 		// verdict exists to require.
 		// Every judgement this builder takes is unreachable from here, so all
-		// three are passed as their zero values rather than computed: only OK
-		// observations survive the guard below, and RecordCoverage reads Blind
-		// and RunGap on the failure branch alone. Computing them would take two
-		// locks for values nothing downstream can consume.
-		if obs := coverageObservation(st, false, false, 0); obs.OK {
+		// four are passed as their zero values rather than computed: only OK
+		// observations survive the guard below, and RecordCoverage reads Blind,
+		// Round and RunGap on the failure branch alone. Computing them would take
+		// two locks for values nothing downstream can consume.
+		if obs := coverageObservation(st, false, false, 0, 0); obs.OK {
 			c.history.RecordCoverage(p.ID, obs)
 		}
 		c.refresh()

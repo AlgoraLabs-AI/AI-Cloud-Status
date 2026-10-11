@@ -134,15 +134,27 @@ type CoverageEntry struct {
 	// CoverageObservation.Blind. Counting those would blame every provider for
 	// the user's own router.
 	ConsecutiveFailures int `json:"cf,omitempty"`
+	// LastRound is the polling round of the last recorded attempt — see
+	// CoverageObservation.Round. It is what lets a failure run be judged by the
+	// fact it is about ("was this provider observed in every round between?")
+	// instead of by wall-clock distances that merely proxy for it.
+	//
+	// Zero means the entry predates round numbering, or was last touched by a
+	// caller that has none; the round rules then abstain for that one judgement.
+	LastRound uint64 `json:"lr,omitempty"`
 }
 
-// failureRunGap is the FALLBACK gap, used only when an observation supplies
-// none. See CoverageObservation.RunGap: a caller that knows the poll cadence
-// must pass one, because the cadence is user-configurable with no upper bound
-// and a constant cannot be "longer than a normal poll interval" for a user who
-// chose a longer one.
+// failureRunGap is the floor on how long attempts may be apart before the
+// polling is considered to have STOPPED — the app closed or the machine asleep.
+// Within a running process that question is answered by round numbers, exactly;
+// this bound exists for the stretch no round number can see, between one
+// process and the next.
 //
-// Erring long merely delays a verdict; erring short prevents one entirely.
+// It is a floor, not a value: a caller whose poll cadence is slower supplies a
+// larger RunGap, because the cadence is user-configurable with no ceiling and a
+// constant alone cannot be "longer than a normal poll interval" for a user who
+// chose a longer one. Erring long merely delays a verdict; erring short prevents
+// one entirely.
 const failureRunGap = time.Hour
 
 // informativeRunGapFactor is how many run-gaps of learning NOTHING may pass
@@ -193,14 +205,25 @@ type CoverageObservation struct {
 	// intended.
 	Skipped      bool
 	FailureClass string
-	// RunGap is how long a silence may be before the next failure starts a NEW
-	// run instead of extending the old one. Zero falls back to failureRunGap.
+	// Round is the scheduled polling round this observation belongs to, from
+	// History.NextRound. It is the fact the failure-run rules are about: a run
+	// counts ROUNDS, so two observations from one round count once however they
+	// were triggered, and a run is contiguous only while no round went by without
+	// this provider being observed. Both are exact, and neither cares how long a
+	// round took.
 	//
-	// It is supplied by the caller because only the caller knows the poll
-	// cadence, and the cadence is user-configurable with no ceiling. A constant
-	// here would be wrong for anyone who slows polling past it: every failure
-	// would land after the gap, reset the counter, and pin it at one forever, so
-	// the sustained-failure verdict could never fire at all.
+	// Zero means the caller has no round — a manual retry, or a reader older than
+	// this field — and the round rules abstain for that observation.
+	Round uint64
+	// RunGap is how long attempts may be apart before the polling is considered
+	// to have stopped — the app closed, the machine asleep. It only matters across
+	// a stretch no round number can see; within a process the rounds decide.
+	// It is floored at failureRunGap, so a caller supplies it to RAISE the bound
+	// for a slow poll cadence, which is user-configurable with no ceiling: a
+	// constant alone would call every poll of a slow poller a stopped one, reset
+	// the counter each time, and make the sustained-failure verdict unreachable.
+	// It also scales the blind-stretch window, which is floored at
+	// minInformativeWindow.
 	RunGap time.Duration
 }
 
@@ -217,6 +240,12 @@ type History struct {
 	// by the next Save. Keeping the reader and the writer symmetric here is the
 	// whole reason this is a struct field and not a local.
 	coverage map[string]CoverageEntry
+	// round is the last polling round number handed out by NextRound. Seeded at
+	// Load from the highest LastRound on disk so numbering continues across
+	// restarts: a counter that restarted at one would collide with persisted
+	// entries and make the first failure after every relaunch look like a repeat
+	// of the round before it.
+	round uint64
 }
 
 // New returns an empty History retaining up to capacity samples per check.
@@ -235,6 +264,17 @@ func New(capacity int) *History {
 
 // Capacity returns the default per-check sample cap.
 func (h *History) Capacity() int { return h.cap }
+
+// NextRound hands out the number of the next scheduled polling round. Call it
+// once per round, from the scheduler — NOT per poll, and NOT for an on-demand
+// re-poll, which belongs to the round in progress: that is what makes a run
+// count rounds rather than clicks.
+func (h *History) NextRound() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.round++
+	return h.round
+}
 
 // SetCap overrides the retention cap for one check id (non-positive clears the
 // override). Used to keep high-frequency checks that only display a short
@@ -314,6 +354,7 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	// the distance from the PREVIOUS attempt, and comparing against a field this
 	// function has already advanced measures zero every time.
 	prevAttempt := cov.LastAttempt
+	prevRound := cov.LastRound
 	// High-water mark, as the field's own doc says — so enforce it. Two polls for
 	// one provider can complete out of order: a scheduled round that started
 	// earlier can finish AFTER a manual retry that started later, and recording
@@ -333,6 +374,9 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	// is a different clock, so it can only be judged where the file is read.
 	// LoadCoverage does it.
 	cov.LastAttempt = obs.At
+	if obs.Round != 0 {
+		cov.LastRound = obs.Round
+	}
 	switch {
 	case obs.OK:
 		cov.LastSuccess = obs.At
@@ -370,36 +414,45 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		//     arbitrarily long blind window never breaks a run at all, and
 		//     failures on either side of a week offline join into one.
 		//
-		// Attempts bound the first question and informative observations the
-		// second, so both are measured. informativeGap is deliberately looser: a
-		// blind stretch is expected and only becomes disqualifying when it is long
-		// enough that the run is no longer one continuous episode.
-		gap := obs.RunGap
-		if gap <= 0 {
-			gap = failureRunGap
+		// "The looking never stopped" is a fact about polling ROUNDS, and the
+		// observation carries which round it belongs to, so it is judged on that
+		// fact rather than on wall-clock distances proxying for it. The proxies —
+		// a measured round cost, doubled, clamped, split into three thresholds —
+		// were each retuned by any change to the others: a failure that arrived
+		// fast after a slow round read as a click, and a long blind stretch could
+		// reset a run the same call then declined to count. Two round rules,
+		// both exact and both indifferent to how long a round took:
+		//
+		//   same round as the last attempt — the Refresh button, a Retry, any
+		//     on-demand re-poll — is this round's observation counted again.
+		//     Recorded above as an attempt, since someone did look; the run does
+		//     not move. Guarding each button is a race the buttons win; the
+		//     record refusing to count a round twice is not.
+		//   a round went by with no attempt on this provider — it was disabled,
+		//     or the record was written by another process — and the run is not
+		//     one episode.
+		//
+		// What no round number can see stays time-bound: the stretch between one
+		// process and the next (RunGap, floored at failureRunGap — within a
+		// process the rounds decide, and a round can cost minutes, never an hour),
+		// and a blind stretch so long that the failures on either side are
+		// separate events. The latter is deliberately looser: a blind stretch is
+		// an expected state, the app polling through a network outage, and only
+		// becomes disqualifying when the run is no longer one continuous episode.
+		if obs.Round != 0 && obs.Round == prevRound {
+			break
 		}
-		informativeWindow := max(informativeRunGapFactor*gap, minInformativeWindow)
-		pollingStopped := !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) > gap
+		roundSkipped := obs.Round != 0 && prevRound != 0 && obs.Round != prevRound+1
+		stoppedGap := max(obs.RunGap, failureRunGap)
+		informativeWindow := max(informativeRunGapFactor*obs.RunGap, minInformativeWindow)
+		pollingStopped := roundSkipped ||
+			(!prevAttempt.IsZero() && obs.At.Sub(prevAttempt) > stoppedGap)
 		learnedNothingTooLong := !cov.LastInformative.IsZero() &&
 			obs.At.Sub(cov.LastInformative) > informativeWindow
-		// The run counts polling ROUNDS, not calls. Anything that can re-enter
-		// the poll on demand — the Retry affordance, the "Refresh now" button,
-		// any future trigger — would otherwise let a user advance the counter as
-		// fast as they can click and manufacture the sustained run the verdict
-		// exists to require. Guarding each button is a race the buttons win; the
-		// counter refusing to move faster than the cadence is not.
-		//
-		// The attempt itself is still recorded above: someone did look.
-		//
 		// The reset and the increment are one decision, not two. Splitting them
 		// let a call reset the run to zero and then decline to count, leaving a
 		// record whose last informative observation is a FAILURE and whose run
-		// reads zero — which the verdict resolves to healthy. A rate limit that
-		// can invent health is worse than no rate limit.
-		tooSoonToCount := !prevAttempt.IsZero() && obs.At.Sub(prevAttempt) < gap/4
-		if tooSoonToCount {
-			break
-		}
+		// reads zero — which the verdict resolves to healthy.
 		if pollingStopped || learnedNothingTooLong {
 			cov.ConsecutiveFailures = 0
 		}
@@ -677,5 +730,8 @@ func Load(path string, capacity int) (*History, error) {
 	// the file.
 	dropFutureDated(snap.Coverage)
 	maps.Copy(h.coverage, snap.Coverage)
+	for _, cov := range h.coverage {
+		h.round = max(h.round, cov.LastRound)
+	}
 	return h, nil
 }

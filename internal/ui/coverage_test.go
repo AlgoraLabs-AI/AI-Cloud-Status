@@ -96,7 +96,7 @@ func TestCoverageObservation(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := coverageObservation(tc.st, tc.noLink, tc.cancelled, 0)
+			got := coverageObservation(tc.st, tc.noLink, tc.cancelled, 0, 0)
 			if got != tc.want {
 				t.Errorf("coverageObservation() = %+v, want %+v", got, tc.want)
 			}
@@ -113,14 +113,14 @@ func TestCoverageObservationFeedsRecordCoverageCorrectly(t *testing.T) {
 
 	// One real read, then the link dies and stays dead for twenty rounds.
 	h.RecordCoverage("p", coverageObservation(
-		provState{when: t0, outcome: history.OutcomeReadable}, false, false, time.Hour))
+		provState{when: t0, outcome: history.OutcomeReadable}, false, false, 1, time.Hour))
 	for i := range 20 {
 		st := provState{
 			when:    t0.Add(time.Duration(i+1) * time.Minute),
 			outcome: history.OutcomeTransport,
 			err:     errors.New("no such host"),
 		}
-		h.RecordCoverage("p", coverageObservation(st, true, false, time.Hour))
+		h.RecordCoverage("p", coverageObservation(st, true, false, uint64(i+2), time.Hour))
 	}
 
 	cov, ok := h.Coverage("p")
