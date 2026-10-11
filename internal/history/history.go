@@ -7,6 +7,8 @@ package history
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"sort"
@@ -142,6 +144,12 @@ type CoverageEntry struct {
 	// Zero means the entry predates round numbering, or was last touched by a
 	// caller that has none; the round rules then abstain for that one judgement.
 	LastRound uint64 `json:"lr,omitempty"`
+	// LastFailureRound is the round whose failure the run last COUNTED. A round
+	// counts at most one failure however many times it is polled, and this is
+	// the fact that rule is checked against — not LastRound, which a blind or
+	// skipped attempt also advances: a round that opened blind and then saw a
+	// real failure on a manual refresh has exactly one failure to count.
+	LastFailureRound uint64 `json:"lfr,omitempty"`
 }
 
 // failureRunGap is the floor on how long attempts may be apart before the
@@ -187,10 +195,13 @@ const CoverageFutureSlack = time.Hour
 // caller that actually made the request.
 //
 // Blind is the load-bearing field. It marks an attempt that tells us nothing
-// about THIS feed because the machine had no connectivity at all — the same
-// distinction internal/ui already draws on the custom-URL path before feeding
-// its failure tracker. A blind attempt still records that someone was watching;
-// it must never count as evidence against the provider.
+// about THIS feed because the machine had no connectivity at all. A blind
+// attempt still records that someone was watching; it must never count as
+// evidence against the provider. The caller decides blindness, and which
+// witness it uses matters: the provider path keys it on the connectivity probe,
+// while the custom-URL path in internal/ui still keys its own unknown-sample
+// rule on the offline latch — the two are NOT the same rule, and the latch is
+// the weaker witness because it folds in "every provider failed".
 type CoverageObservation struct {
 	At    time.Time
 	OK    bool
@@ -203,7 +214,12 @@ type CoverageObservation struct {
 	// Without this, a skipped poll falls to the failure branch and an Optional
 	// provider accumulates a sustained "failure" run for working exactly as
 	// intended.
-	Skipped      bool
+	Skipped bool
+	// FailureClass is one of the Outcome constants when the poll FAILED, and
+	// empty otherwise — on a success, a skip and a blind attempt alike. The
+	// recorder reads it on the failure branch alone today; the contract is
+	// stated here so a caller that fills it on other branches is wrong by the
+	// field's own terms, not merely unused.
 	FailureClass string
 	// Round is the scheduled polling round this observation belongs to, from
 	// History.NextRound. It is the fact the failure-run rules are about: a run
@@ -338,11 +354,12 @@ func (h *History) Last(id string) (time.Time, int) {
 }
 
 // RecordCoverage updates check id's attendance record for one poll: the attempt
-// always, and either the success time or the failure class.
+// always, and either the success time or the failure class — see
+// CoverageObservation for what each field asserts.
 //
-// failureClass is one of the Outcome constants, or "" on success. Callers on the
-// ping and custom-URL paths do not use this — coverage answers "could the feed be
-// read", which is only a question for checks that HAVE a feed.
+// Callers on the ping and custom-URL paths do not use this — coverage answers
+// "could the feed be read", which is only a question for checks that HAVE a
+// feed.
 func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -387,9 +404,15 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// Nothing was fetched because there was nothing to fetch. Unlike a blind
 		// attempt, this DOES say something: whatever the feed used to fail with no
 		// longer applies, so keeping the old class would report a failure the
-		// provider does not have any more. The failure RUN is untouched — a skip
-		// is not a success either.
+		// provider does not have any more — and the run ends with it, because a
+		// run is attempts that KEEP FAILING, and a poll that fetched nothing is
+		// not a failing attempt. Clearing one without the other left a record
+		// that was a sustained failure with no failure class, which the verdict
+		// read as broken and the report printed with an empty cause. A skip is
+		// not a success either: LastInformative stays where it was, so the
+		// verdict falls to unknown rather than to healthy.
 		cov.LastFailureClass = ""
+		cov.ConsecutiveFailures = 0
 	case obs.Blind:
 		// Either the machine had no connectivity, or there was nothing to fetch.
 		// Neither is evidence about this feed. Record that we looked; change
@@ -423,11 +446,13 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// reset a run the same call then declined to count. Two round rules,
 		// both exact and both indifferent to how long a round took:
 		//
-		//   same round as the last attempt — the Refresh button, a Retry, any
-		//     on-demand re-poll — is this round's observation counted again.
-		//     Recorded above as an attempt, since someone did look; the run does
-		//     not move. Guarding each button is a race the buttons win; the
-		//     record refusing to count a round twice is not.
+		//   a round whose failure is already counted — the Refresh button, a
+		//     Retry, any on-demand re-poll — is not counted again. Recorded above
+		//     as an attempt, since someone did look; the run does not move.
+		//     Guarding each button is a race the buttons win; the record refusing
+		//     to count a round twice is not. Keyed on the round of the last
+		//     COUNTED failure, not the last attempt: a round that opened blind
+		//     and then saw a real failure on a refresh has one failure to count.
 		//   a round went by with no attempt on this provider — it was disabled,
 		//     or the record was written by another process — and the run is not
 		//     one episode.
@@ -439,7 +464,7 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// separate events. The latter is deliberately looser: a blind stretch is
 		// an expected state, the app polling through a network outage, and only
 		// becomes disqualifying when the run is no longer one continuous episode.
-		if obs.Round != 0 && obs.Round == prevRound {
+		if obs.Round != 0 && obs.Round == cov.LastFailureRound {
 			break
 		}
 		roundSkipped := obs.Round != 0 && prevRound != 0 && obs.Round != prevRound+1
@@ -458,6 +483,7 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		}
 		cov.LastInformative = obs.At
 		cov.LastFailureClass = obs.FailureClass
+		cov.LastFailureRound = obs.Round
 		cov.ConsecutiveFailures++
 	}
 	h.coverage[id] = cov
@@ -520,10 +546,16 @@ func LoadCoverage(path string) (map[string]CoverageEntry, bool, error) {
 // is what then refuses every later observation for that provider and rewrites
 // the file. A guard that covers one of two readers of the same file is not a
 // guard, it is a coin toss on which one sees the damage first.
+//
+// Each drop is logged: a discarded record is evidence LOST, and without a line
+// here the next reader — the app's own save, the audit — reports it as evidence
+// that never existed.
 func dropFutureDated(m map[string]CoverageEntry) {
 	cutoff := time.Now().Add(CoverageFutureSlack)
 	for id, cov := range m {
 		if cov.LastAttempt.After(cutoff) {
+			slog.Warn("history: coverage entry stamped in the future, discarded as clock damage",
+				"id", id, "last_attempt", cov.LastAttempt, "cutoff", cutoff)
 			delete(m, id)
 		}
 	}
@@ -713,6 +745,19 @@ func Load(path string, capacity int) (*History, error) {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		// A corrupt history file is non-fatal: start fresh rather than refuse to
 		// launch. History is best-effort, not authoritative state.
+		//
+		// But starting fresh over the file DESTROYS it: the next Save rewrites it
+		// without the coverage record, which is the one part of this file that
+		// is never pruned and is meant to answer "when did this feed last work"
+		// months later. A silent fresh start turns months of attendance into a
+		// record that reads as if the install were new. So the damaged file is
+		// moved aside, named for when it was found, and the loss is logged —
+		// the evidence is kept for a human, and the audit can tell "no record
+		// yet" from "a record was here and could not be read".
+		aside := fmt.Sprintf("%s.corrupt-%s", path, time.Now().UTC().Format("20060102-150405"))
+		renameErr := os.Rename(path, aside)
+		slog.Warn("history: file unreadable, starting fresh",
+			"path", path, "err", err, "moved_to", aside, "rename_err", renameErr)
 		return New(capacity), nil
 	}
 	for id, buf := range snap.Series {

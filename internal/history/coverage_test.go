@@ -240,10 +240,9 @@ func TestConsecutiveFailuresIsWhatMakesAVerdictPossible(t *testing.T) {
 	worked := time.Now().Add(-72 * time.Hour)
 	h.RecordCoverage("p", CoverageObservation{At: worked, OK: true})
 
-	// Spaced like real rounds: the failure counter deliberately refuses to move
-	// faster than a quarter of the run-gap, so that a user hammering a manual
-	// refresh cannot manufacture a "sustained" run. RunGap defaults to an hour
-	// here, so 20 minutes apart is comfortably a distinct round.
+	// Spaced like real rounds, with no round numbers: the recorder then has only
+	// time to go on, and 20 minutes apart is well inside the hour after which
+	// attempts count as stopped polling.
 	for i := range 30 {
 		h.RecordCoverage("p", CoverageObservation{
 			At: worked.Add(time.Duration(i+1) * 20 * time.Minute), FailureClass: OutcomeHTTP,
@@ -390,8 +389,8 @@ func TestLoadCoverageDropsFutureDatedEntries(t *testing.T) {
 func TestBlindAttemptsDoNotBreakAFailureRun(t *testing.T) {
 	h := New(10)
 	t0 := time.Now().Add(-8 * time.Hour)
-	gap := time.Hour         // so a distinct round is >= 15 minutes apart
-	step := 20 * time.Minute // and the blind stretch stays inside the 6h informative window
+	gap := time.Hour         // attempts further apart than this are stopped polling
+	step := 20 * time.Minute // well inside it, and the blind stretch stays inside the 6h informative window
 
 	// Five real failures, a stretch of blind polls, then more real failures. The
 	// blind stretch never interrupts the ATTEMPTS, so the run continues.
@@ -464,6 +463,61 @@ func TestFastFailureAfterSlowRoundStillCounts(t *testing.T) {
 	}
 	if cov.LastFailureClass != OutcomeHTTP {
 		t.Errorf("LastFailureClass = %q, want the second round's %q", cov.LastFailureClass, OutcomeHTTP)
+	}
+}
+
+// TestABlindRoundThenARealFailureInItCountsOnce: a round that opened blind and
+// then saw a real failure on a manual refresh has exactly one failure to count.
+// Keying "already counted this round" on the last ATTEMPT's round discarded that
+// failure — the round's only informative observation — and left the staleness
+// clock running from an older timestamp.
+func TestABlindRoundThenARealFailureInItCountsOnce(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+
+	h.RecordCoverage("p", CoverageObservation{At: t0, Blind: true, Round: 1})
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(10 * time.Second), FailureClass: OutcomeHTTP, Round: 1,
+	})
+	// A second refresh in the same round changes nothing more.
+	h.RecordCoverage("p", CoverageObservation{
+		At: t0.Add(20 * time.Second), FailureClass: OutcomeTransport, Round: 1,
+	})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1 — one round, one failure, however many polls", cov.ConsecutiveFailures)
+	}
+	if !cov.LastInformative.Equal(t0.Add(10 * time.Second)) {
+		t.Errorf("LastInformative = %v, want the counted failure at +10s", cov.LastInformative)
+	}
+	if cov.LastFailureClass != OutcomeHTTP {
+		t.Errorf("LastFailureClass = %q, want the counted failure's %q", cov.LastFailureClass, OutcomeHTTP)
+	}
+}
+
+// TestSkippedPollEndsAFailureRun: a run is attempts that keep failing, and a poll
+// that fetched nothing by design is not a failing attempt. Clearing the class
+// while keeping the count produced a "sustained failure" with no cause.
+func TestSkippedPollEndsAFailureRun(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	for r := range uint64(5) {
+		h.RecordCoverage("p", CoverageObservation{
+			At: t0.Add(time.Duration(r) * time.Minute), FailureClass: OutcomeHTTP, Round: r + 1,
+		})
+	}
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(5 * time.Minute), Skipped: true, Round: 6})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d after a skip, want 0", cov.ConsecutiveFailures)
+	}
+	if cov.LastFailureClass != "" {
+		t.Errorf("LastFailureClass = %q after a skip, want empty", cov.LastFailureClass)
+	}
+	if !cov.LastInformative.Equal(t0.Add(4 * time.Minute)) {
+		t.Error("a skip is not a success: LastInformative must stay at the last real failure")
 	}
 }
 

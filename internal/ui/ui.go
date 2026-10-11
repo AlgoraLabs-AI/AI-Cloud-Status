@@ -170,6 +170,10 @@ type Controller struct {
 	cfg        config.Config
 	engine     *monitor.Engine
 	provStates map[string]provState
+	// round is the scheduled polling round in progress, minted by runProviders
+	// from History.NextRound. A manual retry records under it so the coverage
+	// record counts it as this round's observation, never as a round of its own.
+	round uint64
 	// lastRoundAnyOK is whether ANY provider read its feed in the previous round.
 	// It is the independent proof of connectivity for machines whose networks
 	// block the probe targets — and it is not circular, because it is a DIFFERENT
@@ -353,9 +357,9 @@ func feedOutcome(k providers.FeedFailure) string {
 //	          when cancellation lands during a backoff, so the error value is
 //	          silent about cancellation exactly when it matters.
 //	round     the scheduled polling round this poll belongs to, from
-//	          History.NextRound — zero for a poll outside any round, such as a
-//	          manual retry. The record counts rounds, not polls, so an
-//	          on-demand re-poll must carry the round in progress, not a new one.
+//	          History.NextRound — zero only before the first round is minted.
+//	          The record counts rounds, not polls, so an on-demand re-poll (a
+//	          Retry, "Refresh now") carries the round in progress, not a new one.
 //	runGap    how long attempts may be apart before the polling is deemed to
 //	          have stopped — the app closed, the machine asleep. Derived from
 //	          the configured cadence, which is all that matters for it: within a
@@ -389,11 +393,11 @@ func coverageObservation(st provState, noLink, cancelled bool, round uint64, run
 		// at once.
 		Blind: st.err != nil && (noLink || cancelled),
 		// Only set when the poll actually FAILED. RecordCoverage happens to read
-		// this field on that branch alone today, but its own doc says the value
-		// is "a failure class, or empty on success" — so passing "readable" or
-		// "skipped" here violates the contract and quietly waits for someone to
-		// hoist the assignment out of the failure branch, at which point a
-		// healthy feed persists LastFailureClass="readable".
+		// this field on that branch alone today, but the field's own doc says it
+		// is a failure class or empty — so passing "readable" or "skipped" here
+		// violates the contract and quietly waits for someone to hoist the
+		// assignment out of the failure branch, at which point a healthy feed
+		// persists LastFailureClass="readable".
 		FailureClass: failureClassOf(st),
 	}
 }
@@ -1496,6 +1500,16 @@ func (c *Controller) checkTotalLoss(byID map[string]monitor.TargetStatus) {
 	c.saveOutageState()
 }
 
+// nextRound mints the next scheduled polling round and publishes it as the one
+// in progress, for the manual-retry path to record under.
+func (c *Controller) nextRound() uint64 {
+	round := c.history.NextRound()
+	c.mu.Lock()
+	c.round = round
+	c.mu.Unlock()
+	return round
+}
+
 func (c *Controller) runProviders(ctx context.Context) {
 	defer logPanic("runProviders")
 	first := time.Now().Add(startupDelay)
@@ -1510,7 +1524,7 @@ func (c *Controller) runProviders(ctx context.Context) {
 	// progress, so the coverage record sees it as the same round and does not
 	// count it twice — that is what makes a failure run count rounds and not
 	// clicks, with no rate limit anywhere.
-	round := c.history.NextRound()
+	round := c.nextRound()
 	for {
 		c.pruneExpiredRegionMutes() // expire timed region deactivations + notify "resumed"
 		c.pruneExpiredSilences()    // expire timed per-check silences (silently)
@@ -1533,7 +1547,7 @@ func (c *Controller) runProviders(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(interval):
-			round = c.history.NextRound()
+			round = c.nextRound()
 		case <-c.providerTrigger:
 		}
 	}
@@ -1549,16 +1563,21 @@ func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	// connectivity event leaving an inconsistent attendance record across the
 	// fleet. Every provider in a round must be judged against the same answer.
 	//
-	// What this does NOT do, stated so nobody reads more into it: the latch is
-	// necessarily behind a drop that happens DURING the round, and it is false on
-	// the very first round of the process, so the first round of an offline
-	// episode records a real failure against every provider. That costs one
-	// failure per episode and no more — later rounds see the latch and go blind,
+	// What this does NOT do, stated so nobody reads more into it. The witness is
+	// necessarily behind a drop that happens DURING the round: providers polled
+	// before the probe notices record a real failure, and that costs one failure
+	// per episode and no more — later rounds see the probe's answer and go blind,
 	// and any successful poll resets the counter to zero — which is well inside
-	// the sustained run a verdict needs. Recording coverage after the round
-	// completes would close even that, at the cost of restructuring the hot path.
-	// The witness for "this poll could not see anything" is the CONNECTIVITY
-	// PROBE, not the offline latch.
+	// the sustained run a verdict needs. And on the FIRST round of a process the
+	// probe has not answered yet (both loops wake from the same startup delay,
+	// and the probes take seconds), so connJudged is false and that round is
+	// recorded BLIND against every provider: no witness is not a clean bill of
+	// health, see below. The cost is the mirror image — one real failure
+	// dropped per launch, and an app opened and closed inside a single round
+	// accumulates no evidence against a broken feed. Recording coverage after
+	// the probe has answered would close both, at the cost of restructuring the
+	// hot path. The witness for "this poll could not see anything" is the
+	// CONNECTIVITY PROBE, not the offline latch.
 	//
 	// monitor.Evaluate mixes two very different things into that latch: the ping
 	// result, which is independent evidence, and "every provider was
@@ -1648,11 +1667,14 @@ func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 			// failure class: an Optional provider with no public feed was looked
 			// at, and it is not broken.
 			//
-			// Blind mirrors the custom-URL path exactly: a failed poll while the
-			// machine itself has no connectivity says nothing about THIS feed, and
-			// counting it would blame all fifteen providers for the user's router
-			// — a fault that now reaches the audit's exit code, so it must not be
-			// recorded from an unreadable observation.
+			// Blind: a failed poll while the machine itself has no connectivity
+			// says nothing about THIS feed, and counting it would blame all
+			// fifteen providers for the user's router — a fault that now reaches
+			// the audit's exit code, so it must not be recorded from an unreadable
+			// observation. The custom-URL path applies the same IDEA to its
+			// unknown samples but keys it on the offline latch (urlchecks.go),
+			// the witness this path rejects as circular; the two are not the same
+			// rule, and "fixing one to match the other" must go towards the probe.
 			//
 			// The offline answer is the round's snapshot, not a live read, so
 			// every provider in this round is judged against the same state.
@@ -1866,25 +1888,25 @@ func (c *Controller) recheckProvider(p providers.Provider) {
 		// still-broken provider silently emptied the list it was showing.
 		st = carryLastOK(c.provStates[p.ID], st)
 		c.provStates[p.ID] = st
-		c.mu.Unlock()
-		// Only a SUCCESSFUL manual retry is recorded. Its value is letting the
-		// user's own observation clear a failure run they just watched end —
+		// A manual retry is recorded like a scheduled poll, under the round in
+		// progress and against the same connectivity witness. Its success lets
+		// the user's own observation clear a failure run they just watched end —
 		// otherwise the record contradicts what they are looking at, and that
-		// record now drives the audit's exit code.
+		// record now drives the audit's exit code. Its FAILURE counts too: the
+		// record counts at most one failure per round however many polls the
+		// round saw, so ten clicks in a minute cannot manufacture a run — and
+		// recording only the successes made the record manipulable in one
+		// direction, where a lucky click on a flapping feed reset a nine-round
+		// run while ten failed clicks changed nothing.
 		//
-		// Its FAILURES are deliberately not recorded. The scheduled path is
-		// rate-limited to one increment per poll round; this one is rate-limited
-		// only by how fast someone can click, so counting failures here would let
-		// ten clicks in a minute manufacture exactly the "sustained run" the
-		// verdict exists to require.
-		// Every judgement this builder takes is unreachable from here, so all
-		// four are passed as their zero values rather than computed: only OK
-		// observations survive the guard below, and RecordCoverage reads Blind,
-		// Round and RunGap on the failure branch alone. Computing them would take
-		// two locks for values nothing downstream can consume.
-		if obs := coverageObservation(st, false, false, 0, 0); obs.OK {
-			c.history.RecordCoverage(p.ID, obs)
-		}
+		// cancelled is false: this context's 30s deadline is the retry's own
+		// patience, not a shutdown, and a feed that does not answer in 30s is a
+		// transport failure, not a blind attempt.
+		round := c.round
+		noLink := (c.connDown || !c.connJudged) && !c.lastRoundAnyOK
+		c.mu.Unlock()
+		c.history.RecordCoverage(p.ID, coverageObservation(
+			st, noLink, false, round, 2*c.providerInterval()))
 		c.refresh()
 	}()
 }

@@ -323,8 +323,9 @@ type Report struct {
 	GeneratedAt   time.Time
 	AlertLogStart time.Time // zero if alert-log.jsonl doesn't exist / is empty
 	Providers     []ProviderReport
-	// HistoryPresent says whether history.json existed, which is what makes the
-	// coverage tier answerable at all.
+	// HistoryPresent says whether the coverage tier can ANSWER: history.json was
+	// there, it parsed, and it holds at least one coverage entry. Whether the
+	// file merely exists is HistoryFound's job.
 	//
 	// It is reported separately from the alert log and the captures because the
 	// three are NOT the same grade of evidence: alert-log.jsonl and feed-samples/
