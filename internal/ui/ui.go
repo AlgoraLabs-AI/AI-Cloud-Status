@@ -126,6 +126,10 @@ const historyLoadRetryAfter = time.Second
 // than any scheduled poll tolerates, a transport failure the record counts.
 const retryDeadline = 50 * time.Second
 
+// quitDrain bounds how long quit waits for cancelled polls to file their
+// observations before the shutdown save (see quit).
+const quitDrain = 3 * time.Second
+
 // firstProbeWait bounds how long the first provider round waits for the
 // connectivity probe's first answer. The probe runs 3s-timeout checks against a
 // handful of targets, so it is normally done within a few seconds of the startup
@@ -194,8 +198,11 @@ type Controller struct {
 	round uint64
 	// runCtx is the app's run context, so work started by a user action — a
 	// manual retry — ends when the app does instead of recording into a History
-	// that will never be saved again.
-	runCtx context.Context
+	// that will never be saved again. runCancel ends it from quit, BEFORE the
+	// shutdown save, and inflight counts the polls that still have to file.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+	inflight  sync.WaitGroup
 	// lastRoundAnyOK is whether ANY provider read its feed in the previous round.
 	// It is the independent proof of connectivity for machines whose networks
 	// block the probe targets — and it is not circular, because it is a DIFFERENT
@@ -515,6 +522,13 @@ func New() *Controller {
 		// log line is what remains.
 		aside, mvErr := history.SetAside(histPath)
 		slog.Warn("history could not be loaded; starting empty", "err", err, "moved_to", aside, "move_err", mvErr)
+		if mvErr != nil {
+			// The aside failed for the reason the read did: the file is still
+			// held, or not ours to touch. The record on disk is then the one
+			// thing this run must not write over — with no path there is no
+			// save, and the next launch reads the file whole.
+			histPath = ""
+		}
 	}
 	hist.Prune(providerUptimeWindow+time.Hour, time.Now())
 
@@ -649,6 +663,7 @@ func (c *Controller) Run() {
 	defer cancel()
 	c.mu.Lock()
 	c.runCtx = ctx
+	c.runCancel = cancel
 	c.mu.Unlock()
 	go c.runConnectivity(ctx)
 	go c.runProviders(ctx)
@@ -706,8 +721,38 @@ func (c *Controller) saveWindowState() {
 // quit persists state (window size + history) and exits the app.
 func (c *Controller) quit() {
 	c.saveWindowState()
+	// Stop the polls BEFORE the shutdown save, and wait for them to file what
+	// they have. A poll still in flight at quit used to be recorded after the
+	// save and never reach disk, so that provider's LastRound was persisted
+	// one round behind the fleet, and the next launch read the round it was
+	// missing as a skipped one — nine rounds of evidence lost to a quick
+	// restart. A cancelled poll files as a blind attempt, which carries the
+	// round number; the wait is bounded so a hung request cannot hold the
+	// quit.
+	c.mu.Lock()
+	cancel := c.runCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	c.drainPolls(quitDrain)
 	c.saveHistory()
 	c.app.Quit()
+}
+
+// drainPolls waits up to d for every provider poll in flight to file its
+// observation.
+func (c *Controller) drainPolls(d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		c.inflight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		slog.Warn("quit: polls still in flight after the drain bound; saving what is on the record", "bound", d)
+	}
 }
 
 // saveHistory persists the in-memory ring buffer and incident journal (best
@@ -1743,8 +1788,10 @@ func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	var wg sync.WaitGroup
 	for _, p := range list {
 		wg.Add(1)
+		c.inflight.Add(1)
 		go func(p providers.Provider) {
 			defer wg.Done()
+			defer c.inflight.Done()
 			st := c.checkProviderWithRetry(ctx, p)
 			// A poll cancelled by shutdown never got an answer from the feed, so
 			// counting it would let a user who launches and quits during the
@@ -2022,11 +2069,14 @@ func (c *Controller) forceRefreshNow() {
 // recheckProvider re-runs a single provider's status check immediately (used by
 // the Retry affordance on error rows).
 func (c *Controller) recheckProvider(p providers.Provider) {
+	c.inflight.Add(1)
 	go func() {
+		defer c.inflight.Done()
 		// Derived from the app's run context so a quit cancels a retry in
-		// flight: an observation recorded after the shutdown save never reaches
-		// disk, and a refresh after teardown touches a UI that is gone. The 30s
-		// deadline on top is the retry's own patience.
+		// flight and waits for it to file (see quit): an observation recorded
+		// after the shutdown save never reaches disk, and a refresh after
+		// teardown touches a UI that is gone. retryDeadline on top is the
+		// retry's own patience.
 		c.mu.Lock()
 		base := c.runCtx
 		c.mu.Unlock()

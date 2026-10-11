@@ -872,3 +872,50 @@ func TestASameRoundFailureOfAnotherClassUpdatesTheClass(t *testing.T) {
 		t.Error("LastInformative must advance to the retry: something was learned at that instant")
 	}
 }
+
+// TestAStaleRetryDoesNotRenameTheFailure: a retry launched under round 7 that
+// lands after round 8 was counted is older information, however late it
+// arrives. Letting it rewrite the class reported a failure the newest scheduled
+// read did not see.
+func TestAStaleRetryDoesNotRenameTheFailure(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeHTTP, Round: 7})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(time.Minute), FailureClass: OutcomeHTTP, Round: 8})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(70 * time.Second), FailureClass: OutcomeTransport, Round: 7})
+
+	cov, _ := h.Coverage("p")
+	if cov.LastFailureClass != OutcomeHTTP {
+		t.Errorf("LastFailureClass = %q after a stale round-7 retry, want round 8's %q", cov.LastFailureClass, OutcomeHTTP)
+	}
+	if !cov.LastInformative.Equal(t0.Add(time.Minute)) {
+		t.Errorf("LastInformative = %v, want round 8's poll — the stale retry learned nothing newer", cov.LastInformative)
+	}
+	if cov.ConsecutiveFailures != 2 {
+		t.Errorf("ConsecutiveFailures = %d, want 2", cov.ConsecutiveFailures)
+	}
+	if !cov.LastAttempt.Equal(t0.Add(70 * time.Second)) {
+		t.Error("the stale retry was still an attempt and LastAttempt must say so")
+	}
+}
+
+// TestAStaleRetryCannotUndoARecovery: a retry launched during a failure run
+// that completes after the next round's scheduled poll SUCCEEDED is not a new
+// failure. Counting it flipped the record back to failing as the last thing
+// learned, with the row in error, while the newest scheduled read worked.
+func TestAStaleRetryCannotUndoARecovery(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeHTTP, Round: 4})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(time.Minute), OK: true, Round: 5})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(80 * time.Second), FailureClass: OutcomeTransport, Round: 4})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 0 || cov.LastFailureClass != "" {
+		t.Errorf("after a success in round 5 and a stale round-4 retry: cf=%d class=%q, want 0 and empty",
+			cov.ConsecutiveFailures, cov.LastFailureClass)
+	}
+	if !cov.LastInformative.Equal(t0.Add(time.Minute)) {
+		t.Error("LastInformative must stay at the success: the stale retry is not newer information")
+	}
+}

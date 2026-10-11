@@ -487,14 +487,22 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// separate events. The latter is deliberately looser: a blind stretch is
 		// an expected state, the app polling through a network outage, and only
 		// becomes disqualifying when the run is no longer one continuous episode.
-		// "<=", not "==": a retry that completes late carries a round number
-		// BELOW the last counted one, and is still an observation of a round
-		// whose failure is already on the record.
-		if obs.Round != 0 && obs.Round <= cov.LastFailureRound {
-			// Only the COUNT is deduplicated. The class and the informative
-			// stamp still advance: a retry that fails for a different reason
-			// than the round's first poll has learned something, and the report
-			// must name the failure the feed has now, not the one it had.
+		// A failure from a round OLDER than the latest on the record is a stale
+		// retry: a manual poll launched under round N that completed after round
+		// N+1 was recorded — possibly after a SUCCESS in N+1. It is an attempt
+		// (LastAttempt moved above) and nothing more. Counting it flipped a
+		// just-recovered record back to failing, and naming its class reported a
+		// failure the newest scheduled read did not see.
+		if obs.Round != 0 && prevRound != 0 && obs.Round < prevRound {
+			break
+		}
+		// The same round as the failure already counted: only the COUNT is
+		// deduplicated. The class and the informative stamp still advance — a
+		// retry that fails for a different reason than the round's first poll
+		// has learned something, and the report must name the failure the feed
+		// has now, not the one it had. (A round below the counted one was
+		// handled above; it cannot be newer information.)
+		if obs.Round != 0 && obs.Round == cov.LastFailureRound {
 			cov.LastInformative = obs.At
 			cov.LastFailureClass = obs.FailureClass
 			break
@@ -505,10 +513,18 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		roundSkipped := obs.Round != 0 && prevRound != 0 && obs.Round > prevRound+1
 		stoppedGap := max(obs.RunGap, failureRunGap)
 		informativeWindow := max(informativeRunGapFactor*obs.RunGap, minInformativeWindow)
+		// Elapsed time on the WALL clock. obs.At and the stamps it becomes carry
+		// a monotonic reading within a process, and Sub prefers that reading —
+		// but the monotonic clock does not advance through system sleep on
+		// macOS and Linux, so a lid closed for five hours measured as one
+		// interval and the stopped-polling gap this exists to catch was
+		// invisible. The ordering guard above keeps the monotonic comparison,
+		// where a clock STEP is the hazard; the gaps need the clock that moved.
+		wallAt := obs.At.Round(0)
 		pollingStopped := roundSkipped ||
-			(!prevAttempt.IsZero() && obs.At.Sub(prevAttempt) > stoppedGap)
+			(!prevAttempt.IsZero() && wallAt.Sub(prevAttempt.Round(0)) > stoppedGap)
 		learnedNothingTooLong := !cov.LastInformative.IsZero() &&
-			obs.At.Sub(cov.LastInformative) > informativeWindow
+			wallAt.Sub(cov.LastInformative.Round(0)) > informativeWindow
 		// The reset and the increment are one decision, not two. Splitting them
 		// let a call reset the run to zero and then decline to count, leaving a
 		// record whose last informative observation is a FAILURE and whose run
@@ -558,7 +574,9 @@ func dropFutureDated(m map[string]CoverageEntry) (dropped []string) {
 			delete(m, id)
 			dropped = append(dropped, id)
 		case cov.LastAttempt.After(now):
-			slog.Warn("history: coverage entry stamped slightly ahead of now, clamped so the record can move",
+			// Worded for every reader of the file: the app, which rewrites the
+			// clamped record, and the audit, which reads and moves nothing.
+			slog.Warn("history: coverage entry stamped slightly ahead of now, read as now",
 				"id", id, "last_attempt", cov.LastAttempt, "now", now)
 			// Every stamp, not only the one the high-water mark reads: a
 			// LastSuccess or LastInformative left in the future outranks
