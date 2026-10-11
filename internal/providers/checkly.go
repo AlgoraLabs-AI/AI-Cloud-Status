@@ -13,14 +13,25 @@ import (
 // Atlassian Statuspage — the old /api/v2/summary.json endpoint returns the SPA's
 // HTML, which is why Mistral always showed up as feed-unreachable. The page's own
 // front-end reads open incidents from this server-proxied Checkly endpoint, which
-// returns clean JSON.
+// returns clean JSON — when it answers.
+//
+// Optional, because the whole host now sits behind a Cloudflare managed
+// challenge: every path, the root included, answers 403 text/html "Just a
+// moment..." with Cf-Mitigated: challenge, to this client's User-Agent and to a
+// browser's alike, and no RSS/Atom alternative exists (feed.rss and feed.atom
+// 404, history.rss 401). A 403 is therefore "no public feed", the same way a 404
+// is for Groq: the provider stays on the board and is polled, the row reads
+// "feed unavailable" rather than an outage, and the alert audit does not fail
+// the run over a feed nobody outside a browser can read. If the challenge is
+// lifted the feed resumes with no change here.
 func init() {
 	RegisterParser(KindCheckly, func(_ Provider, data []byte) (Result, error) {
 		return parseCheckly(data)
 	})
 	Register(Provider{
 		ID: "mistral", Name: "Mistral", Category: CategoryAI, Kind: KindCheckly,
-		URL: "https://status.mistral.ai/api/status-page/mistral-ai/unresolved-incidents",
+		URL:      "https://status.mistral.ai/api/status-page/mistral-ai/unresolved-incidents",
+		Optional: true,
 	})
 }
 
