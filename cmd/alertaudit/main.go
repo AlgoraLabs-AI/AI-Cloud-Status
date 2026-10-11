@@ -191,7 +191,10 @@ func captureTierPhrase(present, diagnosticsOn bool) string {
 	if present {
 		return "CAPTURE tier present (feed-samples + alert-log)"
 	}
-	why := "diagnostics are OFF in config.json, so these were never written"
+	// The cause is stated only as far as config.json can establish it: the app
+	// also switches diagnostics on from the ACS_DEBUG environment variable,
+	// which this process cannot see.
+	why := "debug_logging is false in config.json, so unless the app ran with ACS_DEBUG set these were never written"
 	if diagnosticsOn {
 		why = "diagnostics are ON, so this corpus is genuinely empty rather than disabled"
 	}
@@ -286,7 +289,9 @@ func printReport(w io.Writer, r audit.Report) {
 			// the feed was ever READ, rather than inferring health from an absence.
 			verdict := p.FeedVerdict(r.GeneratedAt)
 			switch {
-			case verdict == audit.FeedBroken && p.FeedFault(r.GeneratedAt):
+			case p.FeedFault(r.GeneratedAt):
+				// FeedFault is FeedBroken plus enabled with a public feed, so it
+				// goes first and the next arm is the remainder.
 				note = fmt.Sprintf("  <- FEED NOT READABLE: %d consecutive failures (last: %s) — see the section below",
 					p.Coverage.ConsecutiveFailures, p.Coverage.LastFailureClass)
 			case verdict == audit.FeedBroken:

@@ -415,6 +415,10 @@ func (h *History) RecordCoverage(id string, obs CoverageObservation) {
 		// learned is a failure the record shows as a success.
 		cov.LastFailureRound = 0
 	case obs.Skipped:
+		// ...and, as a success does, it ends the round's failure: a real failure
+		// after it in the same round must be counted, or the record ends on a
+		// failure that the zeroed counter denies.
+		cov.LastFailureRound = 0
 		// Nothing was fetched because there was nothing to fetch. Unlike a blind
 		// attempt, this DOES say something: whatever the feed used to fail with no
 		// longer applies, so keeping the old class would report a failure the
@@ -550,7 +554,17 @@ func dropFutureDated(m map[string]CoverageEntry) (dropped int) {
 		case cov.LastAttempt.After(now):
 			slog.Warn("history: coverage entry stamped slightly ahead of now, clamped so the record can move",
 				"id", id, "last_attempt", cov.LastAttempt, "now", now)
+			// Every stamp, not only the one the high-water mark reads: a
+			// LastSuccess or LastInformative left in the future outranks
+			// observations made after it and ages as "just now" for as long as
+			// the clock takes to catch up.
 			cov.LastAttempt = now
+			if cov.LastSuccess.After(now) {
+				cov.LastSuccess = now
+			}
+			if cov.LastInformative.After(now) {
+				cov.LastInformative = now
+			}
 			m[id] = cov
 		}
 	}

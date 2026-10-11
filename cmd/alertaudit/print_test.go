@@ -252,7 +252,7 @@ func TestPrintReportEvidenceTierStates(t *testing.T) {
 			// recording was on and the window really was quiet.
 			"empty because diagnostics were never on",
 			audit.Report{GeneratedAt: base.GeneratedAt, HistoryPresent: true, HistoryFound: true},
-			"diagnostics are OFF in config.json",
+			"debug_logging is false in config.json",
 		},
 		{
 			"empty although diagnostics are on",

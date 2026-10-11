@@ -803,3 +803,48 @@ func TestSkippedPollIsNotAFeedFailure(t *testing.T) {
 		t.Errorf("LastFailureClass = %q, want empty — nothing failed", cov.LastFailureClass)
 	}
 }
+
+// TestAFailureAfterASkipInTheSameRoundCounts: a skip ends the run the way a
+// success does, so a real failure after it in the same round is a new fact.
+// Leaving LastFailureRound at the round let the once-per-round guard refuse
+// that failure, and the entry ended on a failure its zeroed counter denied.
+func TestAFailureAfterASkipInTheSameRoundCounts(t *testing.T) {
+	h := New(10)
+	t0 := time.Now().Add(-time.Hour)
+	h.RecordCoverage("p", CoverageObservation{At: t0, FailureClass: OutcomeHTTP, Round: 7})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(time.Second), Skipped: true, Round: 7})
+	h.RecordCoverage("p", CoverageObservation{At: t0.Add(2 * time.Second), FailureClass: OutcomeHTTP, Round: 7})
+
+	cov, _ := h.Coverage("p")
+	if cov.ConsecutiveFailures != 1 || cov.LastFailureClass != OutcomeHTTP {
+		t.Errorf("after fail, skip, fail in one round: cf=%d class=%q, want 1 and %q",
+			cov.ConsecutiveFailures, cov.LastFailureClass, OutcomeHTTP)
+	}
+}
+
+// TestAClampedEntryHasNoStampInTheFuture: the in-slack clamp must move every
+// stamp, not only LastAttempt. A LastSuccess or LastInformative left ahead of
+// now ages as "just now" until the clock catches up, and outranks observations
+// made after it.
+func TestAClampedEntryHasNoStampInTheFuture(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.json")
+	h := New(10)
+	h.RecordCoverage("p", CoverageObservation{At: time.Now().Add(40 * time.Minute), OK: true, Round: 3})
+	if err := h.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	h2, err := Load(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	cov, _ := h2.Coverage("p")
+	for name, at := range map[string]time.Time{
+		"LastAttempt": cov.LastAttempt, "LastSuccess": cov.LastSuccess, "LastInformative": cov.LastInformative,
+	} {
+		if at.After(now) {
+			t.Errorf("%s = %v is still in the future after the clamp (now %v)", name, at, now)
+		}
+	}
+}

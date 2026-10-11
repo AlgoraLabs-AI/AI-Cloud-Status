@@ -112,7 +112,7 @@ beside the executable and never anywhere else:
 | macOS | `~/Library/Application Support/AI-Cloud-Status/` |
 | Linux | `$XDG_CONFIG_HOME/AI-Cloud-Status/` (or `~/.config/AI-Cloud-Status/`) |
 
-A normal install writes exactly five things there, all of them your own state:
+A normal install writes these five things there, all of them your own state:
 
 | File | What it is |
 | --- | --- |
@@ -121,6 +121,8 @@ A normal install writes exactly five things there, all of them your own state:
 | `incidents.json` | The incident journal behind "Incident history — last 24 h" |
 | `open-outages.json` | Outages still open at shutdown, so their recovery alert is not swallowed |
 | `instance.lock` | The single-instance guard |
+
+One more can appear: if `history.json` cannot be read at launch (it was corrupt, or another program held it open), the app moves it to `history.json.corrupt` and starts a fresh one rather than overwrite it. That file is only kept for you to look at; it is safe to delete.
 
 **Nothing is sent anywhere.** The app talks to the services it monitors and to
 GitHub's release API (for the update check) and to nobody else. There is no
