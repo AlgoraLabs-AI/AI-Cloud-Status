@@ -21,7 +21,16 @@ func init() {
 		ID: testProviderID, Name: "Test Audit Provider", Category: providers.CategoryDev,
 		Kind: providers.KindStatuspage, URL: "https://example.invalid/summary.json",
 	})
+	// A page Kind owned by this test binary, with a parser that reads any
+	// body as one major incident: the archive round trip below depends on no
+	// production parser's anchors.
+	providers.RegisterPageParser(testPageKind, func(_ providers.Provider, _ []byte) (providers.Result, error) {
+		return providers.Result{Severity: providers.SevMajor, Incidents: []providers.Incident{{Summary: "page", Severity: providers.SevMajor}}}, nil
+	})
 }
+
+// testPageKind is the page Kind registered in init for the archive round trip.
+const testPageKind providers.Kind = "test-audit-page"
 
 // statuspageFixture builds a minimal Atlassian-Statuspage-shaped payload with
 // one unresolved incident. pageIndicator deliberately can (and in the
@@ -53,6 +62,41 @@ func writeCapture(t *testing.T, dir, provider string, ts time.Time, label string
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestLoadCapturesReadsWhatFeedCaptureWrites is the round trip the archive's
+// naming rests on: a page Kind's capture is written by the real FeedCapture
+// (gzipped, named .html.gz) and read back by the real loader, which keys on
+// the timestamp and the gzip magic and never on the suffix. A reader that
+// started filtering by ".json" would fail here, not in production.
+func TestLoadCapturesReadsWhatFeedCaptureWrites(t *testing.T) {
+	page := []byte("<html><body>a page</body></html>")
+	dir := t.TempDir()
+	p := providers.Provider{ID: "page-roundtrip", Name: "Page", Kind: testPageKind}
+	res, err := providers.ParseFeed(p, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providers.NewFeedCapture(filepath.Join(dir, "feed-samples")).Capture(p, page, res, nil)
+
+	// What was written is the providers package's contract (its naming test
+	// owns the suffix); this test only needs one file to exist to read back.
+	pdir := filepath.Join(dir, "feed-samples", p.ID)
+	files, err := os.ReadDir(pdir)
+	var names []string
+	for _, f := range files {
+		names = append(names, f.Name())
+	}
+	if err != nil || len(names) != 1 {
+		t.Fatalf("FeedCapture wrote %v (%v), want one capture", names, err)
+	}
+	caps, err := loadCaptures(pdir, p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caps) != 1 || caps[0].ParseErr != nil {
+		t.Errorf("loadCaptures read %+v, want the one capture %s with no parse error", caps, names[0])
+	}
 }
 
 // writeAlertLog writes alert-log.jsonl with the given entries.

@@ -867,10 +867,11 @@ func loadCaptures(dir string, p providers.Provider, regions []string) ([]Capture
 }
 
 // readCapture reads one archived feed payload, transparently decompressing a
-// gzipped one. Captures are written gzipped (they are JSON/XML and compress
-// ~10:1, which is what lets the corpus have a size budget at all), but a corpus
-// collected by an earlier build is plain — and that corpus is precisely the
-// evidence this tool exists to replay, so it must keep reading it.
+// gzipped one. Captures are written gzipped (they are JSON, XML or, for a page
+// Kind, HTML, and compress ~10:1, which is what lets the corpus have a size
+// budget at all), but a corpus collected by an earlier build is plain — and
+// that corpus is precisely the evidence this tool exists to replay, so it must
+// keep reading it.
 //
 // The suffix is not trusted on its own: the gzip magic number is checked, so a
 // file whose name lies is read as what it actually is rather than failing to
