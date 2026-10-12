@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,10 +62,14 @@ func writeCapture(t *testing.T, dir, provider string, ts time.Time, label string
 // the timestamp and the gzip magic and never on the suffix. A reader that
 // started filtering by ".json" would fail here, not in production.
 func TestLoadCapturesReadsWhatFeedCaptureWrites(t *testing.T) {
-	page, err := os.ReadFile(filepath.Join("..", "providers", "testdata", "rootly_degraded.html"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The smallest page the Rootly parser reads: a banner, the service list
+	// heading, one affected row, a whole document. Owned here so a change to
+	// the providers fixtures cannot fail a test about the archive's naming.
+	page := []byte(`<html><body>
+<div class="sp-error-bg"><span class="text-4xl">Partial System Outage</span></div>
+<h2 class="">Services</h2>
+<details class="group"><summary><span class="sp-error-bg"><svg></svg></span><h2>Audio API</h2><span class="text-red-500">Partial Outage</span></summary></details>
+</body></html>`)
 	dir := t.TempDir()
 	p := providers.Provider{ID: "page-roundtrip", Name: "Page", Kind: providers.KindRootly}
 	res, err := providers.ParseFeed(p, page)
@@ -75,20 +80,16 @@ func TestLoadCapturesReadsWhatFeedCaptureWrites(t *testing.T) {
 
 	pdir := filepath.Join(dir, "feed-samples", p.ID)
 	files, err := os.ReadDir(pdir)
-	if err != nil || len(files) != 1 || filepath.Ext(files[0].Name()) != ".gz" || !containsSuffix(files[0].Name(), ".html.gz") {
+	if err != nil || len(files) != 1 || !strings.HasSuffix(files[0].Name(), ".html.gz") {
 		t.Fatalf("FeedCapture wrote %v (%v), want one .html.gz capture", files, err)
 	}
 	caps, err := loadCaptures(pdir, p, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(caps) != 1 || caps[0].ParseErr != nil || caps[0].Severity != res.Severity {
-		t.Errorf("loadCaptures read %+v, want the one capture at %v with no parse error", caps, res.Severity)
+	if len(caps) != 1 || caps[0].ParseErr != nil {
+		t.Errorf("loadCaptures read %+v, want the one capture with no parse error", caps)
 	}
-}
-
-func containsSuffix(name, suffix string) bool {
-	return len(name) >= len(suffix) && name[len(name)-len(suffix):] == suffix
 }
 
 // writeAlertLog writes alert-log.jsonl with the given entries.

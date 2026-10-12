@@ -72,9 +72,9 @@ func TestFeedCaptureNamesAPageAsHTML(t *testing.T) {
 	fc.Capture(Provider{ID: "page", Kind: KindRootly}, readFixture(t, "rootly_degraded.html"), res, nil)
 	fc.Capture(Provider{ID: "feed", Kind: KindStatuspage}, readFixture(t, "statuspage_major.json"), res, nil)
 	for id, want := range map[string]string{"page": "-major.html.gz", "feed": "-major.json.gz"} {
-		files, _ := os.ReadDir(filepath.Join(dir, id))
-		if len(files) != 1 || !strings.HasSuffix(files[0].Name(), want) {
-			t.Errorf("%s capture named %v, want one file ending in %s", id, files, want)
+		files, err := os.ReadDir(filepath.Join(dir, id))
+		if err != nil || len(files) != 1 || !strings.HasSuffix(files[0].Name(), want) {
+			t.Errorf("%s capture named %v (%v), want one file ending in %s", id, files, err, want)
 		}
 	}
 }
