@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -61,7 +62,8 @@ const captureTimeFormat = "20060102-150405"
 // until this directory collects evidence.
 //
 // Samples land in Dir/<provider-id>/<timestamp>Z-<state>.json.gz. Consecutive
-// identical payloads are deduplicated by content hash; files older than
+// identical payloads are deduplicated by content hash (for a page Kind, by
+// what the parser read from it: see captureKey); files older than
 // captureRetention are pruned per provider, and the corpus is held under a
 // stated size budget (see perProviderBytes / totalBytes) rather than growing
 // with the calendar.
@@ -105,7 +107,7 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 		return // operational, nothing to learn from
 	}
 
-	sum := sha256.Sum256(data)
+	sum := sha256.Sum256(captureKey(p, data, res, parseErr))
 	hash := hex.EncodeToString(sum[:8])
 	f.mu.Lock()
 	if f.lastHash == nil {
@@ -148,6 +150,31 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 	slog.Info("feed sample captured", "provider", p.ID, "state", state, "file", name)
 	f.prune(dir)
 	pruneToBudget(f.Dir)
+}
+
+// captureKey is what the dedup hash is taken over. A feed's bytes are stable
+// between polls, so the body is its own key. A status PAGE carries a fresh
+// CSRF token and fresh nonces on every response, so hashing the body would
+// never find a duplicate and an open incident would write a new capture of
+// the whole page every minute, evicting its own onset from the budget before
+// the incident ends; and a denylist of the volatile markup would be one more
+// thing to keep in step with the host. For a page the key is what the parser
+// READ from it (the Result), which is "same state" directly; a page the
+// parser could not read is keyed on WHY (the error), so a markup change is
+// one capture per failure shape rather than one per poll. The bytes archived
+// are the original ones either way.
+func captureKey(p Provider, data []byte, res Result, parseErr error) []byte {
+	if !p.Kind.Page() {
+		return data
+	}
+	if parseErr != nil {
+		return []byte(parseErr.Error())
+	}
+	key, err := json.Marshal(res)
+	if err != nil {
+		return data
+	}
+	return key
 }
 
 // writeGzip writes data to path, gzipped, via a temp file and a rename so a

@@ -334,13 +334,17 @@ type Controller struct {
 
 // provState is the latest known state of a provider check.
 type provState struct {
-	checked  bool
-	skipped  bool
-	err      error
-	res      providers.Result
-	when     time.Time
-	latency  time.Duration
-	attempts int
+	checked bool
+	skipped bool
+	// challenged marks a skip that was a Cloudflare challenge outlasting every
+	// attempt, so the next such poll can tell a persisting state from a new
+	// one and log only the transition.
+	challenged bool
+	err        error
+	res        providers.Result
+	when       time.Time
+	latency    time.Duration
+	attempts   int
 	// lastOK is the last time the feed was actually READ, which is not `when`
 	// (that advances on every attempt, failed ones included). It survives a
 	// failed poll so the last-24h history can still say whether an incident was
@@ -1966,8 +1970,11 @@ func (c *Controller) recordPoll(p providers.Provider, st provState, interest []s
 
 // checkProviderWithRetry fetches p's feed, retrying a failed READ with
 // exponential backoff and full jitter. ErrNoFeed (no public feed) and success
-// both stop immediately; only an unreadable feed is retried. The measured
-// latency is the duration of the final attempt.
+// both stop immediately; an unreadable feed is retried, and so is a Cloudflare
+// challenge (ErrChallenged): its verdict changes from one connection to the
+// next, so the next attempt is a fresh chance rather than the same answer
+// again. A challenge that outlasts the attempts IS no public feed, and is
+// filed as one. The measured latency is the duration of the final attempt.
 func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Provider) provState {
 	st := provState{checked: true}
 	var res providers.Result
@@ -1979,16 +1986,43 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 		if err == nil {
 			return false, nil
 		}
-		if err == providers.ErrNoFeed {
+		if errors.Is(err, providers.ErrChallenged) {
+			return true, err // retryable: the next connection may not be challenged
+		}
+		if errors.Is(err, providers.ErrNoFeed) {
 			return false, err // not retryable: no public feed
 		}
 		return true, err // retryable: feed could not be read
 	})
 	st.attempts = tries
 	switch {
-	case err == providers.ErrNoFeed:
+	case errors.Is(err, providers.ErrNoFeed):
 		st.skipped = true
 		st.outcome = history.OutcomeSkipped
+		if errors.Is(err, providers.ErrChallenged) {
+			// Filed as a skip like any absent feed, but the log must say
+			// which: a challenge that outlasts every attempt is the request
+			// shape being refused again, and that is the first thing to look
+			// at when a Page provider goes grey. Logged on the way IN only: a
+			// challenge that stays tightened for months would otherwise write
+			// the same line every poll.
+			st.challenged = true
+			c.mu.Lock()
+			wasChallenged := c.provStates[p.ID].challenged
+			if !wasChallenged && c.provStates != nil {
+				// Latch it here, under the lock, so a poll overlapping this
+				// one (a manual retry during a scheduled round) sees the
+				// transition already taken and does not log it again.
+				prev := c.provStates[p.ID]
+				prev.challenged = true
+				c.provStates[p.ID] = prev
+			}
+			c.mu.Unlock()
+			if !wasChallenged {
+				slog.Warn("provider feed challenged on every attempt, read as no public feed",
+					"id", p.ID, "attempts", tries)
+			}
+		}
 	case err != nil:
 		st.err = err
 		st.res = providers.Result{Feed: providers.FeedUnreachable}

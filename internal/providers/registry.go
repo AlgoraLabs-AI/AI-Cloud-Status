@@ -16,7 +16,7 @@ type ParseFunc func(p Provider, data []byte) (Result, error)
 //   - adding a provider on an existing backend = one new file with a Register
 //     call (see bitbucket.go), and
 //   - adding a whole new backend = one new adapter file with a RegisterParser
-//     call (see checkly.go / betterstack.go),
+//     call (see rootly.go / betterstack.go),
 //
 // with NO edit to any central list. init() runs single-threaded at package load,
 // but the mutex keeps Register/RegisterParser safe if ever called concurrently.
@@ -24,6 +24,15 @@ var (
 	registryMu sync.Mutex
 	registered []Provider
 	parsers    = map[Kind]ParseFunc{}
+	// pageKinds are the Kinds whose feed is the status page's own HTML (see
+	// Kind.Page), declared by the adapter beside its parser.
+	pageKinds = map[Kind]bool{}
+	// legacy maps a provider ID to the Kinds its feed USED to be, in
+	// registration order. A capture archived under a previous feed is still
+	// that provider's capture, and ParseFeed offers it to each of these
+	// adapters in turn; every one of them anchors on its own shape, so the
+	// order does not decide which reads it.
+	legacy = map[string][]Kind{}
 )
 
 // Register adds a provider definition to the built-in set. Intended to be called
@@ -51,12 +60,48 @@ func RegisterParser(k Kind, fn ParseFunc) {
 	parsers[k] = fn
 }
 
+// RegisterPageParser is RegisterParser for an adapter that reads a status
+// page's own HTML rather than a machine-readable endpoint. Declaring it here,
+// beside the parser, keeps a new backend one file: Check, the capture dedup
+// and the URL-shape test all read Kind.Page, and no central list is edited.
+func RegisterPageParser(k Kind, fn ParseFunc) {
+	RegisterParser(k, fn)
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	pageKinds[k] = true
+}
+
+// isPageKind reports whether k was registered with RegisterPageParser.
+func isPageKind(k Kind) bool {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	return pageKinds[k]
+}
+
 // parserFor returns the adapter registered for a Kind.
 func parserFor(k Kind) (ParseFunc, bool) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	fn, ok := parsers[k]
 	return fn, ok
+}
+
+// RegisterLegacy records that provider id's feed used to be of Kind k, so an
+// archived capture of that feed still parses (see ParseFeed). Intended to be
+// called from the legacy adapter's init(), beside its RegisterParser, when a
+// provider moves to a new backend and the old one keeps no live provider.
+func RegisterLegacy(id string, k Kind) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	legacy[id] = append(legacy[id], k)
+}
+
+// legacyKindsFor returns the Kinds provider id's feed used to be, in
+// registration order.
+func legacyKindsFor(id string) []Kind {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	return append([]Kind(nil), legacy[id]...)
 }
 
 // Default returns the registered providers, grouped by Category display order

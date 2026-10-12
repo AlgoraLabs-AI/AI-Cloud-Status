@@ -2,44 +2,37 @@ package providers
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"time"
 )
 
-// init self-registers the Checkly adapter and the Mistral provider it backs.
+// init self-registers the Checkly adapter as the LEGACY reader of Mistral's
+// archived captures. No live provider uses it.
 //
-// Mistral's status page (status.mistral.ai) is a Checkly status page, NOT an
-// Atlassian Statuspage — the old /api/v2/summary.json endpoint returns the SPA's
-// HTML, which is why Mistral always showed up as feed-unreachable. The page's own
-// front-end reads open incidents from this server-proxied Checkly endpoint, which
-// returns clean JSON — when it answers.
-//
-// Optional, because the whole host now sits behind a Cloudflare managed
-// challenge: every path, the root included, answers 403 text/html "Just a
-// moment..." with Cf-Mitigated: challenge, to this client's User-Agent and to a
-// browser's alike, and no RSS/Atom alternative exists (feed.rss and feed.atom
-// 404, history.rss 401). A 403 is therefore "no public feed", the same way a 404
-// is for Groq: the provider stays on the board and is polled, the row reads
-// "feed unavailable" rather than an outage, and the alert audit does not fail
-// the run over a feed nobody outside a browser can read. If the challenge is
-// lifted the feed resumes with no change here.
+// Mistral's status page was a Checkly status page, and its server-proxied
+// "unresolved-incidents" endpoint was the feed this adapter read. The page is
+// Rootly now (see rootly.go) and that endpoint answers 404, but an archive
+// outlives its feed: every Mistral capture recorded before the move is
+// Checkly JSON, and cmd/alertaudit re-derives severities from the archive
+// with ParseFeed. RegisterLegacy is what lets ParseFeed hand those captures
+// to this adapter, so the archive stays readable without a live Checkly
+// provider and without the audit reading a changed feed as a broken parser.
 func init() {
 	RegisterParser(KindCheckly, func(_ Provider, data []byte) (Result, error) {
 		return parseCheckly(data)
 	})
-	Register(Provider{
-		ID: "mistral", Name: "Mistral", Category: CategoryAI, Kind: KindCheckly,
-		URL:      "https://status.mistral.ai/api/status-page/mistral-ai/unresolved-incidents",
-		Optional: true,
-	})
+	RegisterLegacy("mistral", KindCheckly)
 }
 
 // checklyIncidents models the Checkly status-page "unresolved-incidents"
 // response. Only currently-open incidents are returned, so any incident present
 // is an active issue.
 type checklyIncidents struct {
-	Incidents []checklyIncident `json:"incidents"`
+	// Raw so an absent key (empty) is told from a present one, null or a
+	// list: see the anchor in parseCheckly.
+	Incidents json.RawMessage `json:"incidents"`
 }
 
 type checklyIncident struct {
@@ -64,9 +57,21 @@ func parseCheckly(data []byte) (Result, error) {
 	if err := json.Unmarshal(decodeFeed(data), &feed); err != nil {
 		return Result{}, err
 	}
+	// The anchor: the "incidents" key must be present. An empty list and a
+	// null are both the all-clear; the key missing is not this feed. As the
+	// legacy reader behind ParseFeed this adapter is handed every body the
+	// Rootly parser rejects, and `{}` or `{"message":"Forbidden"}` must read
+	// as unreadable, not as a quiet all-clear.
+	if len(feed.Incidents) == 0 {
+		return Result{}, errors.New("checkly: document carries no incidents key")
+	}
+	var incidents []checklyIncident
+	if err := json.Unmarshal(feed.Incidents, &incidents); err != nil {
+		return Result{}, err
+	}
 
 	res := Result{Severity: SevNone}
-	for _, inc := range feed.Incidents {
+	for _, inc := range incidents {
 		sev := checklySeverity(inc.Severity)
 		if sev > res.Severity {
 			res.Severity = sev

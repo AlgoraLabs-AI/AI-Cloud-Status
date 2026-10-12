@@ -56,9 +56,16 @@ func (f FeedFailure) String() string {
 type StatusError struct {
 	Provider string
 	Code     int
+	// Challenged is set when the answer carried Cf-Mitigated: challenge: the
+	// request SHAPE was refused by a Cloudflare managed challenge, which is a
+	// different thing to debug than the status code alone says.
+	Challenged bool
 }
 
 func (e *StatusError) Error() string {
+	if e.Challenged {
+		return fmt.Sprintf("%s: unexpected status %d (Cloudflare challenge)", e.Provider, e.Code)
+	}
 	return fmt.Sprintf("%s: unexpected status %d", e.Provider, e.Code)
 }
 

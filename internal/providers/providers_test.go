@@ -1,8 +1,11 @@
 package providers
 
 import (
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,6 +20,16 @@ func readFixture(t *testing.T, name string) []byte {
 	data, err := os.ReadFile(filepath.Join("testdata", name))
 	if err != nil {
 		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	if strings.HasSuffix(name, ".gz") {
+		// A whole live page is committed gzipped (a tenth of its size).
+		zr, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("gunzip fixture %s: %v", name, err)
+		}
+		if data, err = io.ReadAll(zr); err != nil {
+			t.Fatalf("gunzip fixture %s: %v", name, err)
+		}
 	}
 	return data
 }
@@ -272,32 +285,6 @@ func TestStatuspageIncidentNote(t *testing.T) {
 	}
 	if inc.Started.IsZero() || inc.Updated.IsZero() {
 		t.Errorf("Started/Updated must be parsed: %v / %v", inc.Started, inc.Updated)
-	}
-}
-
-// TestParseChecklyTimesAndNote pins the Checkly (Mistral) incident metadata:
-// created_at → Started, newest update → Updated + Note.
-func TestParseChecklyTimesAndNote(t *testing.T) {
-	feed := `{"incidents":[{"name":"Audio API Degraded","severity":"MEDIUM",
-	 "created_at":"2026-07-17T07:55:56.406Z","updated_at":"2026-07-17T07:55:56.428Z",
-	 "services":[{"name":"Audio API"}],
-	 "incidentUpdates":[{"status":"INVESTIGATING",
-	  "description":"Requests to the Audio API are experiencing degraded service.",
-	  "created_at":"2026-07-17T08:30:00.000Z"}]}]}`
-	res, err := parseCheckly([]byte(feed))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Incidents) != 1 {
-		t.Fatalf("incidents = %d, want 1", len(res.Incidents))
-	}
-	inc := res.Incidents[0]
-	if inc.Note == "" || inc.Started.IsZero() {
-		t.Errorf("Note/Started missing: %+v", inc)
-	}
-	// Updated must advance to the newest update's timestamp (08:30 > 07:55).
-	if inc.Updated.UTC().Hour() != 8 {
-		t.Errorf("Updated = %v, want the newest update time", inc.Updated)
 	}
 }
 
@@ -797,8 +784,13 @@ func TestDefaultProvidersWellFormed(t *testing.T) {
 // hit a machine-readable status/health API (so results reflect true outage
 // state), never a bare marketing domain.
 func TestDefaultProvidersQueryStatusAPIs(t *testing.T) {
-	apiMarker := []string{"summary.json", "incidents.json", "currentevents", "/status/feed", "unresolved-incidents", "index.json", "feed.xml"}
+	apiMarker := []string{"summary.json", "incidents.json", "currentevents", "/status/feed", "index.json", "feed.xml"}
 	for _, p := range Default() {
+		if p.Kind.Page() {
+			// The page IS the feed (Rootly exposes no API or RSS); the parser
+			// anchors on its service rows, which is the same guarantee.
+			continue
+		}
 		ok := false
 		for _, m := range apiMarker {
 			if strings.Contains(p.URL, m) {
@@ -866,8 +858,8 @@ func TestModularSelfRegistration(t *testing.T) {
 			t.Errorf("provider %q uses kind %q with no registered parser", p.ID, p.Kind)
 		}
 	}
-	if _, ok := parserFor(KindCheckly); !ok {
-		t.Error("Checkly adapter did not self-register")
+	if _, ok := parserFor(KindRootly); !ok {
+		t.Error("Rootly adapter did not self-register")
 	}
 	if _, ok := parserFor(KindBetterStack); !ok {
 		t.Error("Better Stack adapter did not self-register")
@@ -904,6 +896,37 @@ func encodeUTF16LE(s string) []byte {
 		out = append(out, byte(u), byte(u>>8))
 	}
 	return out
+}
+
+// The Checkly adapter has no live provider since Mistral moved to Rootly, but it
+// is the legacy reader of every Mistral capture archived before the move (see
+// checkly.go), and the alert audit derives severities from those captures. Its
+// tests stay for that reason.
+
+// TestParseChecklyTimesAndNote pins the Checkly (Mistral) incident metadata:
+// created_at → Started, newest update → Updated + Note.
+func TestParseChecklyTimesAndNote(t *testing.T) {
+	feed := `{"incidents":[{"name":"Audio API Degraded","severity":"MEDIUM",
+	 "created_at":"2026-07-17T07:55:56.406Z","updated_at":"2026-07-17T07:55:56.428Z",
+	 "services":[{"name":"Audio API"}],
+	 "incidentUpdates":[{"status":"INVESTIGATING",
+	  "description":"Requests to the Audio API are experiencing degraded service.",
+	  "created_at":"2026-07-17T08:30:00.000Z"}]}]}`
+	res, err := parseCheckly([]byte(feed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Incidents) != 1 {
+		t.Fatalf("incidents = %d, want 1", len(res.Incidents))
+	}
+	inc := res.Incidents[0]
+	if inc.Note == "" || inc.Started.IsZero() {
+		t.Errorf("Note/Started missing: %+v", inc)
+	}
+	// Updated must advance to the newest update's timestamp (08:30 > 07:55).
+	if inc.Updated.UTC().Hour() != 8 {
+		t.Errorf("Updated = %v, want the newest update time", inc.Updated)
+	}
 }
 
 func TestParseChecklyOpenIncidents(t *testing.T) {
@@ -959,6 +982,8 @@ func TestParseChecklyMediumAlerts(t *testing.T) {
 	}
 }
 
+// TestParseChecklyOperational: an empty incidents list IS the all-clear, and
+// the anchor (the key being present) is what tells it from a JSON error body.
 func TestParseChecklyOperational(t *testing.T) {
 	res, err := parseCheckly(readFixture(t, "checkly_operational.json"))
 	if err != nil {
@@ -966,6 +991,358 @@ func TestParseChecklyOperational(t *testing.T) {
 	}
 	if res.Severity != SevNone || len(res.Incidents) != 0 {
 		t.Errorf("operational page = %v with %d incidents, want none/0", res.Severity, len(res.Incidents))
+	}
+}
+
+// TestParseRootlyOperational reads the live Mistral page as captured (header,
+// banner, legend and three of the fifteen service rows, uptime charts
+// trimmed): all clear is SevNone with no incident.
+func TestParseRootlyOperational(t *testing.T) {
+	res, err := parseRootly(readFixture(t, "rootly_operational.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevNone || len(res.Incidents) != 0 {
+		t.Errorf("operational page = %v with %d incidents, want none/0", res.Severity, len(res.Incidents))
+	}
+}
+
+// TestParseRootlyDegraded is the same page with the banner and three rows
+// edited to the states the page's own legend documents (Affected, Maintenance).
+// The worst row sets the severity, the affected rows fold into ONE incident
+// titled with the banner, and the note lists each row's own words.
+func TestParseRootlyDegraded(t *testing.T) {
+	res, err := parseRootly(readFixture(t, "rootly_degraded.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevCritical {
+		t.Errorf("severity = %v, want critical (the Major Outage row)", res.Severity)
+	}
+	if len(res.Incidents) != 1 {
+		t.Fatalf("incidents = %d, want 1 (the page has no incident timeline, only service states)", len(res.Incidents))
+	}
+	inc := res.Incidents[0]
+	if inc.Summary != "Partial System Outage" {
+		t.Errorf("Summary = %q, want the page banner", inc.Summary)
+	}
+	if got := strings.Join(inc.Components, ","); got != "Audio API,Batch API,Console" {
+		t.Errorf("Components = %q, want the three non-operational rows in page order", got)
+	}
+	if !strings.Contains(inc.Note, "Audio API: Partial Outage") || !strings.Contains(inc.Note, "Batch API: Maintenance") {
+		t.Errorf("Note = %q, want each row's own status label", inc.Note)
+	}
+}
+
+// TestRootlySeverityScale pins the keyword mapping and the icon fallback. The
+// labels are prose rather than an enum, so an unfamiliar label must still land
+// where the icon colour says, and never on SevNone unless the icon is green.
+func TestRootlySeverityScale(t *testing.T) {
+	cases := []struct {
+		status, icon string
+		want         Severity
+	}{
+		{"Operational", "sp-success-bg", SevNone},
+		{"Degraded Performance", "sp-error-bg", SevMinor},
+		{"Under Maintenance", "bg-yellow-100", SevMinor},
+		{"Partial Outage", "sp-error-bg", SevMajor},
+		{"Affected", "sp-error-bg", SevMajor},
+		{"Major Outage", "sp-error-bg", SevCritical},
+		{"major outage", "", SevCritical}, // case-insensitive
+		// A qualified "operational" is not operational, whatever the icon;
+		// an unqualified one is, whatever surrounds the word.
+		{"Not Operational", "sp-error-bg", SevMajor},
+		{"Partially Operational", "sp-success-bg", SevMajor},
+		{"Fully Operational", "sp-success-bg", SevNone},
+		{"Operational (Monitoring)", "", SevNone},
+		// A minor qualifier on "operational" is minor, not major.
+		{"Operational (Degraded Performance)", "", SevMinor},
+		{"Operational - Under Maintenance", "bg-yellow-100", SevMinor},
+		{"Operational (Minor issues)", "", SevMinor},
+		{"Down for Maintenance", "bg-yellow-100", SevMinor},
+		// No words at all: the icon is the verdict.
+		{"", "sp-error-bg", SevMajor},
+		{"", "sp-success-bg", SevNone},
+		// Keywords are words: "Countdown" is not "down".
+		{"Countdown", "sp-success-bg", SevNone},
+		{"Something New", "sp-error-bg", SevMajor},
+		{"Something New", "bg-yellow-100", SevMinor},
+		{"Something New", "sp-success-bg", SevNone},
+		{"Something New", "", SevMinor},
+	}
+	for _, tc := range cases {
+		if got := rootlySeverity(tc.status, tc.icon); got != tc.want {
+			t.Errorf("rootlySeverity(%q, %q) = %v, want %v", tc.status, tc.icon, got, tc.want)
+		}
+	}
+}
+
+// TestParseRootlyBannerAloneIsNotAllClear: every row operational but the banner
+// says otherwise. Something is posted that the rows do not show, so the page is
+// a minor incident carrying the banner's words, never a clean SevNone.
+func TestParseRootlyBannerAloneIsNotAllClear(t *testing.T) {
+	page := strings.Replace(string(readFixture(t, "rootly_operational.html")),
+		"All Systems Operational", "Degraded Performance", 1)
+	res, err := parseRootly([]byte(page))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevMinor || len(res.Incidents) != 1 || res.Incidents[0].Summary != "Degraded Performance" {
+		t.Errorf("got %v with %+v, want minor with the banner as the incident", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseRootlyRejectsAPageWithoutServices pins the anchor. The Cloudflare
+// challenge that fronted this host for months is a 200-shaped HTML document
+// when it is not a 403 (the fixture is the real one); so is any error page.
+// None of them carries a service row, and none may read as operational.
+func TestParseRootlyRejectsAPageWithoutServices(t *testing.T) {
+	challenge := readFixture(t, "rootly_challenge.html")
+	if !strings.Contains(string(challenge), "Just a moment") {
+		t.Fatal("rootly_challenge.html is not the Cloudflare challenge document")
+	}
+	notThePage := [][]byte{
+		challenge,
+		[]byte(`<html><body>nope</body></html>`),
+		[]byte(`{"message":"Forbidden"}`),
+		{},
+	}
+	for _, doc := range notThePage {
+		if _, err := parseRootly(doc); err == nil {
+			t.Errorf("parseRootly(%s) accepted a page with no service rows as healthy", truncate(string(doc), 40))
+		}
+	}
+}
+
+// TestParseRootlyFailsClosedOnAPartialRead pins the three shapes that would
+// otherwise read as operational: ONE row that says nothing readable while the
+// others are intact (a redesign lands on every row at once, but an outage
+// lands on one, and that one carrying new markup is exactly the case), a page
+// truncated by the response size limit, and a page whose banner moved. A row
+// whose label is unreadable but whose icon is a legend colour is NOT that
+// case: the icon is a verdict, and the row is read from it.
+func TestParseRootlyFailsClosedOnAPartialRead(t *testing.T) {
+	whole := string(readFixture(t, "rootly_operational.html"))
+
+	// The Audio API row: the icon comes before the name, so edit from the
+	// row's own start. Wrap the label in a tag the text-span regexp cannot
+	// see through; Agents API and Batch API stay readable and operational.
+	i := strings.LastIndex(whole[:strings.Index(whole, "Audio API")], "<details")
+	wrapLabel := func(s string) string {
+		return s[:i] + strings.Replace(s[i:],
+			`<span class="text-green-400">Operational</span>`,
+			`<span class="text-red-500"><b>Partial Outage</b></span>`, 1)
+	}
+	noIcon := whole[:i] + strings.Replace(whole[i:], "sp-success-bg text-green-400", "text-green-400", 1)
+	if res, err := parseRootly([]byte(wrapLabel(noIcon))); err == nil {
+		t.Errorf("a row with no readable label and no legend icon parsed as %v with %d incidents, want an error",
+			res.Severity, len(res.Incidents))
+	}
+	redIcon := whole[:i] + strings.Replace(whole[i:], "sp-success-bg text-green-400", "sp-error-bg text-red-500", 1)
+	res, err := parseRootly([]byte(wrapLabel(redIcon)))
+	if err != nil || res.Severity != SevMajor {
+		t.Fatalf("a row with an unreadable label and a red icon = %v, %v; want major from the icon", res.Severity, err)
+	}
+	// The icon's legend word stands in for the label: no dangling "Name: ".
+	if len(res.Incidents) != 1 || res.Incidents[0].Summary != "Audio API: Affected" {
+		t.Errorf("icon-only row incident = %+v, want summary \"Audio API: Affected\"", res.Incidents)
+	}
+
+	truncated := whole[:strings.LastIndex(whole, "Batch API")]
+	if _, err := parseRootly([]byte(truncated)); err == nil {
+		t.Error("a truncated page parsed, want an error")
+	}
+
+	noBanner := strings.Replace(whole, "text-4xl", "text-3xl", 1)
+	if _, err := parseRootly([]byte(noBanner)); err == nil {
+		t.Error("a page without the status banner parsed, want an error")
+	}
+
+	// The service list heading is an anchor too: without it the row and
+	// banner guarantees would lapse silently, so it fails closed instead.
+	noHeading := strings.Replace(whole, `<h2 class="">Services</h2>`, `<h2 class="">Components</h2>`, 1)
+	if _, err := parseRootly([]byte(noHeading)); err == nil {
+		t.Error("a page without the service list heading parsed, want an error")
+	}
+
+	// The controls: the whole page still reads, and so does one an edge
+	// appended a marker to after the closing tag.
+	if _, err := parseRootly([]byte(whole)); err != nil {
+		t.Fatalf("the unmodified fixture no longer parses: %v", err)
+	}
+	if _, err := parseRootly([]byte(whole + "\n<!-- served-by: edge -->\n")); err != nil {
+		t.Errorf("a page with a marker after </html> no longer parses: %v", err)
+	}
+}
+
+// TestParseRootlyReadsTheWholeLivePage runs the parser over the untrimmed
+// live page (fifteen rows, the uptime charts, the head with its tokens): the
+// properties the trimmed fixture pins must hold on the real markup too.
+func TestParseRootlyReadsTheWholeLivePage(t *testing.T) {
+	res, err := parseRootly(readFixture(t, "rootly_live_page.html.gz"))
+	if err != nil {
+		t.Fatalf("the live page no longer parses: %v", err)
+	}
+	if res.Severity != SevNone || len(res.Incidents) != 0 {
+		t.Errorf("live all-clear page = %v with %+v, want none/0", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseRootlyIgnoresACardAboveTheServiceList: a page gains an incident
+// card during an incident, shaped like a row (a group container with a
+// heading). Rows are read from the "Services" heading on, so the card is
+// never a phantom component.
+func TestParseRootlyIgnoresACardAboveTheServiceList(t *testing.T) {
+	whole := string(readFixture(t, "rootly_degraded.html"))
+	i := strings.Index(whole, `<h2 class="">Services</h2>`)
+	i = strings.LastIndex(whole[:i], "<details")
+	card := `<details class="group"><summary><h2>Elevated error rates</h2><span class="text-sm">Investigating</span></summary></details>` + "\n"
+	res, err := parseRootly([]byte(whole[:i] + card + whole[i:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Incidents) != 1 || strings.Join(res.Incidents[0].Components, ",") != "Audio API,Batch API,Console" {
+		t.Errorf("components = %+v, want the three affected rows and no phantom from the card", res.Incidents)
+	}
+}
+
+// TestParseRootlyARewordedAllClearIsStillAllClear: the banner's container
+// carries the legend's green, so an all-clear worded without "operational"
+// ("All systems running normally") is not an incident that never closes,
+// while the same words in a red container still are.
+func TestParseRootlyARewordedAllClearIsStillAllClear(t *testing.T) {
+	whole := string(readFixture(t, "rootly_operational.html"))
+	green := strings.Replace(whole, "All Systems Operational", "All systems running normally", 1)
+	res, err := parseRootly([]byte(green))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevNone || len(res.Incidents) != 0 {
+		t.Errorf("reworded all-clear in a green container = %v with %+v, want all clear", res.Severity, res.Incidents)
+	}
+	red := strings.Replace(green,
+		`<div class="sp-success-bg w-full rounded-[20px] flex flex-col items-center justify-center gap-3 p-8 text-green-400">`,
+		`<div class="sp-error-bg w-full rounded-[20px] flex flex-col items-center justify-center gap-3 p-8 text-red-500">`, 1)
+	if red == green {
+		t.Fatal("fixture banner container not found")
+	}
+	res, err = parseRootly([]byte(red))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevMinor || len(res.Incidents) != 1 {
+		t.Errorf("unfamiliar banner in a red container = %v with %+v, want a minor incident", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseRootlyBannerWithAnInlinePrefixIsStillAllClear: an sr-only prefix
+// nested in the banner must not truncate the verdict to the prefix.
+func TestParseRootlyBannerWithAnInlinePrefixIsStillAllClear(t *testing.T) {
+	page := strings.Replace(string(readFixture(t, "rootly_operational.html")),
+		">All Systems Operational</span>", `><span class="sr-only">Status:</span> All Systems Operational</span>`, 1)
+	res, err := parseRootly([]byte(page))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevNone || len(res.Incidents) != 0 {
+		t.Errorf("got %v with %+v, want all clear", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseRootlyReadsTheLastTextSpanAsTheLabel: the real markup of an
+// affected row is unverified (no incident was open when the page was
+// captured), so the label is the last text span of the header rather than
+// its last element. A row that carries a badge after the label is then read
+// through the badge's words, and the icon decides, instead of the row going
+// unreadable during the outage it reports.
+func TestParseRootlyReadsTheLastTextSpanAsTheLabel(t *testing.T) {
+	whole := string(readFixture(t, "rootly_operational.html"))
+	// The row's icon comes BEFORE its name, so edit from the row's own start.
+	i := strings.LastIndex(whole[:strings.Index(whole, "Audio API")], "<details")
+	page := whole[:i] + strings.Replace(whole[i:],
+		`<span class="text-green-400">Operational</span>`,
+		`<span class="text-red-500">Partial Outage</span><span class="text-xs">1 incident</span>`, 1)
+	page = page[:i] + strings.Replace(page[i:], "sp-success-bg text-green-400", "sp-error-bg text-red-500", 1)
+	res, err := parseRootly([]byte(page))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevMajor || len(res.Incidents) != 1 || strings.Join(res.Incidents[0].Components, ",") != "Audio API" {
+		t.Errorf("got %v with %+v, want major (red icon) on Audio API alone", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseRootlyIgnoresAnIconOnTheSectionHeader: the "Services" header is
+// not a row because it is not a "group" container, not because it has no
+// icon, so a header that gains an aggregate status icon during an outage
+// does not become an unreadable row and fail the page closed.
+func TestParseRootlyIgnoresAnIconOnTheSectionHeader(t *testing.T) {
+	whole := string(readFixture(t, "rootly_degraded.html"))
+	i := strings.Index(whole, `<h2 class="">Services</h2>`)
+	if i < 0 {
+		t.Fatal("fixture has no Services header")
+	}
+	withIcon := whole[:i] + `<span class="flex sp-error-bg text-red-500"><svg></svg></span>` + whole[i:]
+	res, err := parseRootly([]byte(withIcon))
+	if err != nil {
+		t.Fatalf("a status icon on the section header made the page unreadable: %v", err)
+	}
+	if res.Severity != SevCritical || len(res.Incidents) != 1 {
+		t.Errorf("got %v with %d incidents, want the degraded page's critical incident", res.Severity, len(res.Incidents))
+	}
+}
+
+// TestParseRootlyAnEmptyBannerIsAnError: a banner span with no words is the
+// anchor missing, never a minor incident with an empty summary.
+func TestParseRootlyAnEmptyBannerIsAnError(t *testing.T) {
+	page := strings.Replace(string(readFixture(t, "rootly_operational.html")), "All Systems Operational", " ", 1)
+	if res, err := parseRootly([]byte(page)); err == nil {
+		t.Errorf("empty banner parsed as %v with %+v, want an error", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseFeedReadsAnArchivedCaptureWithTheAdapterOfItsTime: Mistral's
+// captures from before the move to Rootly are Checkly JSON. The archive
+// outlives the feed, so ParseFeed (what the audit and the replay use) hands
+// them to the legacy adapter, while a live Check (parse) still rejects them:
+// a Checkly body arriving from the live host today IS an unreadable feed.
+func TestParseFeedReadsAnArchivedCaptureWithTheAdapterOfItsTime(t *testing.T) {
+	mistral, ok := providerByID("mistral")
+	if !ok || mistral.Kind != KindRootly {
+		t.Fatalf("mistral = %+v, want the Rootly provider", mistral)
+	}
+	capture := readFixture(t, filepath.Join("captures", "mistral-20260727-113302-major.json"))
+	res, err := ParseFeed(mistral, capture)
+	if err != nil {
+		t.Fatalf("archived Checkly capture no longer parses: %v", err)
+	}
+	if res.Severity < SevMajor || len(res.Incidents) == 0 {
+		t.Errorf("archived capture read as %v with %d incidents, want the MEDIUM incident it recorded", res.Severity, len(res.Incidents))
+	}
+	if _, err := parse(mistral, capture); err == nil {
+		t.Error("the live parser accepted a Checkly body for the Rootly provider")
+	}
+}
+
+// TestRootlyAllClearIsTheWholePhrase: all clear is "operational" with nothing
+// taking it back, so a qualified "operational" is not all clear and a reworded
+// all-clear still is (a banner read as an incident would never close).
+func TestRootlyAllClearIsTheWholePhrase(t *testing.T) {
+	for banner, want := range map[string]bool{
+		"All Systems Operational":                        true,
+		"  all systems operational":                      true,
+		"All Systems Are Operational":                    true,
+		"All services operational":                       true,
+		"All Systems Operational. No incidents reported": true,
+		"Not Operational":                                false,
+		"Partially Operational":                          false,
+		"Operational with degraded performance":          false,
+		"Partial System Outage":                          false,
+		"":                                               false,
+	} {
+		if got := rootlyAllClear(banner); got != want {
+			t.Errorf("rootlyAllClear(%q) = %v, want %v", banner, got, want)
+		}
 	}
 }
 

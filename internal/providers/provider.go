@@ -101,7 +101,8 @@ const (
 	KindGoogleCloud Kind = "googlecloud" // status.cloud.google.com incidents.json
 	KindAWS         Kind = "aws"         // AWS Health public current events
 	KindAzure       Kind = "azure"       // Azure status RSS feed
-	KindCheckly     Kind = "checkly"     // Checkly status page (e.g. Mistral)
+	KindRootly      Kind = "rootly"      // Rootly status page, read from its HTML (e.g. Mistral)
+	KindCheckly     Kind = "checkly"     // Checkly status page; legacy, kept for Mistral's archived captures
 	KindBetterStack Kind = "betterstack" // Better Stack status page (e.g. Hugging Face)
 	KindInstatus    Kind = "instatus"    // Instatus status page (e.g. Perplexity)
 	KindXAI         Kind = "xai"         // xAI status RSS feed (status.x.ai/feed.xml)
@@ -139,6 +140,17 @@ type Provider struct {
 	// Optional providers are skipped gracefully (not surfaced as unreachable)
 	// when they do not expose a public feed (e.g. a 404).
 	Optional bool
+}
+
+// Page reports whether a Kind's feed is the status page's own HTML rather
+// than a machine-readable endpoint. It is a property of the adapter (declared
+// with RegisterPageParser), not a flag on the provider, so a provider cannot
+// be registered on a page-reading Kind and fetched API-shaped (which the
+// page's host would challenge). Check fetches a page as the document it is,
+// the capture dedup keys on what the page SAID rather than on its bytes, and
+// the URL-shape test exempts it.
+func (k Kind) Page() bool {
+	return isPageKind(k)
 }
 
 // Incident is a single open issue reported by a provider feed. It carries its
@@ -366,6 +378,16 @@ func MatchRegion(region string, interest []string) bool {
 // should be skipped rather than reported as unreachable.
 var ErrNoFeed = errors.New("provider exposes no public status feed")
 
+// ErrChallenged is the ErrNoFeed of a Cloudflare managed challenge: the
+// Optional provider's host answered 403 with Cf-Mitigated: challenge, so the
+// request SHAPE was refused, not the endpoint found absent. It wraps ErrNoFeed
+// because that is what it means if it persists, and it is told apart so a
+// caller can retry it first: the verdict is not stable from one connection to
+// the next (measured on status.mistral.ai with the document request
+// Check sends for a Page provider: runs of 15 of 15 answered, and runs where
+// one connection in three was challenged while the next one was not).
+var ErrChallenged = fmt.Errorf("%w: the request was challenged", ErrNoFeed)
+
 // parse dispatches raw feed bytes to the self-registered adapter for p.Kind.
 // Adapters register themselves via RegisterParser in their own file's init, so
 // adding a backend requires no edit here.
@@ -384,8 +406,25 @@ func parse(p Provider, data []byte) (Result, error) {
 // rather than trusting FeedCapture's own filename label (see feedcapture.go —
 // that label reads the page-level indicator, not each incident's own impact,
 // and can disagree with it).
+//
+// An archive outlives a feed. When the current adapter rejects the bytes and
+// the provider's feed used to be of another Kind (RegisterLegacy), the
+// adapter of that time gets to read them: Mistral's 2026-07 captures are
+// Checkly JSON, and without this every one of them read as a broken parser
+// the day the provider moved to Rootly. A live Check never takes this path.
 func ParseFeed(p Provider, data []byte) (Result, error) {
-	return parse(p, data)
+	res, err := parse(p, data)
+	if err == nil {
+		return res, nil
+	}
+	for _, k := range legacyKindsFor(p.ID) {
+		if fn, ok := parserFor(k); ok {
+			if r, e := fn(p, data); e == nil {
+				return r, nil
+			}
+		}
+	}
+	return res, err
 }
 
 // Checker performs a live provider health check.
@@ -412,7 +451,23 @@ func (c *Checker) Check(ctx context.Context, p Provider) (Result, error) {
 		return Result{Feed: FeedUnreachable}, err
 	}
 	req.Header.Set("User-Agent", "AI-Cloud-Status/1.0 (+https://github.com/AlgoraLabs-AI/AI-Cloud-Status)")
-	req.Header.Set("Accept", "application/json, application/rss+xml, text/xml;q=0.9, */*;q=0.8")
+	if p.Kind.Page() {
+		// The feed is the status page itself, so ask for it the way a page is
+		// asked for: an HTML Accept and the Fetch Metadata a top-level
+		// navigation carries. That metadata is what Cloudflare's managed
+		// challenge at status.mistral.ai keys on. Measured with this
+		// User-Agent throughout and Go's default TLS: without the Sec-Fetch
+		// headers every request answered 403 "Just a moment..." (Cf-Mitigated:
+		// challenge), with them 15 of 15 fresh connections answered the page.
+		// Neither the User-Agent nor the TLS fingerprint changes; nothing here
+		// claims to be a browser.
+		req.Header.Set("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		req.Header.Set("Sec-Fetch-Site", "none")
+	} else {
+		req.Header.Set("Accept", "application/json, application/rss+xml, text/xml;q=0.9, */*;q=0.8")
+	}
 
 	resp, err := c.Client.Do(req)
 	if err != nil {
@@ -420,6 +475,17 @@ func (c *Checker) Check(ctx context.Context, p Provider) (Result, error) {
 	}
 	defer resp.Body.Close()
 
+	// A Cloudflare managed challenge is read off its header, whatever status
+	// it comes with: 403 is the usual one, a JS challenge can be 503, and a
+	// challenge document can even arrive as a 200, which would otherwise be
+	// parsed, fail, and be filed as an unreadable feed (retried, then counted
+	// against the provider as a failure run).
+	if resp.Header.Get("Cf-Mitigated") == "challenge" {
+		if p.Optional {
+			return Result{}, ErrChallenged
+		}
+		return Result{Feed: FeedUnreachable}, &StatusError{Provider: p.Name, Code: resp.StatusCode, Challenged: true}
+	}
 	if resp.StatusCode != http.StatusOK {
 		if p.Optional && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden) {
 			return Result{}, ErrNoFeed
