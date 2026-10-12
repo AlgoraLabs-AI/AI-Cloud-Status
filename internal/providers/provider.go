@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -371,6 +370,16 @@ func MatchRegion(region string, interest []string) bool {
 // should be skipped rather than reported as unreachable.
 var ErrNoFeed = errors.New("provider exposes no public status feed")
 
+// ErrChallenged is the ErrNoFeed of a Cloudflare managed challenge: the
+// Optional provider's host answered 403 with Cf-Mitigated: challenge, so the
+// request SHAPE was refused, not the endpoint found absent. It wraps ErrNoFeed
+// because that is what it means if it persists, and it is told apart so a
+// caller can retry it first: the verdict is not stable from one connection to
+// the next (measured 2026-10-11 on status.mistral.ai with the document request
+// Check sends for a Page provider: runs of 15 of 15 answered, and runs where
+// one connection in three was challenged while the next one was not).
+var ErrChallenged = fmt.Errorf("%w: the request was challenged", ErrNoFeed)
+
 // parse dispatches raw feed bytes to the self-registered adapter for p.Kind.
 // Adapters register themselves via RegisterParser in their own file's init, so
 // adding a backend requires no edit here.
@@ -444,12 +453,7 @@ func (c *Checker) Check(ctx context.Context, p Provider) (Result, error) {
 	if resp.StatusCode != http.StatusOK {
 		if p.Optional && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden) {
 			if resp.Header.Get("Cf-Mitigated") == "challenge" {
-				// Still "no public feed" for the row and the audit, but say so
-				// in the log: a 403 from a Cloudflare challenge is the request
-				// shape being refused, not an endpoint that went away, and for
-				// a Page provider it is the regression to look for first.
-				slog.Warn("provider feed is behind a Cloudflare challenge, read as no public feed",
-					"provider", p.ID, "status", resp.StatusCode)
+				return Result{}, ErrChallenged
 			}
 			return Result{}, ErrNoFeed
 		}

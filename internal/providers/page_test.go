@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -52,5 +53,43 @@ func TestCheckAsksForAPageAsADocument(t *testing.T) {
 	if got.Get("Sec-Fetch-Dest") != "" || !strings.HasPrefix(got.Get("Accept"), "application/json") {
 		t.Errorf("API request carries document headers: Accept=%q Sec-Fetch-Dest=%q",
 			got.Get("Accept"), got.Get("Sec-Fetch-Dest"))
+	}
+}
+
+// TestCheckTellsAChallengeFromAnAbsentFeed: a 403 that carries Cf-Mitigated:
+// challenge on an Optional provider is ErrChallenged, which IS ErrNoFeed (the
+// row and the audit treat it so) but can be told apart, so the poll retries it
+// before filing it. A plain 403 stays ErrNoFeed, and a non-Optional provider
+// keeps reading a challenge as an unreadable feed with its status code.
+func TestCheckTellsAChallengeFromAnAbsentFeed(t *testing.T) {
+	challenge := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cf-Mitigated", "challenge")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("<html><title>Just a moment...</title></html>"))
+	}
+	plain := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }
+
+	challenged := httptest.NewServer(http.HandlerFunc(challenge))
+	defer challenged.Close()
+	forbidden := httptest.NewServer(http.HandlerFunc(plain))
+	defer forbidden.Close()
+
+	ck := &Checker{Client: challenged.Client()}
+	optional := Provider{ID: "p", Name: "P", Kind: KindRootly, URL: challenged.URL, Optional: true, Page: true}
+	_, err := ck.Check(context.Background(), optional)
+	if !errors.Is(err, ErrChallenged) || !errors.Is(err, ErrNoFeed) {
+		t.Errorf("challenged Optional provider: err = %v, want ErrChallenged, which is also ErrNoFeed", err)
+	}
+
+	optional.URL = forbidden.URL
+	if _, err := ck.Check(context.Background(), optional); !errors.Is(err, ErrNoFeed) || errors.Is(err, ErrChallenged) {
+		t.Errorf("plain 403 on an Optional provider: err = %v, want ErrNoFeed and not a challenge", err)
+	}
+
+	required := Provider{ID: "r", Name: "R", Kind: KindRootly, URL: challenged.URL, Page: true}
+	res, err := ck.Check(context.Background(), required)
+	var se *StatusError
+	if !errors.As(err, &se) || se.Code != http.StatusForbidden || res.Feed != FeedUnreachable {
+		t.Errorf("challenged required provider: res=%+v err=%v, want an unreachable feed with a 403 StatusError", res, err)
 	}
 }
