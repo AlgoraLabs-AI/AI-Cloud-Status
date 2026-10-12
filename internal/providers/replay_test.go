@@ -3,6 +3,7 @@ package providers
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -68,6 +69,12 @@ func readCaptureBytes(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(data) == 0 {
+		// FeedCapture never writes an empty capture, so an empty file is
+		// corruption (disk full on a pre-temp-and-rename build), and must
+		// read as such rather than as a parser regression.
+		return nil, errors.New("empty capture")
+	}
 	if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
 		return data, nil
 	}
@@ -104,9 +111,9 @@ func captureSeverity(name string) (Severity, bool) {
 	return SevNone, false
 }
 
-// TestReadCaptureBytesSniffsGzip pins the reader on the three shapes the
-// archive holds: a plain legacy capture, a gzipped one, and a file that only
-// claims to be gzipped.
+// TestReadCaptureBytesSniffsGzip pins the reader on the four shapes the
+// archive can hold: a plain legacy capture, a gzipped one, a file that only
+// claims to be gzipped, and a gzip stream cut mid-body.
 func TestReadCaptureBytesSniffsGzip(t *testing.T) {
 	dir := t.TempDir()
 	body := []byte(`{"incidents":[]}`)
@@ -202,7 +209,8 @@ func TestCommittedCapturesStillParse(t *testing.T) {
 		}
 		data, err := readCaptureBytes(filepath.Join("testdata", "captures", f.Name()))
 		if err != nil {
-			t.Fatalf("read %s: %v", f.Name(), err)
+			t.Errorf("read %s: %v", f.Name(), err)
+			continue
 		}
 		res, err := ParseFeed(p, data)
 		if err != nil {
@@ -211,17 +219,44 @@ func TestCommittedCapturesStillParse(t *testing.T) {
 		}
 		want, ok := captureSeverity(f.Name())
 		if !ok {
+			t.Errorf("committed capture %q carries no severity label", f.Name())
 			continue
 		}
-		// The app recorded this moment as non-operational. The parser must still
-		// see SOMETHING wrong — either a severity or at least one incident.
-		// Not an equality check: FeedCapture's filename label reads the
-		// page-level indicator while the parser derives severity per incident,
-		// and provider.go:355 documents that the two legitimately disagree.
-		if want > SevNone && res.Severity == SevNone && len(res.Incidents) == 0 {
-			t.Errorf("%s: capture recorded %v, parser now reports fully operational", f.Name(), want)
+		// The app recorded this moment as worth archiving: a non-operational
+		// aggregate, or a "none" aggregate over a list of incidents (FeedCapture
+		// writes nothing for an operational page). The parser must still see
+		// SOMETHING wrong — a severity or at least one incident. Not an
+		// equality check: FeedCapture's filename label reads the page-level
+		// indicator while the parser derives severity per incident, and
+		// provider.go:355 documents that the two legitimately disagree.
+		if res.Severity == SevNone && len(res.Incidents) == 0 {
+			t.Errorf("%s: %s", f.Name(), captureRegression(want))
 		}
 	}
+}
+
+// captureRegression words the one regression the sweeps look for: a capture
+// the app archived because something was wrong now reads as fully operational.
+// A "-none" capture was archived for its incident list, so that is what it
+// lost; any other state was archived for its severity.
+func captureRegression(want Severity) string {
+	if want == SevNone {
+		return "capture listed incidents under a none aggregate, parser now sees no incidents"
+	}
+	return "capture recorded " + want.String() + ", parser now says operational with no incidents"
+}
+
+// isCaptureName reports whether a file in a provider's capture directory is a
+// capture the sweeps should read: not a parse-error archive (those are the
+// parser's known failures), not a writeGzip temp file left by a crash, and
+// carrying a severity label. Both sweeps and the committed-capture test agree
+// on this, so a stray file reads the same way in all three.
+func isCaptureName(name string) bool {
+	if strings.Contains(name, "parse-error") || strings.Contains(name, ".tmp-") {
+		return false
+	}
+	_, ok := captureSeverity(name)
+	return ok
 }
 
 // TestReplayRealCapturesNeverError is the guard that matters for the rejection
@@ -247,14 +282,21 @@ func TestReplayRealCapturesNeverError(t *testing.T) {
 		}
 		files, err := os.ReadDir(filepath.Join(dir, e.Name()))
 		if err != nil {
-			t.Fatalf("read %s: %v", e.Name(), err)
+			// Reported, not fatal: one unlistable directory must not hide the
+			// regressions in the other providers' captures.
+			t.Errorf("read %s: %v", e.Name(), err)
+			continue
 		}
 		for _, f := range files {
-			if f.IsDir() || strings.Contains(f.Name(), "parse-error") {
+			if f.IsDir() || strings.Contains(f.Name(), "parse-error") || strings.Contains(f.Name(), ".tmp-") {
 				continue
 			}
-			if strings.Contains(f.Name(), ".tmp-") {
-				continue // a writeGzip temp file left by a crash mid-write: not a capture
+			if !isCaptureName(f.Name()) {
+				// The archive is this app's own output, so a file with no
+				// severity label is not expected here; say so rather than
+				// reading it as a capture or skipping it in silence.
+				t.Errorf("%s/%s carries no severity label", e.Name(), f.Name())
+				continue
 			}
 			data, err := readCaptureBytes(filepath.Join(dir, e.Name(), f.Name()))
 			if err != nil {
@@ -313,7 +355,7 @@ func TestReplayRealCapturesNeverSilentlyOperational(t *testing.T) {
 			}
 			want, ok := captureSeverity(f.Name())
 			if !ok {
-				t.Logf("%s/%s carries no severity label — skipping", e.Name(), f.Name())
+				t.Errorf("%s/%s carries no severity label", e.Name(), f.Name())
 				continue
 			}
 			// A "-none" capture is NOT an operational page: FeedCapture writes
@@ -336,7 +378,7 @@ func TestReplayRealCapturesNeverSilentlyOperational(t *testing.T) {
 			if res.Severity == SevNone && len(res.Incidents) == 0 {
 				lost = append(lost, regression{
 					file:   e.Name() + "/" + f.Name(),
-					detail: "capture recorded " + want.String() + ", parser now says operational with no incidents",
+					detail: captureRegression(want),
 				})
 			}
 		}
