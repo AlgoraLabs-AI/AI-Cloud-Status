@@ -67,7 +67,10 @@ type StatusError struct {
 
 func (e *StatusError) Error() string {
 	if e.Challenged {
-		return fmt.Sprintf("%s: unexpected status %d (Cloudflare challenge)", e.Provider, e.Code)
+		// The challenge leads and the code follows: a 200 is not an
+		// unexpected status, and this line is what gets pasted to whoever
+		// owns the network.
+		return fmt.Sprintf("%s: Cloudflare challenge (HTTP %d)", e.Provider, e.Code)
 	}
 	return fmt.Sprintf("%s: unexpected status %d", e.Provider, e.Code)
 }
