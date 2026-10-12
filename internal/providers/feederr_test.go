@@ -39,6 +39,10 @@ func TestClassifyFeedFailure(t *testing.T) {
 		{"dns timeout is a timeout", wrap(&net.DNSError{Err: "i/o timeout", IsTimeout: true}), FeedFailTimeout, 0},
 		{"context deadline", wrap(context.DeadlineExceeded), FeedFailTimeout, 0},
 		{"http status", &StatusError{Provider: "Anthropic", Code: 503}, FeedFailHTTP, 503},
+		// A challenge keeps its code for the log but is not an HTTP-status
+		// failure: "HTTP 200" as the reason a feed is unreadable is nonsense.
+		{"cloudflare challenge on a 200", &StatusError{Provider: "Mistral", Code: 200, Challenged: true}, FeedFailChallenged, 200},
+		{"cloudflare challenge on a 503", wrap(&StatusError{Provider: "Mistral", Code: 503, Challenged: true}), FeedFailChallenged, 503},
 		{"unparseable body", fmt.Errorf("%w: %v", ErrUnparseable, errors.New("invalid character '<'")), FeedFailUnparseable, 0},
 		{"anything else", wrap(errors.New("connection reset by peer")), FeedFailOther, 0},
 	}

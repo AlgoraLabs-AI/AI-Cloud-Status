@@ -27,6 +27,12 @@ const (
 	FeedFailTLS                            // the HTTPS certificate was rejected
 	FeedFailHTTP                           // answered, but not 200
 	FeedFailUnparseable                    // answered 200 with bytes no adapter understood
+	FeedFailChallenged                     // answered with a Cloudflare challenge: the request shape was refused
+
+	// FeedFailureCount is one past the last class: the bound a consumer uses
+	// to prove it handles every class, so a class added here and forgotten
+	// there is a failing test rather than a silent fallthrough.
+	FeedFailureCount
 )
 
 // String is the short, stable token used in log lines (`reason=certificate`).
@@ -45,7 +51,14 @@ func (f FeedFailure) String() string {
 		return "http-status"
 	case FeedFailUnparseable:
 		return "unparseable"
+	case FeedFailChallenged:
+		return "challenged"
 	default:
+		if f >= FeedFailureCount {
+			// The bound, or a value past it, is not a class: say so in the
+			// log rather than pass for a connection failure.
+			return "invalid"
+		}
 		return "connection"
 	}
 }
@@ -64,7 +77,10 @@ type StatusError struct {
 
 func (e *StatusError) Error() string {
 	if e.Challenged {
-		return fmt.Sprintf("%s: unexpected status %d (Cloudflare challenge)", e.Provider, e.Code)
+		// The challenge leads and the code follows: a 200 is not an
+		// unexpected status, and this line is what gets pasted to whoever
+		// owns the network.
+		return fmt.Sprintf("%s: Cloudflare challenge (HTTP %d)", e.Provider, e.Code)
 	}
 	return fmt.Sprintf("%s: unexpected status %d", e.Provider, e.Code)
 }
@@ -75,13 +91,20 @@ func (e *StatusError) Error() string {
 var ErrUnparseable = errors.New("status feed could not be parsed")
 
 // ClassifyFeedFailure reports why a check failed, plus the HTTP status code when
-// the failure is FeedFailHTTP (0 otherwise).
+// the failure is backed by an HTTP answer (FeedFailHTTP and FeedFailChallenged;
+// 0 otherwise).
 func ClassifyFeedFailure(err error) (FeedFailure, int) {
 	if err == nil {
 		return FeedFailNone, 0
 	}
 	var se *StatusError
 	if errors.As(err, &se) {
+		if se.Challenged {
+			// A challenge rides on any status (403, 503, even 200): the code
+			// alone would send the reader to the wrong end of the wire, and
+			// "HTTP 200" as the reason a feed is unreadable is a contradiction.
+			return FeedFailChallenged, se.Code
+		}
 		return FeedFailHTTP, se.Code
 	}
 	if errors.Is(err, ErrUnparseable) {

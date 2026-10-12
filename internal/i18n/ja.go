@@ -198,6 +198,7 @@ var ja = Catalog{
 	FeedErrDNS:            "ステータスページのアドレスを解決できませんでした（DNS）。サービスの健全性は不明です。",
 	FeedErrTimeout:        "ステータスページが時間内に応答しませんでした。サービスの健全性は不明です。",
 	FeedErrHTTP:           "ステータスページが HTTP %d を返しました。サービスの健全性は不明です。",
+	FeedErrChallenged:     "ステータスページがこの自動チェックに Cloudflare のチャレンジで応答しました。サービスの健全性は不明です。",
 	FeedErrUnparseable:    "ステータスページの応答をこのアプリが解釈できませんでした。サービスの健全性は不明です。",
 	FeedErrDetail:         "技術的な詳細: %s",
 	TrayStillRunningTitle: "%s は実行中です",

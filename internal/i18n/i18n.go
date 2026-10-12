@@ -252,6 +252,7 @@ type Catalog struct {
 	FeedErrDNS            string
 	FeedErrTimeout        string
 	FeedErrHTTP           string // one %d: the status code the page answered with
+	FeedErrChallenged     string // the page answered with a Cloudflare challenge instead of its content
 	FeedErrUnparseable    string
 	FeedErrDetail         string // one %s: the raw transport error, for the drill-down
 	TrayStillRunningTitle string // "%s is still running"
