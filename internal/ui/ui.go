@@ -341,10 +341,10 @@ type provState struct {
 	// one and log only the transition.
 	challenged bool
 	err        error
-	res      providers.Result
-	when     time.Time
-	latency  time.Duration
-	attempts int
+	res        providers.Result
+	when       time.Time
+	latency    time.Duration
+	attempts   int
 	// lastOK is the last time the feed was actually READ, which is not `when`
 	// (that advances on every attempt, failed ones included). It survives a
 	// failed poll so the last-24h history can still say whether an incident was

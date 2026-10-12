@@ -1042,6 +1042,12 @@ func TestRootlySeverityScale(t *testing.T) {
 		{"Partially Operational", "sp-success-bg", SevMajor},
 		{"Fully Operational", "sp-success-bg", SevNone},
 		{"Operational (Monitoring)", "", SevNone},
+		// A minor qualifier on "operational" is minor, not major.
+		{"Operational (Degraded Performance)", "", SevMinor},
+		{"Operational - Under Maintenance", "bg-yellow-100", SevMinor},
+		// No words at all: the icon is the verdict.
+		{"", "sp-error-bg", SevMajor},
+		{"", "sp-success-bg", SevNone},
 		// Keywords are words: "Countdown" is not "down".
 		{"Countdown", "sp-success-bg", SevNone},
 		{"Something New", "sp-error-bg", SevMajor},
@@ -1094,22 +1100,32 @@ func TestParseRootlyRejectsAPageWithoutServices(t *testing.T) {
 }
 
 // TestParseRootlyFailsClosedOnAPartialRead pins the three shapes that would
-// otherwise read as operational: ONE row whose label the parser cannot read
-// while the others are intact (a redesign lands on every row at once, but an
-// outage lands on one, and that one carrying new markup is exactly the case),
-// a page truncated by the response size limit, and a page whose banner moved.
+// otherwise read as operational: ONE row that says nothing readable while the
+// others are intact (a redesign lands on every row at once, but an outage
+// lands on one, and that one carrying new markup is exactly the case), a page
+// truncated by the response size limit, and a page whose banner moved. A row
+// whose label is unreadable but whose icon is a legend colour is NOT that
+// case: the icon is a verdict, and the row is read from it.
 func TestParseRootlyFailsClosedOnAPartialRead(t *testing.T) {
 	whole := string(readFixture(t, "rootly_operational.html"))
 
-	// Wrap the Audio API label in a tag the trailing-span regexp cannot see
-	// through; Agents API and Batch API stay readable and operational.
-	i := strings.Index(whole, "Audio API")
-	oneRowChanged := whole[:i] + strings.Replace(whole[i:],
-		`<span class="text-green-400">Operational</span>`,
-		`<span class="text-red-500"><b>Partial Outage</b></span>`, 1)
-	if res, err := parseRootly([]byte(oneRowChanged)); err == nil {
-		t.Errorf("one unreadable row among readable ones parsed as %v with %d incidents, want an error",
+	// The Audio API row: the icon comes before the name, so edit from the
+	// row's own start. Wrap the label in a tag the text-span regexp cannot
+	// see through; Agents API and Batch API stay readable and operational.
+	i := strings.LastIndex(whole[:strings.Index(whole, "Audio API")], "<details")
+	wrapLabel := func(s string) string {
+		return s[:i] + strings.Replace(s[i:],
+			`<span class="text-green-400">Operational</span>`,
+			`<span class="text-red-500"><b>Partial Outage</b></span>`, 1)
+	}
+	noIcon := whole[:i] + strings.Replace(whole[i:], "sp-success-bg text-green-400", "text-green-400", 1)
+	if res, err := parseRootly([]byte(wrapLabel(noIcon))); err == nil {
+		t.Errorf("a row with no readable label and no legend icon parsed as %v with %d incidents, want an error",
 			res.Severity, len(res.Incidents))
+	}
+	redIcon := whole[:i] + strings.Replace(whole[i:], "sp-success-bg text-green-400", "sp-error-bg text-red-500", 1)
+	if res, err := parseRootly([]byte(wrapLabel(redIcon))); err != nil || res.Severity != SevMajor {
+		t.Errorf("a row with an unreadable label and a red icon = %v, %v; want major from the icon", res.Severity, err)
 	}
 
 	truncated := whole[:strings.LastIndex(whole, "Batch API")]
@@ -1122,9 +1138,58 @@ func TestParseRootlyFailsClosedOnAPartialRead(t *testing.T) {
 		t.Error("a page without the status banner parsed, want an error")
 	}
 
-	// The control: the whole page still reads.
+	// The controls: the whole page still reads, and so does one an edge
+	// appended a marker to after the closing tag.
 	if _, err := parseRootly([]byte(whole)); err != nil {
 		t.Fatalf("the unmodified fixture no longer parses: %v", err)
+	}
+	if _, err := parseRootly([]byte(whole + "\n<!-- served-by: edge -->\n")); err != nil {
+		t.Errorf("a page with a marker after </html> no longer parses: %v", err)
+	}
+}
+
+// TestParseRootlyReadsTheWholeLivePage runs the parser over the untrimmed
+// live page (fifteen rows, the uptime charts, the head with its tokens): the
+// properties the trimmed fixture pins must hold on the real markup too.
+func TestParseRootlyReadsTheWholeLivePage(t *testing.T) {
+	res, err := parseRootly(readFixture(t, "rootly_live_page.html"))
+	if err != nil {
+		t.Fatalf("the live page no longer parses: %v", err)
+	}
+	if res.Severity != SevNone || len(res.Incidents) != 0 {
+		t.Errorf("live all-clear page = %v with %+v, want none/0", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseRootlyIgnoresACardAboveTheServiceList: a page gains an incident
+// card during an incident, shaped like a row (a group container with a
+// heading). Rows are read from the "Services" heading on, so the card is
+// never a phantom component.
+func TestParseRootlyIgnoresACardAboveTheServiceList(t *testing.T) {
+	whole := string(readFixture(t, "rootly_degraded.html"))
+	i := strings.Index(whole, `<h2 class="">Services</h2>`)
+	i = strings.LastIndex(whole[:i], "<details")
+	card := `<details class="group"><summary><h2>Elevated error rates</h2><span class="text-sm">Investigating</span></summary></details>` + "\n"
+	res, err := parseRootly([]byte(whole[:i] + card + whole[i:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Incidents) != 1 || strings.Join(res.Incidents[0].Components, ",") != "Audio API,Batch API,Console" {
+		t.Errorf("components = %+v, want the three affected rows and no phantom from the card", res.Incidents)
+	}
+}
+
+// TestParseRootlyBannerWithAnInlinePrefixIsStillAllClear: an sr-only prefix
+// nested in the banner must not truncate the verdict to the prefix.
+func TestParseRootlyBannerWithAnInlinePrefixIsStillAllClear(t *testing.T) {
+	page := strings.Replace(string(readFixture(t, "rootly_operational.html")),
+		">All Systems Operational</span>", `><span class="sr-only">Status:</span> All Systems Operational</span>`, 1)
+	res, err := parseRootly([]byte(page))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevNone || len(res.Incidents) != 0 {
+		t.Errorf("got %v with %+v, want all clear", res.Severity, res.Incidents)
 	}
 }
 

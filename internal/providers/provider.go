@@ -143,13 +143,14 @@ type Provider struct {
 }
 
 // Page reports whether a Kind's feed is the status page's own HTML rather
-// than a machine-readable endpoint. It is a property of the adapter, not a
-// flag on the provider, so a provider cannot be registered on a page-reading
-// Kind and fetched API-shaped (which the page's host would challenge). Check
-// fetches a page as the document it is, the capture dedup keys on what the
-// page SAID rather than on its bytes, and the URL-shape test exempts it.
+// than a machine-readable endpoint. It is a property of the adapter (declared
+// with RegisterPageParser), not a flag on the provider, so a provider cannot
+// be registered on a page-reading Kind and fetched API-shaped (which the
+// page's host would challenge). Check fetches a page as the document it is,
+// the capture dedup keys on what the page SAID rather than on its bytes, and
+// the URL-shape test exempts it.
 func (k Kind) Page() bool {
-	return k == KindRootly
+	return isPageKind(k)
 }
 
 // Incident is a single open issue reported by a provider feed. It carries its

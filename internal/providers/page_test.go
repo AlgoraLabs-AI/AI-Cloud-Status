@@ -74,7 +74,7 @@ func TestFeedCaptureDedupsAPageWhoseTokensRotate(t *testing.T) {
 	fc := NewFeedCapture(dir)
 	// The full live page: it carries the csrf-token and csp-nonce metas and
 	// the per-script nonce attributes the trimmed fixtures dropped.
-	whole := string(readFixture(t, filepath.Join("captures", "mistral-20261011-214000-none.html")))
+	whole := string(readFixture(t, "rootly_live_page.html"))
 	rotate := func(tag string) string {
 		s := strings.Replace(whole, `csp-nonce" content="`, `csp-nonce" content="`+tag, 1)
 		s = strings.Replace(s, `csrf-token" content="`, `csrf-token" content="`+tag, 1)
@@ -92,6 +92,16 @@ func TestFeedCaptureDedupsAPageWhoseTokensRotate(t *testing.T) {
 	files, _ := os.ReadDir(filepath.Join(dir, "page"))
 	if len(files) != 1 {
 		t.Errorf("page captured %d times, want 1: the rotating token and nonces are not a new state", len(files))
+	}
+
+	// A page the parser could not read is keyed on WHY, so a markup change
+	// is one capture per failure shape, not one per poll of rotating tokens.
+	broken := Provider{ID: "broken", Kind: KindRootly}
+	fc.Capture(broken, []byte(first), Result{Feed: FeedUnreachable}, errFake)
+	fc.Capture(broken, []byte(second), Result{Feed: FeedUnreachable}, errFake)
+	files, _ = os.ReadDir(filepath.Join(dir, "broken"))
+	if len(files) != 1 {
+		t.Errorf("unreadable page captured %d times, want 1: the same failure is not a new one", len(files))
 	}
 
 	// The control: for a feed the bytes ARE the key, so the same two bodies

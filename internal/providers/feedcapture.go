@@ -62,7 +62,8 @@ const captureTimeFormat = "20060102-150405"
 // until this directory collects evidence.
 //
 // Samples land in Dir/<provider-id>/<timestamp>Z-<state>.json.gz. Consecutive
-// identical payloads are deduplicated by content hash; files older than
+// identical payloads are deduplicated by content hash (for a page Kind, by
+// what the parser read from it: see captureKey); files older than
 // captureRetention are pruned per provider, and the corpus is held under a
 // stated size budget (see perProviderBytes / totalBytes) rather than growing
 // with the calendar.
@@ -159,11 +160,15 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 // the incident ends; and a denylist of the volatile markup would be one more
 // thing to keep in step with the host. For a page the key is what the parser
 // READ from it (the Result), which is "same state" directly; a page the
-// parser could not read falls back to its bytes. The bytes archived are the
-// original ones either way.
+// parser could not read is keyed on WHY (the error), so a markup change is
+// one capture per failure shape rather than one per poll. The bytes archived
+// are the original ones either way.
 func captureKey(p Provider, data []byte, res Result, parseErr error) []byte {
-	if !p.Kind.Page() || parseErr != nil {
+	if !p.Kind.Page() {
 		return data
+	}
+	if parseErr != nil {
+		return []byte(parseErr.Error())
 	}
 	key, err := json.Marshal(res)
 	if err != nil {

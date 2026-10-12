@@ -21,9 +21,9 @@ import (
 // The host sits behind a Cloudflare managed challenge that keys on how the
 // page is asked for, not on who asks: an API-shaped request (a JSON Accept, no
 // Fetch Metadata) answers 403 "Just a moment..." on every path, a document
-// request with this app's own User-Agent answers the page. KindRootly is a
-// page Kind (Kind.Page), which is what makes Check send the latter (see there
-// for the measurement). A challenge
+// request with this app's own User-Agent answers the page. KindRootly is
+// registered as a page Kind (RegisterPageParser, Kind.Page), which is what
+// makes Check send the latter (see there for the measurement). A challenge
 // page is HTML too, which is why parseRootly anchors on the service rows and
 // the banner: a page without them is an error, never a clean all-clear.
 //
@@ -31,7 +31,7 @@ import (
 // the row reads "feed unavailable" rather than an outage, and the alert audit
 // does not fail the run over a feed nobody outside a browser can read.
 func init() {
-	RegisterParser(KindRootly, func(_ Provider, data []byte) (Result, error) {
+	RegisterPageParser(KindRootly, func(_ Provider, data []byte) (Result, error) {
 		return parseRootly(data)
 	})
 	Register(Provider{
@@ -45,7 +45,9 @@ var (
 	// rootlyBanner is the page-level verdict above the service list, e.g.
 	// "All Systems Operational": the one span styled text-4xl, wherever that
 	// token sits in its class list.
-	rootlyBanner = regexp.MustCompile(`(?is)<span\b[^>]*class="[^"]*\btext-4xl\b[^"]*"[^>]*>\s*(.*?)\s*</span>`)
+	// One level of inline nesting is allowed inside it (an sr-only prefix, an
+	// emphasis), so the verdict is the whole phrase, never a truncated one.
+	rootlyBanner = regexp.MustCompile(`(?is)<span\b[^>]*class="[^"]*\btext-4xl\b[^"]*"[^>]*>((?:[^<]|<(?:span|strong|em|b)\b[^>]*>[^<]*</(?:span|strong|em|b)>)*)</span>`)
 	// rootlyRow isolates one service row's header: the <summary> of a
 	// <details class="group …"> container. Every service is one such row: a
 	// status icon, an <h2> with the name, and a status label that closes the
@@ -60,8 +62,13 @@ var (
 	// unfamiliar label means, which keeps a row readable during the very
 	// outage it reports. A header with no text span at all is unreadable.
 	rootlyTextSpan = regexp.MustCompile(`(?is)<span\b[^>]*>\s*([^<>]+?)\s*</span>`)
-	// rootlyDocumentEnd is the closing tag of a whole document.
-	rootlyDocumentEnd = regexp.MustCompile(`(?i)</html>\s*$`)
+	// rootlyDocumentEnd is the closing tag of a whole document. Anywhere in
+	// the body, not at its very end: an edge may append a marker after it,
+	// and a body cut by the size limit has lost it altogether.
+	rootlyDocumentEnd = regexp.MustCompile(`(?i)</html>`)
+	// rootlyServices is the heading of the service list; rows are read from
+	// there on, so an incident card above the list is never a row.
+	rootlyServices = regexp.MustCompile(`(?is)<h2\b[^>]*>\s*Services\s*</h2>`)
 	// rootlyIcon reads the status icon's colour class, the page's second
 	// channel for the same fact: its legend pairs sp-success-bg with
 	// "Operational", sp-error-bg with "Affected" and bg-yellow-100 with
@@ -94,8 +101,14 @@ func parseRootly(data []byte) (Result, error) {
 		return Result{}, errors.New("rootly: body is not a whole document")
 	}
 
+	// Rows are read from the service list's heading on, so a card the page
+	// gains above it during an incident is never mistaken for a service.
+	list := page
+	if loc := rootlyServices.FindStringIndex(page); loc != nil {
+		list = page[loc[1]:]
+	}
 	var services []rootlyService
-	for _, m := range rootlyRow.FindAllStringSubmatch(page, -1) {
+	for _, m := range rootlyRow.FindAllStringSubmatch(list, -1) {
 		block := strings.TrimSpace(m[1])
 		name := rootlyName.FindStringSubmatch(block)
 		if name == nil {
@@ -109,11 +122,17 @@ func parseRootly(data []byte) (Result, error) {
 		if icon := rootlyIcon.FindStringSubmatch(block); icon != nil {
 			svc.Icon = icon[1]
 		}
-		if spans := rootlyTextSpan.FindAllStringSubmatch(block, -1); len(spans) > 0 {
-			svc.Status = plainNote(spans[len(spans)-1][1])
+		for _, span := range rootlyTextSpan.FindAllStringSubmatch(block, -1) {
+			if s := plainNote(span[1]); s != "" {
+				svc.Status = s // the last span with words is the label
+			}
 		}
-		if svc.Status == "" {
-			return Result{}, fmt.Errorf("rootly: service row %q has no readable status label", svc.Name)
+		// A row with no readable label is still a row with an icon: the
+		// legend's colour is a verdict on its own, so the row is read from
+		// it rather than failing the page during the outage it reports. Only
+		// a row that says nothing either way is unreadable.
+		if svc.Status == "" && svc.Icon == "" {
+			return Result{}, fmt.Errorf("rootly: service row %q has no readable status", svc.Name)
 		}
 		services = append(services, svc)
 	}
@@ -208,13 +227,15 @@ func rootlyWords(label string) []string {
 
 // rootlySeverity maps a service row's status label onto a Severity. The labels
 // are prose rather than an enum, so the match is by word, in the order that
-// keeps "Major Outage" above "Partial Outage". An unqualified "operational"
-// ("Operational", "Fully Operational") is healthy; a qualified one ("Not
-// Operational", "Partially Operational") is a degradation whatever the icon
-// says, by the same vocabulary the banner is read with. When the words are
-// unfamiliar the icon colour decides, per the page's own legend; when both
-// are unfamiliar the row is an open degradation of unknown size, floored at
-// minor and logged so a new vocabulary does not collapse silently.
+// keeps "Major Outage" above "Partial Outage" and a minor qualifier
+// ("Operational (Degraded Performance)") below a major one. An unqualified
+// "operational" ("Operational", "Fully Operational") is healthy, by the same
+// test the banner is read with; a qualified one ("Not Operational",
+// "Partially Operational") is a degradation whatever the icon says. When the
+// words are unfamiliar, or there are none, the icon colour decides, per the
+// page's own legend; when both are unfamiliar the row is an open degradation
+// of unknown size, floored at minor and logged so a new vocabulary does not
+// collapse silently.
 func rootlySeverity(status, icon string) Severity {
 	words := rootlyWords(status)
 	has := func(ws ...string) bool {
@@ -226,14 +247,16 @@ func rootlySeverity(status, icon string) Severity {
 		return false
 	}
 	switch {
-	case has("operational") && !rootlyQualified(words):
+	case rootlyAllClear(status):
 		return SevNone
 	case has("major", "down", "unavailable"):
 		return SevCritical
+	case has("degraded", "maintenance"):
+		// Before the qualified-operational case: "Operational (Degraded
+		// Performance)" and "Operational – Under Maintenance" are minor.
+		return SevMinor
 	case has("partial", "partially", "outage", "affected", "operational"):
 		return SevMajor
-	case has("degraded", "maintenance"):
-		return SevMinor
 	}
 	switch icon {
 	case "sp-success-bg":

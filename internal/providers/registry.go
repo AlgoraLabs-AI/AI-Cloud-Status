@@ -24,6 +24,9 @@ var (
 	registryMu sync.Mutex
 	registered []Provider
 	parsers    = map[Kind]ParseFunc{}
+	// pageKinds are the Kinds whose feed is the status page's own HTML (see
+	// Kind.Page), declared by the adapter beside its parser.
+	pageKinds = map[Kind]bool{}
 	// legacy maps a provider ID to the Kinds its feed USED to be, in
 	// registration order. A capture archived under a previous feed is still
 	// that provider's capture, and ParseFeed offers it to each of these
@@ -55,6 +58,24 @@ func RegisterParser(k Kind, fn ParseFunc) {
 		panic("providers: duplicate parser for kind " + string(k))
 	}
 	parsers[k] = fn
+}
+
+// RegisterPageParser is RegisterParser for an adapter that reads a status
+// page's own HTML rather than a machine-readable endpoint. Declaring it here,
+// beside the parser, keeps a new backend one file: Check, the capture dedup
+// and the URL-shape test all read Kind.Page, and no central list is edited.
+func RegisterPageParser(k Kind, fn ParseFunc) {
+	RegisterParser(k, fn)
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	pageKinds[k] = true
+}
+
+// isPageKind reports whether k was registered with RegisterPageParser.
+func isPageKind(k Kind) bool {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	return pageKinds[k]
 }
 
 // parserFor returns the adapter registered for a Kind.
