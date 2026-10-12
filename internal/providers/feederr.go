@@ -54,6 +54,11 @@ func (f FeedFailure) String() string {
 	case FeedFailChallenged:
 		return "challenged"
 	default:
+		if f >= FeedFailureCount {
+			// The bound, or a value past it, is not a class: say so in the
+			// log rather than pass for a connection failure.
+			return "invalid"
+		}
 		return "connection"
 	}
 }

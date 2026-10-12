@@ -700,11 +700,12 @@ func (c *Controller) providerSpec(p providers.Provider, st provState, ok bool, i
 
 // feedFailureMessage is the sentence a failed provider check shows in the row
 // and at the top of its drill-down. It names WHY the feed could not be read,
-// because the five causes have five different answers: a rejected certificate
-// is the reader's own network, an HTTP status is the provider, a Cloudflare
-// challenge is the edge refusing this check's request shape (its status code
-// is deliberately not shown: it rides on 403, 503 or 200 alike), an
-// unreadable body is this app, and a timeout could be either. The old single sentence
+// because each cause has a different answer: a rejected certificate is the
+// reader's own network, a name that does not resolve is the reader's DNS, an
+// HTTP status is the provider, a Cloudflare challenge is the edge refusing
+// this check's request shape (its status code is deliberately not shown: it
+// rides on 403, 503 or 200 alike), an unreadable body is this app, and a
+// timeout could be either. The old single sentence
 // ("Status feed unavailable — service health unknown.") is kept as the fallback
 // for a cause we cannot name, which is the only case where it is honest.
 //
