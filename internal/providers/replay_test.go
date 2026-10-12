@@ -127,6 +127,12 @@ func TestReadCaptureBytesSniffsGzip(t *testing.T) {
 	if err := os.WriteFile(broken, []byte{0x1f, 0x8b, 0x00, 0x00}, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The realistic corruption: a valid header, a body cut mid-stream (disk
+	// full on a build before writeGzip's temp-and-rename).
+	truncated := filepath.Join(dir, "20260801-155358Z-major.json.gz")
+	if err := os.WriteFile(truncated, buf.Bytes()[:buf.Len()-8], 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, path := range []string{plain, zipped} {
 		got, err := readCaptureBytes(path)
@@ -134,8 +140,10 @@ func TestReadCaptureBytesSniffsGzip(t *testing.T) {
 			t.Errorf("%s: got %q, %v; want the body", filepath.Base(path), got, err)
 		}
 	}
-	if _, err := readCaptureBytes(broken); err == nil {
-		t.Error("a file carrying the gzip magic but no gzip stream read without error")
+	for _, path := range []string{broken, truncated} {
+		if _, err := readCaptureBytes(path); err == nil {
+			t.Errorf("%s read without error, want the corruption reported", filepath.Base(path))
+		}
 	}
 }
 
@@ -245,9 +253,15 @@ func TestReplayRealCapturesNeverError(t *testing.T) {
 			if f.IsDir() || strings.Contains(f.Name(), "parse-error") {
 				continue
 			}
+			if strings.Contains(f.Name(), ".tmp-") {
+				continue // a writeGzip temp file left by a crash mid-write: not a capture
+			}
 			data, err := readCaptureBytes(filepath.Join(dir, e.Name(), f.Name()))
 			if err != nil {
-				t.Fatalf("read capture %s/%s: %v", e.Name(), f.Name(), err)
+				// Reported, not fatal: one truncated stream must not hide the
+				// parse regressions in the thousands of captures after it.
+				t.Errorf("read capture %s/%s: %v", e.Name(), f.Name(), err)
+				continue
 			}
 			total++
 			if _, err := ParseFeed(p, data); err != nil {
@@ -288,15 +302,24 @@ func TestReplayRealCapturesNeverSilentlyOperational(t *testing.T) {
 		if !ok {
 			continue
 		}
-		files, _ := os.ReadDir(filepath.Join(dir, e.Name()))
+		files, err := os.ReadDir(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Errorf("read %s: %v", e.Name(), err)
+			continue
+		}
 		for _, f := range files {
-			if f.IsDir() || strings.Contains(f.Name(), "parse-error") {
+			if f.IsDir() || strings.Contains(f.Name(), "parse-error") || strings.Contains(f.Name(), ".tmp-") {
 				continue
 			}
 			want, ok := captureSeverity(f.Name())
-			if !ok || want == SevNone {
-				continue // the capture itself recorded "operational"
+			if !ok {
+				t.Logf("%s/%s carries no severity label — skipping", e.Name(), f.Name())
+				continue
 			}
+			// A "-none" capture is NOT an operational page: FeedCapture writes
+			// nothing for those. It is a page whose aggregate was none while
+			// it listed incidents, so it belongs in this sweep: a parser that
+			// stops seeing those incidents is exactly the regression below.
 			data, err := readCaptureBytes(filepath.Join(dir, e.Name(), f.Name()))
 			if err != nil {
 				// A capture that cannot be read is a capture this test did not
