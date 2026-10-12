@@ -15,7 +15,7 @@ import (
 // Mistral's status page (status.mistral.ai) moved from Checkly to Rootly. The
 // Checkly JSON endpoint the previous adapter read answers 404 now, and the Rootly
 // page offers no public JSON or RSS (index.json 404, feed.rss and feed.atom 404,
-// history.rss 401; measured 2026-10-11). What it does serve is a server-rendered
+// history.rss 401, all measured). What it does serve is a server-rendered
 // HTML page with every service's status in it, so the feed IS the page.
 //
 // The host sits behind a Cloudflare managed challenge that keys on how the
@@ -165,11 +165,29 @@ func parseRootly(data []byte) (Result, error) {
 	return res, nil
 }
 
-// rootlyAllClear reports whether the page banner is the all-clear verdict,
-// and only that one: "Not Operational" or "Partially Operational" must not
-// pass for it, so the test is the whole phrase, not a word in it.
+// rootlyAllClear reports whether the page banner is an all-clear verdict: it
+// says "operational" and nothing that takes it back. "Not Operational" and
+// "Partially Operational" must not pass for it; "All Systems Are Operational"
+// and "All services operational" must, or a reworded all-clear becomes a
+// minor incident that never closes.
 func rootlyAllClear(banner string) bool {
-	return strings.Join(rootlyWords(banner), " ") == "all systems operational"
+	words := rootlyWords(banner)
+	if !slices.Contains(words, "operational") {
+		return false
+	}
+	for _, w := range words {
+		if slices.Contains(rootlyNotClear, w) {
+			return false
+		}
+	}
+	return true
+}
+
+// rootlyNotClear are the words that qualify an "operational" into something
+// less: a banner carrying any of them is not all clear.
+var rootlyNotClear = []string{
+	"not", "no", "partial", "partially", "degraded", "outage", "down", "unavailable",
+	"maintenance", "issue", "issues", "affected", "major", "minor", "incident", "incidents",
 }
 
 // rootlyWords lower-cases a label and splits it into words, so a keyword is

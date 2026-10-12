@@ -1995,6 +1995,14 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 	case errors.Is(err, providers.ErrNoFeed):
 		st.skipped = true
 		st.outcome = history.OutcomeSkipped
+		if errors.Is(err, providers.ErrChallenged) {
+			// Filed as a skip like any absent feed, but the log must say
+			// which: a challenge that outlasts every attempt is the request
+			// shape being refused again, and that is the first thing to look
+			// at when a Page provider goes grey.
+			slog.Warn("provider feed challenged on every attempt, read as no public feed",
+				"id", p.ID, "attempts", tries)
+		}
 	case err != nil:
 		st.err = err
 		st.res = providers.Result{Feed: providers.FeedUnreachable}

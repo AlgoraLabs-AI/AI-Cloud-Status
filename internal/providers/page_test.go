@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -13,7 +15,7 @@ import (
 // provider past Cloudflare's managed challenge at status.mistral.ai: the Fetch
 // Metadata of a top-level navigation and an HTML Accept, under this app's own
 // User-Agent. Every request without the Sec-Fetch headers was challenged
-// (measured 2026-10-11); drop one of them here and the row goes grey again
+// (measured); drop one of them here and the row goes grey again
 // without any test noticing, which is why this one exists. The API providers
 // keep the feed Accept and send no Fetch Metadata: a JSON endpoint is not a
 // document.
@@ -53,6 +55,49 @@ func TestCheckAsksForAPageAsADocument(t *testing.T) {
 	if got.Get("Sec-Fetch-Dest") != "" || !strings.HasPrefix(got.Get("Accept"), "application/json") {
 		t.Errorf("API request carries document headers: Accept=%q Sec-Fetch-Dest=%q",
 			got.Get("Accept"), got.Get("Sec-Fetch-Dest"))
+	}
+}
+
+// TestFeedCaptureDedupsAPageWhoseTokensRotate: a Rails page mints a fresh CSRF
+// token and fresh CSP nonces per response, so two polls of the SAME open
+// incident differ byte for byte. Hashed raw, every poll would archive the
+// whole page again and an incident would evict its own onset from the budget;
+// the dedup key blanks those parts for a Page provider and keeps them for a
+// feed, whose bytes are the key.
+func TestFeedCaptureDedupsAPageWhoseTokensRotate(t *testing.T) {
+	dir := t.TempDir()
+	fc := NewFeedCapture(dir)
+	// The full live page: it carries the csrf-token and csp-nonce metas and
+	// the per-script nonce attributes the trimmed fixtures dropped.
+	whole := string(readFixture(t, filepath.Join("captures", "mistral-20261011-214000-none.html")))
+	rotate := func(tag string) string {
+		s := strings.Replace(whole, `csp-nonce" content="`, `csp-nonce" content="`+tag, 1)
+		s = strings.Replace(s, `csrf-token" content="`, `csrf-token" content="`+tag, 1)
+		return strings.ReplaceAll(s, ` nonce="`, ` nonce="`+tag)
+	}
+	first, second := rotate("AAAA"), rotate("BBBB")
+	if !strings.Contains(whole, ` nonce="`) || !strings.Contains(whole, `csrf-token" content="`) || first == second {
+		t.Fatal("capture lacks the rotating parts this test is about")
+	}
+	res := Result{Severity: SevCritical, Incidents: []Incident{{Summary: "x", Severity: SevCritical}}}
+
+	page := Provider{ID: "page", Page: true}
+	fc.Capture(page, []byte(first), res, nil)
+	fc.Capture(page, []byte(second), res, nil)
+	files, _ := os.ReadDir(filepath.Join(dir, "page"))
+	if len(files) != 1 {
+		t.Errorf("page captured %d times, want 1: the rotating token and nonces are not a new state", len(files))
+	}
+
+	// The control: for a feed the bytes ARE the key, so the same two bodies
+	// are two captures. Two states, because the capture name has one-second
+	// resolution and a same-second same-state pair would share a file.
+	feed := Provider{ID: "feed"}
+	fc.Capture(feed, []byte(first), res, nil)
+	fc.Capture(feed, []byte(second), Result{Severity: SevMajor, Incidents: res.Incidents}, nil)
+	files, _ = os.ReadDir(filepath.Join(dir, "feed"))
+	if len(files) != 2 {
+		t.Errorf("feed captured %d times, want 2: a feed's bytes are its own key", len(files))
 	}
 }
 

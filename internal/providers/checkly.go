@@ -2,6 +2,7 @@ package providers
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"time"
@@ -50,6 +51,17 @@ type checklyIncident struct {
 // are tied to services rather than geographic regions, so they are recorded as
 // global (region-agnostic). With no open incidents the service is operational.
 func parseCheckly(data []byte) (Result, error) {
+	// The anchor: the "incidents" key must be present, even when empty. As the
+	// legacy reader behind ParseFeed this adapter is handed every body the
+	// Rootly parser rejects, and `{}` or `{"message":"Forbidden"}` must read
+	// as unreadable, not as a quiet all-clear.
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(decodeFeed(data), &doc); err != nil {
+		return Result{}, err
+	}
+	if _, ok := doc["incidents"]; !ok {
+		return Result{}, errors.New("checkly: document carries no incidents key")
+	}
 	var feed checklyIncidents
 	if err := json.Unmarshal(decodeFeed(data), &feed); err != nil {
 		return Result{}, err

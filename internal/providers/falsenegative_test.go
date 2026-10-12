@@ -169,6 +169,11 @@ func TestJSONAdaptersRejectResponsesMissingTheirAnchor(t *testing.T) {
 		if _, err := parseInstatus([]byte(doc)); err == nil {
 			t.Errorf("parseInstatus(%s) accepted a non-feed response as healthy", doc)
 		}
+		// The legacy reader behind ParseFeed sees every body the live parser
+		// rejects, so a JSON error body must not read as a clean Checkly feed.
+		if _, err := parseCheckly([]byte(doc)); err == nil {
+			t.Errorf("parseCheckly(%s) accepted a non-feed response as healthy", doc)
+		}
 	}
 }
 

@@ -885,9 +885,105 @@ func encodeUTF16LE(s string) []byte {
 	return out
 }
 
-// TestParseRootlyOperational reads the live Mistral page as captured on
-// 2026-10-11 (header, banner, legend and three of the fifteen service rows,
-// uptime charts trimmed): all clear is SevNone with no incident.
+// The Checkly adapter has no live provider since Mistral moved to Rootly, but it
+// is the legacy reader of every Mistral capture archived before the move (see
+// checkly.go), and the alert audit derives severities from those captures. Its
+// tests stay for that reason.
+
+// TestParseChecklyTimesAndNote pins the Checkly (Mistral) incident metadata:
+// created_at → Started, newest update → Updated + Note.
+func TestParseChecklyTimesAndNote(t *testing.T) {
+	feed := `{"incidents":[{"name":"Audio API Degraded","severity":"MEDIUM",
+	 "created_at":"2026-07-17T07:55:56.406Z","updated_at":"2026-07-17T07:55:56.428Z",
+	 "services":[{"name":"Audio API"}],
+	 "incidentUpdates":[{"status":"INVESTIGATING",
+	  "description":"Requests to the Audio API are experiencing degraded service.",
+	  "created_at":"2026-07-17T08:30:00.000Z"}]}]}`
+	res, err := parseCheckly([]byte(feed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Incidents) != 1 {
+		t.Fatalf("incidents = %d, want 1", len(res.Incidents))
+	}
+	inc := res.Incidents[0]
+	if inc.Note == "" || inc.Started.IsZero() {
+		t.Errorf("Note/Started missing: %+v", inc)
+	}
+	// Updated must advance to the newest update's timestamp (08:30 > 07:55).
+	if inc.Updated.UTC().Hour() != 8 {
+		t.Errorf("Updated = %v, want the newest update time", inc.Updated)
+	}
+}
+
+func TestParseChecklyOpenIncidents(t *testing.T) {
+	res, err := parseCheckly(readFixture(t, "checkly_incidents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// MAJOR is the top of Checkly's MINOR < MEDIUM < MAJOR scale.
+	if res.Severity != SevCritical {
+		t.Errorf("severity = %v, want critical (worst open incident)", res.Severity)
+	}
+	if len(res.Incidents) != 2 {
+		t.Fatalf("incidents = %d, want 2 open", len(res.Incidents))
+	}
+	inc := findIncident(res.Incidents, "Deep Research is down.")
+	if !strings.Contains(inc.Summary, "Vibe") {
+		t.Errorf("incident summary %q should name the affected service", inc.Summary)
+	}
+}
+
+// TestChecklySeverityScale pins Checkly's three-level scale. MEDIUM used to be
+// unmapped and fell through to the SevMinor default, capping Mistral below the
+// SevMajor alert threshold: every Mistral incident payload captured over
+// 2026-07-18..23 was MEDIUM, so Mistral could never raise an alert.
+func TestChecklySeverityScale(t *testing.T) {
+	cases := map[string]Severity{
+		"MINOR":       SevMinor,
+		"MEDIUM":      SevMajor,
+		"MAJOR":       SevCritical,
+		"CRITICAL":    SevCritical,
+		"MAINTENANCE": SevMinor,
+		"medium":      SevMajor, // case-insensitive
+	}
+	for in, want := range cases {
+		if got := checklySeverity(in); got != want {
+			t.Errorf("checklySeverity(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// TestParseChecklyMediumAlerts is the end-to-end guard on the above: the real
+// captured Mistral payload must reach the SevMajor alert threshold.
+func TestParseChecklyMediumAlerts(t *testing.T) {
+	res, err := parseCheckly(readFixture(t, "checkly_medium.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity < SevMajor {
+		t.Errorf("severity = %v, want >= major so a MEDIUM incident can alert", res.Severity)
+	}
+	if len(res.Incidents) != 1 {
+		t.Fatalf("incidents = %d, want 1", len(res.Incidents))
+	}
+}
+
+// TestParseChecklyOperational: an empty incidents list IS the all-clear, and
+// the anchor (the key being present) is what tells it from a JSON error body.
+func TestParseChecklyOperational(t *testing.T) {
+	res, err := parseCheckly(readFixture(t, "checkly_operational.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevNone || len(res.Incidents) != 0 {
+		t.Errorf("operational page = %v with %d incidents, want none/0", res.Severity, len(res.Incidents))
+	}
+}
+
+// TestParseRootlyOperational reads the live Mistral page as captured (header,
+// banner, legend and three of the fifteen service rows, uptime charts
+// trimmed): all clear is SevNone with no incident.
 func TestParseRootlyOperational(t *testing.T) {
 	res, err := parseRootly(readFixture(t, "rootly_operational.html"))
 	if err != nil {
@@ -1084,16 +1180,20 @@ func TestParseFeedReadsAnArchivedCaptureWithTheAdapterOfItsTime(t *testing.T) {
 	}
 }
 
-// TestRootlyAllClearIsTheWholePhrase: the banner test is an exact phrase, not
-// a word in it, so a qualified "operational" is not all clear.
+// TestRootlyAllClearIsTheWholePhrase: all clear is "operational" with nothing
+// taking it back, so a qualified "operational" is not all clear and a reworded
+// all-clear still is (a banner read as an incident would never close).
 func TestRootlyAllClearIsTheWholePhrase(t *testing.T) {
 	for banner, want := range map[string]bool{
-		"All Systems Operational":   true,
-		"  all systems operational": true,
-		"Not Operational":           false,
-		"Partially Operational":     false,
-		"Partial System Outage":     false,
-		"":                          false,
+		"All Systems Operational":               true,
+		"  all systems operational":             true,
+		"All Systems Are Operational":           true,
+		"All services operational":              true,
+		"Not Operational":                       false,
+		"Partially Operational":                 false,
+		"Operational with degraded performance": false,
+		"Partial System Outage":                 false,
+		"":                                      false,
 	} {
 		if got := rootlyAllClear(banner); got != want {
 			t.Errorf("rootlyAllClear(%q) = %v, want %v", banner, got, want)

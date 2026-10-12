@@ -16,7 +16,7 @@ import (
 
 // TestAChallengedPollIsRetriedBeforeItIsFiledAsNoFeed pins the poll's answer
 // to a Cloudflare managed challenge whose verdict changes from one connection
-// to the next (measured on status.mistral.ai, 2026-10-11): a challenge is
+// to the next (measured on status.mistral.ai): a challenge is
 // retried like an unreadable feed, so a page that answers on the second
 // connection is READ, and only a challenge that outlasts every attempt is
 // filed as the skip an Optional provider without a feed gets. A plain 403 is

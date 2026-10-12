@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"sync"
@@ -105,7 +106,7 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 		return // operational, nothing to learn from
 	}
 
-	sum := sha256.Sum256(data)
+	sum := sha256.Sum256(captureKey(p, data))
 	hash := hex.EncodeToString(sum[:8])
 	f.mu.Lock()
 	if f.lastHash == nil {
@@ -148,6 +149,25 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 	slog.Info("feed sample captured", "provider", p.ID, "state", state, "file", name)
 	f.prune(dir)
 	pruneToBudget(f.Dir)
+}
+
+// pageVolatile matches the parts of an HTML status page that change on every
+// response without the status changing: the CSRF token and the CSP nonces a
+// Rails-rendered page (Rootly) mints per request.
+var pageVolatile = regexp.MustCompile(`(?i)\bnonce="[^"]*"|<meta name="(?:csrf-token|csp-nonce)" content="[^"]*"`)
+
+// captureKey is what the dedup hash is taken over. A feed's bytes are stable
+// between polls, so the body is its own key; a status PAGE carries a fresh
+// CSRF token and fresh nonces on every response, so hashing the body would
+// never find a duplicate and an open incident would write a new capture of
+// the whole page every minute, evicting its own onset from the budget before
+// the incident ends. For a Page provider the volatile parts are blanked
+// first; the bytes archived are still the original ones.
+func captureKey(p Provider, data []byte) []byte {
+	if !p.Page {
+		return data
+	}
+	return pageVolatile.ReplaceAll(data, nil)
 }
 
 // writeGzip writes data to path, gzipped, via a temp file and a rename so a

@@ -376,7 +376,7 @@ var ErrNoFeed = errors.New("provider exposes no public status feed")
 // request SHAPE was refused, not the endpoint found absent. It wraps ErrNoFeed
 // because that is what it means if it persists, and it is told apart so a
 // caller can retry it first: the verdict is not stable from one connection to
-// the next (measured 2026-10-11 on status.mistral.ai with the document request
+// the next (measured on status.mistral.ai with the document request
 // Check sends for a Page provider: runs of 15 of 15 answered, and runs where
 // one connection in three was challenged while the next one was not).
 var ErrChallenged = fmt.Errorf("%w: the request was challenged", ErrNoFeed)
@@ -448,7 +448,7 @@ func (c *Checker) Check(ctx context.Context, p Provider) (Result, error) {
 		// The feed is the status page itself, so ask for it the way a page is
 		// asked for: an HTML Accept and the Fetch Metadata a top-level
 		// navigation carries. That metadata is what Cloudflare's managed
-		// challenge at status.mistral.ai keys on. Measured 2026-10-11, this
+		// challenge at status.mistral.ai keys on. Measured with this
 		// User-Agent throughout and Go's default TLS: without the Sec-Fetch
 		// headers every request answered 403 "Just a moment..." (Cf-Mitigated:
 		// challenge), with them 15 of 15 fresh connections answered the page.
