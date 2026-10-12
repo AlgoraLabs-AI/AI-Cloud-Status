@@ -1029,6 +1029,61 @@ func TestParseRootlyFailsClosedOnAPartialRead(t *testing.T) {
 	}
 }
 
+// TestParseRootlyReadsTheLastTextSpanAsTheLabel: the real markup of an
+// affected row is unverified (no incident was open when the page was
+// captured), so the label is the last text span of the header rather than
+// its last element. A row that carries a badge after the label is then read
+// through the badge's words, and the icon decides, instead of the row going
+// unreadable during the outage it reports.
+func TestParseRootlyReadsTheLastTextSpanAsTheLabel(t *testing.T) {
+	whole := string(readFixture(t, "rootly_operational.html"))
+	// The row's icon comes BEFORE its name, so edit from the row's own start.
+	i := strings.LastIndex(whole[:strings.Index(whole, "Audio API")], "<details")
+	page := whole[:i] + strings.Replace(whole[i:],
+		`<span class="text-green-400">Operational</span>`,
+		`<span class="text-red-500">Partial Outage</span><span class="text-xs">1 incident</span>`, 1)
+	page = page[:i] + strings.Replace(page[i:], "sp-success-bg text-green-400", "sp-error-bg text-red-500", 1)
+	res, err := parseRootly([]byte(page))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevMajor || len(res.Incidents) != 1 || strings.Join(res.Incidents[0].Components, ",") != "Audio API" {
+		t.Errorf("got %v with %+v, want major (red icon) on Audio API alone", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseRootlyAnEmptyBannerIsAnError: a banner span with no words is the
+// anchor missing, never a minor incident with an empty summary.
+func TestParseRootlyAnEmptyBannerIsAnError(t *testing.T) {
+	page := strings.Replace(string(readFixture(t, "rootly_operational.html")), "All Systems Operational", " ", 1)
+	if res, err := parseRootly([]byte(page)); err == nil {
+		t.Errorf("empty banner parsed as %v with %+v, want an error", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseFeedReadsAnArchivedCaptureWithTheAdapterOfItsTime: Mistral's
+// captures from before the move to Rootly are Checkly JSON. The archive
+// outlives the feed, so ParseFeed (what the audit and the replay use) hands
+// them to the legacy adapter, while a live Check (parse) still rejects them:
+// a Checkly body arriving from the live host today IS an unreadable feed.
+func TestParseFeedReadsAnArchivedCaptureWithTheAdapterOfItsTime(t *testing.T) {
+	mistral, ok := providerByID("mistral")
+	if !ok || mistral.Kind != KindRootly {
+		t.Fatalf("mistral = %+v, want the Rootly provider", mistral)
+	}
+	capture := readFixture(t, filepath.Join("captures", "mistral-20260727-113302-major.json"))
+	res, err := ParseFeed(mistral, capture)
+	if err != nil {
+		t.Fatalf("archived Checkly capture no longer parses: %v", err)
+	}
+	if res.Severity < SevMajor || len(res.Incidents) == 0 {
+		t.Errorf("archived capture read as %v with %d incidents, want the MEDIUM incident it recorded", res.Severity, len(res.Incidents))
+	}
+	if _, err := parse(mistral, capture); err == nil {
+		t.Error("the live parser accepted a Checkly body for the Rootly provider")
+	}
+}
+
 // TestRootlyAllClearIsTheWholePhrase: the banner test is an exact phrase, not
 // a word in it, so a qualified "operational" is not all clear.
 func TestRootlyAllClearIsTheWholePhrase(t *testing.T) {

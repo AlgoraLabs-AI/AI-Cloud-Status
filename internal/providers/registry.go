@@ -24,6 +24,10 @@ var (
 	registryMu sync.Mutex
 	registered []Provider
 	parsers    = map[Kind]ParseFunc{}
+	// legacy maps a provider ID to the Kinds its feed USED to be, oldest
+	// last. A capture archived under a previous feed is still that provider's
+	// capture, and ParseFeed reads it with the adapter of its time.
+	legacy = map[string][]Kind{}
 )
 
 // Register adds a provider definition to the built-in set. Intended to be called
@@ -57,6 +61,23 @@ func parserFor(k Kind) (ParseFunc, bool) {
 	defer registryMu.Unlock()
 	fn, ok := parsers[k]
 	return fn, ok
+}
+
+// RegisterLegacy records that provider id's feed used to be of Kind k, so an
+// archived capture of that feed still parses (see ParseFeed). Intended to be
+// called from the legacy adapter's init(), beside its RegisterParser, when a
+// provider moves to a new backend and the old one keeps no live provider.
+func RegisterLegacy(id string, k Kind) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	legacy[id] = append(legacy[id], k)
+}
+
+// legacyKindsFor returns the Kinds provider id's feed used to be, newest first.
+func legacyKindsFor(id string) []Kind {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	return append([]Kind(nil), legacy[id]...)
 }
 
 // Default returns the registered providers, grouped by Category display order

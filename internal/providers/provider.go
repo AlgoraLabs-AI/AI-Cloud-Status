@@ -102,6 +102,7 @@ const (
 	KindAWS         Kind = "aws"         // AWS Health public current events
 	KindAzure       Kind = "azure"       // Azure status RSS feed
 	KindRootly      Kind = "rootly"      // Rootly status page, read from its HTML (e.g. Mistral)
+	KindCheckly     Kind = "checkly"     // Checkly status page; legacy, kept for Mistral's archived captures
 	KindBetterStack Kind = "betterstack" // Better Stack status page (e.g. Hugging Face)
 	KindInstatus    Kind = "instatus"    // Instatus status page (e.g. Perplexity)
 	KindXAI         Kind = "xai"         // xAI status RSS feed (status.x.ai/feed.xml)
@@ -398,8 +399,25 @@ func parse(p Provider, data []byte) (Result, error) {
 // rather than trusting FeedCapture's own filename label (see feedcapture.go —
 // that label reads the page-level indicator, not each incident's own impact,
 // and can disagree with it).
+//
+// An archive outlives a feed. When the current adapter rejects the bytes and
+// the provider's feed used to be of another Kind (RegisterLegacy), the
+// adapter of that time gets to read them: Mistral's 2026-07 captures are
+// Checkly JSON, and without this every one of them read as a broken parser
+// the day the provider moved to Rootly. A live Check never takes this path.
 func ParseFeed(p Provider, data []byte) (Result, error) {
-	return parse(p, data)
+	res, err := parse(p, data)
+	if err == nil {
+		return res, nil
+	}
+	for _, k := range legacyKindsFor(p.ID) {
+		if fn, ok := parserFor(k); ok {
+			if r, e := fn(p, data); e == nil {
+				return r, nil
+			}
+		}
+	}
+	return res, err
 }
 
 // Checker performs a live provider health check.
@@ -450,11 +468,19 @@ func (c *Checker) Check(ctx context.Context, p Provider) (Result, error) {
 	}
 	defer resp.Body.Close()
 
+	// A Cloudflare managed challenge is read off its header, whatever status
+	// it comes with: 403 is the usual one, a JS challenge can be 503, and a
+	// challenge document can even arrive as a 200, which would otherwise be
+	// parsed, fail, and be filed as an unreadable feed (retried, then counted
+	// against the provider as a failure run).
+	if resp.Header.Get("Cf-Mitigated") == "challenge" {
+		if p.Optional {
+			return Result{}, ErrChallenged
+		}
+		return Result{Feed: FeedUnreachable}, &StatusError{Provider: p.Name, Code: resp.StatusCode, Challenged: true}
+	}
 	if resp.StatusCode != http.StatusOK {
 		if p.Optional && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden) {
-			if resp.Header.Get("Cf-Mitigated") == "challenge" {
-				return Result{}, ErrChallenged
-			}
 			return Result{}, ErrNoFeed
 		}
 		return Result{Feed: FeedUnreachable}, &StatusError{Provider: p.Name, Code: resp.StatusCode}

@@ -52,7 +52,15 @@ var (
 	// a heading but no icon, which is how it is told apart.
 	rootlySummary = regexp.MustCompile(`(?is)<summary\b[^>]*>(.*?)</summary>`)
 	rootlyName    = regexp.MustCompile(`(?is)<h2\b[^>]*>(.*?)</h2>`)
-	rootlyStatus  = regexp.MustCompile(`(?is)<span\b[^>]*>([^<]*?)</span>$`)
+	// rootlyTextSpan matches a span holding bare text; the LAST one in a row's
+	// header is its status label. The label closes the header on the captured
+	// page; should an affected row carry something after it (a count, a
+	// badge), that is read instead and the icon colour decides what an
+	// unfamiliar label means, which keeps a row readable during the very
+	// outage it reports. A header with no text span at all is unreadable.
+	rootlyTextSpan = regexp.MustCompile(`(?is)<span\b[^>]*>\s*([^<>]+?)\s*</span>`)
+	// rootlyDocumentEnd is the closing tag of a whole document.
+	rootlyDocumentEnd = regexp.MustCompile(`(?i)</html>\s*$`)
 	// rootlyIcon reads the status icon's colour class, the page's second
 	// channel for the same fact: its legend pairs sp-success-bg with
 	// "Operational", sp-error-bg with "Affected" and bg-yellow-100 with
@@ -81,7 +89,7 @@ type rootlyService struct {
 // rows or no banner at all (a challenge page, an error page, a redesign).
 func parseRootly(data []byte) (Result, error) {
 	page := string(decodeFeed(data))
-	if !strings.Contains(strings.ToLower(page), "</html>") {
+	if !rootlyDocumentEnd.MatchString(page) {
 		return Result{}, errors.New("rootly: body is not a whole document")
 	}
 
@@ -96,10 +104,9 @@ func parseRootly(data []byte) (Result, error) {
 		if icon == nil {
 			continue // a section header ("Services"): a heading, no status icon
 		}
-		status := rootlyStatus.FindStringSubmatch(block)
 		svc := rootlyService{Name: plainNote(name[1]), Icon: icon[1]}
-		if status != nil {
-			svc.Status = plainNote(status[1])
+		if spans := rootlyTextSpan.FindAllStringSubmatch(block, -1); len(spans) > 0 {
+			svc.Status = plainNote(spans[len(spans)-1][1])
 		}
 		if svc.Status == "" {
 			return Result{}, fmt.Errorf("rootly: service row %q has no readable status label", svc.Name)
@@ -115,6 +122,11 @@ func parseRootly(data []byte) (Result, error) {
 		return Result{}, errors.New("rootly: page carries no status banner")
 	}
 	banner := plainNote(m[1])
+	if banner == "" {
+		// A banner with no words is the anchor missing, not a verdict: it
+		// must not become a minor incident with an empty summary.
+		return Result{}, errors.New("rootly: status banner carries no text")
+	}
 
 	res := Result{Severity: SevNone}
 	var affected, notes []string

@@ -89,7 +89,24 @@ func TestCheckTellsAChallengeFromAnAbsentFeed(t *testing.T) {
 	required := Provider{ID: "r", Name: "R", Kind: KindRootly, URL: challenged.URL, Page: true}
 	res, err := ck.Check(context.Background(), required)
 	var se *StatusError
-	if !errors.As(err, &se) || se.Code != http.StatusForbidden || res.Feed != FeedUnreachable {
-		t.Errorf("challenged required provider: res=%+v err=%v, want an unreachable feed with a 403 StatusError", res, err)
+	if !errors.As(err, &se) || se.Code != http.StatusForbidden || !se.Challenged || res.Feed != FeedUnreachable {
+		t.Errorf("challenged required provider: res=%+v err=%v, want an unreachable feed with a 403 StatusError that says it was challenged", res, err)
+	}
+
+	// The challenge is read off its header, whatever status it rides on: a
+	// 200-shaped challenge document is not a page to parse and fail on, and a
+	// 503 one is not an outage of the provider.
+	for _, code := range []int{http.StatusOK, http.StatusServiceUnavailable} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Cf-Mitigated", "challenge")
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte("<html><title>Just a moment...</title></html>"))
+		}))
+		optional.URL = srv.URL
+		_, err := (&Checker{Client: srv.Client()}).Check(context.Background(), optional)
+		srv.Close()
+		if !errors.Is(err, ErrChallenged) {
+			t.Errorf("challenge with status %d: err = %v, want ErrChallenged", code, err)
+		}
 	}
 }
