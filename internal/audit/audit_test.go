@@ -55,6 +55,42 @@ func writeCapture(t *testing.T, dir, provider string, ts time.Time, label string
 	return path
 }
 
+// TestLoadCapturesReadsWhatFeedCaptureWrites is the round trip the archive's
+// naming rests on: a page Kind's capture is written by the real FeedCapture
+// (gzipped, named .html.gz) and read back by the real loader, which keys on
+// the timestamp and the gzip magic and never on the suffix. A reader that
+// started filtering by ".json" would fail here, not in production.
+func TestLoadCapturesReadsWhatFeedCaptureWrites(t *testing.T) {
+	page, err := os.ReadFile(filepath.Join("..", "providers", "testdata", "rootly_degraded.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	p := providers.Provider{ID: "page-roundtrip", Name: "Page", Kind: providers.KindRootly}
+	res, err := providers.ParseFeed(p, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providers.NewFeedCapture(filepath.Join(dir, "feed-samples")).Capture(p, page, res, nil)
+
+	pdir := filepath.Join(dir, "feed-samples", p.ID)
+	files, err := os.ReadDir(pdir)
+	if err != nil || len(files) != 1 || filepath.Ext(files[0].Name()) != ".gz" || !containsSuffix(files[0].Name(), ".html.gz") {
+		t.Fatalf("FeedCapture wrote %v (%v), want one .html.gz capture", files, err)
+	}
+	caps, err := loadCaptures(pdir, p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caps) != 1 || caps[0].ParseErr != nil || caps[0].Severity != res.Severity {
+		t.Errorf("loadCaptures read %+v, want the one capture at %v with no parse error", caps, res.Severity)
+	}
+}
+
+func containsSuffix(name, suffix string) bool {
+	return len(name) >= len(suffix) && name[len(name)-len(suffix):] == suffix
+}
+
 // writeAlertLog writes alert-log.jsonl with the given entries.
 func writeAlertLog(t *testing.T, dir string, entries []alertlog.Entry) {
 	t.Helper()

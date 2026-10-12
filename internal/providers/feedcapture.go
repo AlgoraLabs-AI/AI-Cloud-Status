@@ -144,9 +144,9 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 	// tell what the file is (XML feeds share it: the name says "feed", not
 	// "JSON"), and the audit tool reads both this and the legacy plain ".json"
 	// left by earlier builds. A page Kind's capture is the page's HTML and is
-	// named so; nothing that reads the archive keys on the suffix (the audit
-	// sniffs the gzip magic and reads the timestamp, pruning reads the
-	// timestamp, the replay cuts the state at its first dot).
+	// named so. The archive's readers key on the timestamp and the gzip
+	// magic, never on the suffix; the round-trip test in internal/audit is
+	// what holds them to that.
 	ext := ".json.gz"
 	if p.Kind.Page() {
 		ext = ".html.gz"
