@@ -2,9 +2,12 @@ package providers
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
+	"unicode"
 )
 
 // init self-registers the Rootly adapter and the Mistral provider it backs.
@@ -20,8 +23,8 @@ import (
 // Fetch Metadata) answers 403 "Just a moment..." on every path, a document
 // request with this app's own User-Agent answers the page. Page: true is what
 // makes Check send the latter (see there for the measurement). A challenge
-// page is HTML too, which is why parseRootly anchors on the service rows: a
-// page with none is an error, never a clean all-clear.
+// page is HTML too, which is why parseRootly anchors on the service rows and
+// the banner: a page without them is an error, never a clean all-clear.
 //
 // Optional stays: if the challenge is tightened again a 403 is "no public feed",
 // the row reads "feed unavailable" rather than an outage, and the alert audit
@@ -40,10 +43,13 @@ func init() {
 
 var (
 	// rootlyBanner is the page-level verdict above the service list, e.g.
-	// "All Systems Operational".
-	rootlyBanner = regexp.MustCompile(`(?is)<span class="text-4xl[^"]*">\s*(.*?)\s*</span>`)
+	// "All Systems Operational": the one span styled text-4xl, wherever that
+	// token sits in its class list.
+	rootlyBanner = regexp.MustCompile(`(?is)<span\b[^>]*class="[^"]*\btext-4xl\b[^"]*"[^>]*>\s*(.*?)\s*</span>`)
 	// rootlySummary isolates one collapsible row's header. Every service is one
-	// such row: an icon, an <h2> with the name, and a status label closing it.
+	// such row: a status icon, an <h2> with the name, and a status label that
+	// closes the header. The "Services" section header is a summary too, with
+	// a heading but no icon, which is how it is told apart.
 	rootlySummary = regexp.MustCompile(`(?is)<summary\b[^>]*>(.*?)</summary>`)
 	rootlyName    = regexp.MustCompile(`(?is)<h2\b[^>]*>(.*?)</h2>`)
 	rootlyStatus  = regexp.MustCompile(`(?is)<span\b[^>]*>([^<]*?)</span>$`)
@@ -66,36 +72,49 @@ type rootlyService struct {
 // incident (the page carries no incident timeline, only the current state of
 // each service), titled with the page's own banner when it says more than
 // "all clear".
+//
+// It fails closed on three shapes, because every one of them would otherwise
+// read as operational: a body that is not a whole document (the response is
+// read through a size limit, and a truncated page has lost its last rows), a
+// service row whose status label cannot be read (one redesigned row among
+// intact ones is exactly how an outage would go unread), and a page with no
+// rows or no banner at all (a challenge page, an error page, a redesign).
 func parseRootly(data []byte) (Result, error) {
 	page := string(decodeFeed(data))
+	if !strings.Contains(strings.ToLower(page), "</html>") {
+		return Result{}, errors.New("rootly: body is not a whole document")
+	}
 
 	var services []rootlyService
 	for _, m := range rootlySummary.FindAllStringSubmatch(page, -1) {
 		block := strings.TrimSpace(m[1])
 		name := rootlyName.FindStringSubmatch(block)
+		if name == nil {
+			continue // not a row: no heading
+		}
+		icon := rootlyIcon.FindStringSubmatch(block)
+		if icon == nil {
+			continue // a section header ("Services"): a heading, no status icon
+		}
 		status := rootlyStatus.FindStringSubmatch(block)
-		if name == nil || status == nil {
-			continue // the "Services" section header has a heading but no status label
+		svc := rootlyService{Name: plainNote(name[1]), Icon: icon[1]}
+		if status != nil {
+			svc.Status = plainNote(status[1])
 		}
-		svc := rootlyService{Name: plainNote(name[1]), Status: plainNote(status[1])}
-		if icon := rootlyIcon.FindStringSubmatch(block); icon != nil {
-			svc.Icon = icon[1]
-		}
-		if svc.Name == "" || svc.Status == "" {
-			continue
+		if svc.Status == "" {
+			return Result{}, fmt.Errorf("rootly: service row %q has no readable status label", svc.Name)
 		}
 		services = append(services, svc)
 	}
-	// The anchor. A Cloudflare challenge, an error page or a redesign that
-	// drops the rows must read "unreadable", never "operational".
 	if len(services) == 0 {
 		return Result{}, errors.New("rootly: page carries no service rows")
 	}
 
-	banner := ""
-	if m := rootlyBanner.FindStringSubmatch(page); m != nil {
-		banner = plainNote(m[1])
+	m := rootlyBanner.FindStringSubmatch(page)
+	if m == nil {
+		return Result{}, errors.New("rootly: page carries no status banner")
 	}
+	banner := plainNote(m[1])
 
 	res := Result{Severity: SevNone}
 	var affected, notes []string
@@ -114,9 +133,8 @@ func parseRootly(data []byte) (Result, error) {
 	switch {
 	case len(affected) > 0:
 		summary := banner
-		if summary == "" || rootlyAllClear(summary) {
-			// The rows disagree with the banner (or there is none): say what
-			// the rows say.
+		if rootlyAllClear(summary) {
+			// The rows disagree with the banner: say what the rows say.
 			summary = strings.Join(notes, ", ")
 		}
 		res.Incidents = append(res.Incidents, Incident{
@@ -125,7 +143,7 @@ func parseRootly(data []byte) (Result, error) {
 			Components: affected,
 			Note:       strings.Join(notes, "\n"),
 		})
-	case banner != "" && !rootlyAllClear(banner):
+	case !rootlyAllClear(banner):
 		// Every row reads operational but the banner does not: something is
 		// posted that the rows do not show. A real but unquantified
 		// degradation, floored at minor rather than read as all clear.
@@ -135,30 +153,47 @@ func parseRootly(data []byte) (Result, error) {
 	return res, nil
 }
 
-// rootlyAllClear reports whether the page banner is the all-clear verdict
-// ("All Systems Operational"). Every other banner Rootly renders names the
-// trouble (an outage, a degradation, a maintenance) and carries no
-// "operational".
+// rootlyAllClear reports whether the page banner is the all-clear verdict,
+// and only that one: "Not Operational" or "Partially Operational" must not
+// pass for it, so the test is the whole phrase, not a word in it.
 func rootlyAllClear(banner string) bool {
-	return strings.Contains(strings.ToLower(banner), "operational")
+	return strings.Join(rootlyWords(banner), " ") == "all systems operational"
+}
+
+// rootlyWords lower-cases a label and splits it into words, so a keyword is
+// matched as a word: "Countdown" is not "down".
+func rootlyWords(label string) []string {
+	return strings.FieldsFunc(strings.ToLower(label), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 }
 
 // rootlySeverity maps a service row's status label onto a Severity. The labels
-// are prose rather than an enum, so the match is by keyword, in the order that
-// keeps "Major Outage" above "Partial Outage". When the words are unfamiliar
-// the icon colour decides, per the page's own legend; when both are
-// unfamiliar the row is an open degradation of unknown size, floored at minor
-// and logged so a new vocabulary does not collapse silently.
+// are prose rather than an enum, so the match is by word, in the order that
+// keeps "Major Outage" above "Partial Outage". Only the bare label
+// "Operational" is healthy: a qualified one ("Not Operational", "Partially
+// Operational") is a degradation whatever the icon says. When the words are
+// unfamiliar the icon colour decides, per the page's own legend; when both
+// are unfamiliar the row is an open degradation of unknown size, floored at
+// minor and logged so a new vocabulary does not collapse silently.
 func rootlySeverity(status, icon string) Severity {
-	s := strings.ToLower(status)
+	words := rootlyWords(status)
+	has := func(ws ...string) bool {
+		for _, w := range ws {
+			if slices.Contains(words, w) {
+				return true
+			}
+		}
+		return false
+	}
 	switch {
-	case strings.Contains(s, "operational"):
+	case len(words) == 1 && words[0] == "operational":
 		return SevNone
-	case strings.Contains(s, "major"), strings.Contains(s, "down"), strings.Contains(s, "unavailable"):
+	case has("major", "down", "unavailable"):
 		return SevCritical
-	case strings.Contains(s, "partial"), strings.Contains(s, "outage"), strings.Contains(s, "affected"):
+	case has("partial", "partially", "outage", "affected", "operational"):
 		return SevMajor
-	case strings.Contains(s, "degraded"), strings.Contains(s, "maintenance"):
+	case has("degraded", "maintenance"):
 		return SevMinor
 	}
 	switch icon {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -442,6 +443,14 @@ func (c *Checker) Check(ctx context.Context, p Provider) (Result, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		if p.Optional && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden) {
+			if resp.Header.Get("Cf-Mitigated") == "challenge" {
+				// Still "no public feed" for the row and the audit, but say so
+				// in the log: a 403 from a Cloudflare challenge is the request
+				// shape being refused, not an endpoint that went away, and for
+				// a Page provider it is the regression to look for first.
+				slog.Warn("provider feed is behind a Cloudflare challenge, read as no public feed",
+					"provider", p.ID, "status", resp.StatusCode)
+			}
 			return Result{}, ErrNoFeed
 		}
 		return Result{Feed: FeedUnreachable}, &StatusError{Provider: p.Name, Code: resp.StatusCode}

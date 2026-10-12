@@ -940,6 +940,11 @@ func TestRootlySeverityScale(t *testing.T) {
 		{"Affected", "sp-error-bg", SevMajor},
 		{"Major Outage", "sp-error-bg", SevCritical},
 		{"major outage", "", SevCritical}, // case-insensitive
+		// A qualified "operational" is not operational, whatever the icon.
+		{"Not Operational", "sp-error-bg", SevMajor},
+		{"Partially Operational", "sp-success-bg", SevMajor},
+		// Keywords are words: "Countdown" is not "down".
+		{"Countdown", "sp-success-bg", SevNone},
 		{"Something New", "sp-error-bg", SevMajor},
 		{"Something New", "bg-yellow-100", SevMinor},
 		{"Something New", "sp-success-bg", SevNone},
@@ -969,11 +974,15 @@ func TestParseRootlyBannerAloneIsNotAllClear(t *testing.T) {
 
 // TestParseRootlyRejectsAPageWithoutServices pins the anchor. The Cloudflare
 // challenge that fronted this host for months is a 200-shaped HTML document
-// when it is not a 403; so is any error page. None of them carries a service
-// row, and none may read as operational.
+// when it is not a 403 (the fixture is the real one); so is any error page.
+// None of them carries a service row, and none may read as operational.
 func TestParseRootlyRejectsAPageWithoutServices(t *testing.T) {
+	challenge := readFixture(t, "rootly_challenge.html")
+	if !strings.Contains(string(challenge), "Just a moment") {
+		t.Fatal("rootly_challenge.html is not the Cloudflare challenge document")
+	}
 	notThePage := [][]byte{
-		readFixture(t, "rootly_challenge.html"),
+		challenge,
 		[]byte(`<html><body>nope</body></html>`),
 		[]byte(`{"message":"Forbidden"}`),
 		{},
@@ -981,6 +990,58 @@ func TestParseRootlyRejectsAPageWithoutServices(t *testing.T) {
 	for _, doc := range notThePage {
 		if _, err := parseRootly(doc); err == nil {
 			t.Errorf("parseRootly(%s) accepted a page with no service rows as healthy", truncate(string(doc), 40))
+		}
+	}
+}
+
+// TestParseRootlyFailsClosedOnAPartialRead pins the three shapes that would
+// otherwise read as operational: ONE row whose label the parser cannot read
+// while the others are intact (a redesign lands on every row at once, but an
+// outage lands on one, and that one carrying new markup is exactly the case),
+// a page truncated by the response size limit, and a page whose banner moved.
+func TestParseRootlyFailsClosedOnAPartialRead(t *testing.T) {
+	whole := string(readFixture(t, "rootly_operational.html"))
+
+	// Wrap the Audio API label in a tag the trailing-span regexp cannot see
+	// through; Agents API and Batch API stay readable and operational.
+	i := strings.Index(whole, "Audio API")
+	oneRowChanged := whole[:i] + strings.Replace(whole[i:],
+		`<span class="text-green-400">Operational</span>`,
+		`<span class="text-red-500"><b>Partial Outage</b></span>`, 1)
+	if res, err := parseRootly([]byte(oneRowChanged)); err == nil {
+		t.Errorf("one unreadable row among readable ones parsed as %v with %d incidents, want an error",
+			res.Severity, len(res.Incidents))
+	}
+
+	truncated := whole[:strings.LastIndex(whole, "Batch API")]
+	if _, err := parseRootly([]byte(truncated)); err == nil {
+		t.Error("a truncated page parsed, want an error")
+	}
+
+	noBanner := strings.Replace(whole, "text-4xl", "text-3xl", 1)
+	if _, err := parseRootly([]byte(noBanner)); err == nil {
+		t.Error("a page without the status banner parsed, want an error")
+	}
+
+	// The control: the whole page still reads.
+	if _, err := parseRootly([]byte(whole)); err != nil {
+		t.Fatalf("the unmodified fixture no longer parses: %v", err)
+	}
+}
+
+// TestRootlyAllClearIsTheWholePhrase: the banner test is an exact phrase, not
+// a word in it, so a qualified "operational" is not all clear.
+func TestRootlyAllClearIsTheWholePhrase(t *testing.T) {
+	for banner, want := range map[string]bool{
+		"All Systems Operational":   true,
+		"  all systems operational": true,
+		"Not Operational":           false,
+		"Partially Operational":     false,
+		"Partial System Outage":     false,
+		"":                          false,
+	} {
+		if got := rootlyAllClear(banner); got != want {
+			t.Errorf("rootlyAllClear(%q) = %v, want %v", banner, got, want)
 		}
 	}
 }
