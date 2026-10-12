@@ -198,6 +198,7 @@ var es = Catalog{
 	FeedErrDNS:            "No se pudo resolver la dirección de la página de estado (DNS). Estado del servicio desconocido.",
 	FeedErrTimeout:        "La página de estado no respondió a tiempo. Estado del servicio desconocido.",
 	FeedErrHTTP:           "La página de estado respondió HTTP %d. Estado del servicio desconocido.",
+	FeedErrChallenged:     "La página de estado respondió a esta comprobación automática con un desafío de Cloudflare. Estado del servicio desconocido.",
 	FeedErrUnparseable:    "La página de estado respondió con datos que esta app no pudo leer. Estado del servicio desconocido.",
 	FeedErrDetail:         "Detalle técnico: %s",
 	TrayStillRunningTitle: "%s sigue corriendo",

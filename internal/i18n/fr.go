@@ -197,6 +197,7 @@ var fr = Catalog{
 	FeedErrDNS:            "L'adresse de la page de statut n'a pas pu être résolue (DNS). État du service inconnu.",
 	FeedErrTimeout:        "La page de statut n'a pas répondu à temps. État du service inconnu.",
 	FeedErrHTTP:           "La page de statut a répondu HTTP %d. État du service inconnu.",
+	FeedErrChallenged:     "La page de statut a répondu à cette vérification automatique par un défi Cloudflare. État du service inconnu.",
 	FeedErrUnparseable:    "La page de statut a répondu avec des données que cette application n'a pas pu lire. État du service inconnu.",
 	FeedErrDetail:         "Détail technique : %s",
 	TrayStillRunningTitle: "%s est toujours en cours d'exécution",

@@ -718,6 +718,10 @@ func feedFailureMessage(err error) string {
 		return t.FeedErrTimeout
 	case providers.FeedFailHTTP:
 		return fmt.Sprintf(t.FeedErrHTTP, code)
+	case providers.FeedFailChallenged:
+		// No status code in the sentence: the challenge rides on 403, 503 or
+		// 200 alike, and the code is in the log line and the drill-down.
+		return t.FeedErrChallenged
 	case providers.FeedFailUnparseable:
 		return t.FeedErrUnparseable
 	default:

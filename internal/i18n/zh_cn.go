@@ -199,6 +199,7 @@ var zhCN = Catalog{
 	FeedErrDNS:            "无法解析状态页地址（DNS）。服务健康状况未知。",
 	FeedErrTimeout:        "状态页未在超时前响应。服务健康状况未知。",
 	FeedErrHTTP:           "状态页返回 HTTP %d。服务健康状况未知。",
+	FeedErrChallenged:     "状态页以 Cloudflare 验证回应了此自动检查。服务健康状况未知。",
 	FeedErrUnparseable:    "状态页返回了本应用无法读取的数据。服务健康状况未知。",
 	FeedErrDetail:         "技术细节：%s",
 	TrayStillRunningTitle: "%s 仍在运行",

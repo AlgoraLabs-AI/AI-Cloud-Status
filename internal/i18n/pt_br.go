@@ -197,6 +197,7 @@ var ptBR = Catalog{
 	FeedErrDNS:            "Não foi possível resolver o endereço da página de status (DNS). Saúde do serviço desconhecida.",
 	FeedErrTimeout:        "A página de status não respondeu a tempo. Saúde do serviço desconhecida.",
 	FeedErrHTTP:           "A página de status respondeu HTTP %d. Saúde do serviço desconhecida.",
+	FeedErrChallenged:     "A página de status respondeu a esta verificação automática com um desafio do Cloudflare. Saúde do serviço desconhecida.",
 	FeedErrUnparseable:    "A página de status respondeu com dados que este app não conseguiu ler. Saúde do serviço desconhecida.",
 	FeedErrDetail:         "Detalhe técnico: %s",
 	TrayStillRunningTitle: "%s continua em execução",

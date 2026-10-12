@@ -198,6 +198,7 @@ var en = Catalog{
 	FeedErrDNS:            "The status page address could not be resolved (DNS). Service health unknown.",
 	FeedErrTimeout:        "The status page did not answer in time. Service health unknown.",
 	FeedErrHTTP:           "The status page answered HTTP %d. Service health unknown.",
+	FeedErrChallenged:     "The status page answered this automated check with a Cloudflare challenge. Service health unknown.",
 	FeedErrUnparseable:    "The status page answered with data this app could not read. Service health unknown.",
 	FeedErrDetail:         "Technical detail: %s",
 	TrayStillRunningTitle: "%s is still running",

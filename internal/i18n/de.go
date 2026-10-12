@@ -199,6 +199,7 @@ var de = Catalog{
 	FeedErrDNS:            "Die Adresse der Statusseite konnte nicht aufgelöst werden (DNS). Dienstzustand unbekannt.",
 	FeedErrTimeout:        "Die Statusseite hat nicht rechtzeitig geantwortet. Dienstzustand unbekannt.",
 	FeedErrHTTP:           "Die Statusseite antwortete mit HTTP %d. Dienstzustand unbekannt.",
+	FeedErrChallenged:     "Die Statusseite beantwortete diese automatische Prüfung mit einer Cloudflare-Challenge. Dienstzustand unbekannt.",
 	FeedErrUnparseable:    "Die Statusseite antwortete mit Daten, die diese App nicht lesen konnte. Dienstzustand unbekannt.",
 	FeedErrDetail:         "Technisches Detail: %s",
 	TrayStillRunningTitle: "%s läuft weiterhin",

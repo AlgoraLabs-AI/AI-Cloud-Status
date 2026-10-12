@@ -98,6 +98,12 @@ func TestFeedFailureMessageNamesTheCause(t *testing.T) {
 			t.Errorf("http failure rendered %q, want the status code in it", got)
 		}
 	})
+	t.Run("a challenge names the challenge, not the code", func(t *testing.T) {
+		got := feedFailureMessage(&providers.StatusError{Provider: "Mistral", Code: 200, Challenged: true})
+		if !strings.Contains(got, "Cloudflare") || strings.Contains(got, "200") {
+			t.Errorf("challenge rendered %q, want the challenge named and no status code", got)
+		}
+	})
 	t.Run("unparseable", func(t *testing.T) {
 		got := feedFailureMessage(fmt.Errorf("%w: %v", providers.ErrUnparseable, errors.New("invalid character '<'")))
 		if got != i18n.T().FeedErrUnparseable {

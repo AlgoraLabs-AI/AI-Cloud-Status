@@ -27,6 +27,7 @@ const (
 	FeedFailTLS                            // the HTTPS certificate was rejected
 	FeedFailHTTP                           // answered, but not 200
 	FeedFailUnparseable                    // answered 200 with bytes no adapter understood
+	FeedFailChallenged                     // answered with a Cloudflare challenge: the request shape was refused
 )
 
 // String is the short, stable token used in log lines (`reason=certificate`).
@@ -45,6 +46,8 @@ func (f FeedFailure) String() string {
 		return "http-status"
 	case FeedFailUnparseable:
 		return "unparseable"
+	case FeedFailChallenged:
+		return "challenged"
 	default:
 		return "connection"
 	}
@@ -75,13 +78,20 @@ func (e *StatusError) Error() string {
 var ErrUnparseable = errors.New("status feed could not be parsed")
 
 // ClassifyFeedFailure reports why a check failed, plus the HTTP status code when
-// the failure is FeedFailHTTP (0 otherwise).
+// the failure is backed by an HTTP answer (FeedFailHTTP and FeedFailChallenged;
+// 0 otherwise).
 func ClassifyFeedFailure(err error) (FeedFailure, int) {
 	if err == nil {
 		return FeedFailNone, 0
 	}
 	var se *StatusError
 	if errors.As(err, &se) {
+		if se.Challenged {
+			// A challenge rides on any status (403, 503, even 200): the code
+			// alone would send the reader to the wrong end of the wire, and
+			// "HTTP 200" as the reason a feed is unreadable is a contradiction.
+			return FeedFailChallenged, se.Code
+		}
 		return FeedFailHTTP, se.Code
 	}
 	if errors.Is(err, ErrUnparseable) {

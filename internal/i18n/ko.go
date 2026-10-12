@@ -198,6 +198,7 @@ var ko = Catalog{
 	FeedErrDNS:            "상태 페이지 주소를 확인할 수 없습니다(DNS). 서비스 상태를 알 수 없습니다.",
 	FeedErrTimeout:        "상태 페이지가 제한 시간 안에 응답하지 않았습니다. 서비스 상태를 알 수 없습니다.",
 	FeedErrHTTP:           "상태 페이지가 HTTP %d 로 응답했습니다. 서비스 상태를 알 수 없습니다.",
+	FeedErrChallenged:     "상태 페이지가 이 자동 확인에 Cloudflare 챌린지로 응답했습니다. 서비스 상태를 알 수 없습니다.",
 	FeedErrUnparseable:    "상태 페이지가 이 앱이 읽을 수 없는 데이터로 응답했습니다. 서비스 상태를 알 수 없습니다.",
 	FeedErrDetail:         "기술 세부 정보: %s",
 	TrayStillRunningTitle: "%s이(가) 계속 실행 중입니다",
