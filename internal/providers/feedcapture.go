@@ -61,7 +61,8 @@ const captureTimeFormat = "20060102-150405"
 // Stack) have never been observed mid-incident, so their parsers stay minimal
 // until this directory collects evidence.
 //
-// Samples land in Dir/<provider-id>/<timestamp>Z-<state>.json.gz. Consecutive
+// Samples land in Dir/<provider-id>/<timestamp>Z-<state>.json.gz, or
+// .html.gz for a page Kind (Kind.Page), whose capture is the page. Consecutive
 // identical payloads are deduplicated by content hash (for a page Kind, by
 // what the parser read from it: see captureKey); files older than
 // captureRetention are pruned per provider, and the corpus is held under a
@@ -140,9 +141,17 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 	// The payload is GZIPPED: status feeds are JSON and XML and compress roughly
 	// 10:1, so the corpus holds about ten times the evidence per byte of the
 	// budget above. ".json.gz" keeps the old name visible so a reader can still
-	// tell what the file is, and the audit tool reads both this and the legacy
-	// plain ".json" left by earlier builds.
-	name := time.Now().UTC().Format(captureTimeFormat) + "Z-" + state + ".json.gz"
+	// tell what the file is (XML feeds share it: the name says "feed", not
+	// "JSON"), and the audit tool reads both this and the legacy plain ".json"
+	// left by earlier builds. A page Kind's capture is the page's HTML and is
+	// named so; nothing that reads the archive keys on the suffix (the audit
+	// sniffs the gzip magic and reads the timestamp, pruning reads the
+	// timestamp, the replay cuts the state at its first dot).
+	ext := ".json.gz"
+	if p.Kind.Page() {
+		ext = ".html.gz"
+	}
+	name := time.Now().UTC().Format(captureTimeFormat) + "Z-" + state + ext
 	if err := writeGzip(filepath.Join(dir, name), data); err != nil {
 		slog.Warn("feed capture write failed", "provider", p.ID, "err", err)
 		return

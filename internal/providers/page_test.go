@@ -62,6 +62,23 @@ func TestCheckAsksForAPageAsADocument(t *testing.T) {
 	}
 }
 
+// TestFeedCaptureNamesAPageAsHTML: the archive is self-describing. A page
+// Kind's capture is the page's HTML and is named .html.gz; a feed keeps the
+// .json.gz name every reader of the archive already knows.
+func TestFeedCaptureNamesAPageAsHTML(t *testing.T) {
+	dir := t.TempDir()
+	fc := NewFeedCapture(dir)
+	res := Result{Severity: SevMajor, Incidents: []Incident{{Summary: "x", Severity: SevMajor}}}
+	fc.Capture(Provider{ID: "page", Kind: KindRootly}, readFixture(t, "rootly_degraded.html"), res, nil)
+	fc.Capture(Provider{ID: "feed", Kind: KindStatuspage}, readFixture(t, "statuspage_major.json"), res, nil)
+	for id, want := range map[string]string{"page": "-major.html.gz", "feed": "-major.json.gz"} {
+		files, _ := os.ReadDir(filepath.Join(dir, id))
+		if len(files) != 1 || !strings.HasSuffix(files[0].Name(), want) {
+			t.Errorf("%s capture named %v, want one file ending in %s", id, files, want)
+		}
+	}
+}
+
 // TestFeedCaptureDedupsAPageWhoseTokensRotate: a Rails page mints a fresh CSRF
 // token and fresh CSP nonces per response, so two polls of the SAME open
 // incident differ byte for byte. Hashed raw, every poll would archive the
