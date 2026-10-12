@@ -4,10 +4,10 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"sync"
@@ -106,7 +106,7 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 		return // operational, nothing to learn from
 	}
 
-	sum := sha256.Sum256(captureKey(p, data))
+	sum := sha256.Sum256(captureKey(p, data, res, parseErr))
 	hash := hex.EncodeToString(sum[:8])
 	f.mu.Lock()
 	if f.lastHash == nil {
@@ -151,23 +151,25 @@ func (f *FeedCapture) Capture(p Provider, data []byte, res Result, parseErr erro
 	pruneToBudget(f.Dir)
 }
 
-// pageVolatile matches the parts of an HTML status page that change on every
-// response without the status changing: the CSRF token and the CSP nonces a
-// Rails-rendered page (Rootly) mints per request.
-var pageVolatile = regexp.MustCompile(`(?i)\bnonce="[^"]*"|<meta name="(?:csrf-token|csp-nonce)" content="[^"]*"`)
-
 // captureKey is what the dedup hash is taken over. A feed's bytes are stable
-// between polls, so the body is its own key; a status PAGE carries a fresh
+// between polls, so the body is its own key. A status PAGE carries a fresh
 // CSRF token and fresh nonces on every response, so hashing the body would
 // never find a duplicate and an open incident would write a new capture of
 // the whole page every minute, evicting its own onset from the budget before
-// the incident ends. For a Page provider the volatile parts are blanked
-// first; the bytes archived are still the original ones.
-func captureKey(p Provider, data []byte) []byte {
-	if !p.Page {
+// the incident ends; and a denylist of the volatile markup would be one more
+// thing to keep in step with the host. For a page the key is what the parser
+// READ from it (the Result), which is "same state" directly; a page the
+// parser could not read falls back to its bytes. The bytes archived are the
+// original ones either way.
+func captureKey(p Provider, data []byte, res Result, parseErr error) []byte {
+	if !p.Kind.Page() || parseErr != nil {
 		return data
 	}
-	return pageVolatile.ReplaceAll(data, nil)
+	key, err := json.Marshal(res)
+	if err != nil {
+		return data
+	}
+	return key
 }
 
 // writeGzip writes data to path, gzipped, via a temp file and a rename so a

@@ -21,8 +21,9 @@ import (
 // The host sits behind a Cloudflare managed challenge that keys on how the
 // page is asked for, not on who asks: an API-shaped request (a JSON Accept, no
 // Fetch Metadata) answers 403 "Just a moment..." on every path, a document
-// request with this app's own User-Agent answers the page. Page: true is what
-// makes Check send the latter (see there for the measurement). A challenge
+// request with this app's own User-Agent answers the page. KindRootly is a
+// page Kind (Kind.Page), which is what makes Check send the latter (see there
+// for the measurement). A challenge
 // page is HTML too, which is why parseRootly anchors on the service rows and
 // the banner: a page without them is an error, never a clean all-clear.
 //
@@ -37,7 +38,6 @@ func init() {
 		ID: "mistral", Name: "Mistral", Category: CategoryAI, Kind: KindRootly,
 		URL:      "https://status.mistral.ai/",
 		Optional: true,
-		Page:     true,
 	})
 }
 
@@ -101,11 +101,14 @@ func parseRootly(data []byte) (Result, error) {
 		if name == nil {
 			continue // not a row: no heading
 		}
-		icon := rootlyIcon.FindStringSubmatch(block)
-		if icon == nil {
-			continue // a heading without a status icon is not a service row
+		// A group container with a heading IS a service row. An icon class
+		// the legend does not show (a fourth state, a restyle) leaves Icon
+		// empty, and rootlySeverity then reads the label alone, flooring an
+		// unfamiliar one at minor; the row is never dropped from the verdict.
+		svc := rootlyService{Name: plainNote(name[1])}
+		if icon := rootlyIcon.FindStringSubmatch(block); icon != nil {
+			svc.Icon = icon[1]
 		}
-		svc := rootlyService{Name: plainNote(name[1]), Icon: icon[1]}
 		if spans := rootlyTextSpan.FindAllStringSubmatch(block, -1); len(spans) > 0 {
 			svc.Status = plainNote(spans[len(spans)-1][1])
 		}
@@ -173,23 +176,24 @@ func parseRootly(data []byte) (Result, error) {
 // minor incident that never closes.
 func rootlyAllClear(banner string) bool {
 	words := rootlyWords(banner)
-	if !slices.Contains(words, "operational") {
-		return false
-	}
-	for _, w := range words {
-		if slices.Contains(rootlyNotClear, w) {
-			return false
-		}
-	}
-	return true
+	return slices.Contains(words, "operational") && !rootlyQualified(words)
 }
 
-// rootlyNotClear are the words that qualify an "operational" into something
-// less: a banner carrying any of them is not all clear. "no", "issues" and
-// "incidents" are deliberately absent: "All Systems Operational. No incidents
-// reported" is an all-clear, and reading its negation as trouble would make
-// it a minor incident that never closes.
-var rootlyNotClear = []string{
+// rootlyQualified reports whether a label's words take an "operational" back.
+// ONE vocabulary serves the banner and the rows, so the two readings cannot
+// drift apart. "no", "issues" and "incidents" are deliberately absent: "All
+// Systems Operational. No incidents reported" is an all-clear, and reading
+// its negation as trouble would make it a minor incident that never closes.
+func rootlyQualified(words []string) bool {
+	for _, w := range words {
+		if slices.Contains(rootlyQualifiers, w) {
+			return true
+		}
+	}
+	return false
+}
+
+var rootlyQualifiers = []string{
 	"not", "partial", "partially", "degraded", "outage", "down", "unavailable",
 	"maintenance", "affected", "major", "minor",
 }
@@ -204,9 +208,10 @@ func rootlyWords(label string) []string {
 
 // rootlySeverity maps a service row's status label onto a Severity. The labels
 // are prose rather than an enum, so the match is by word, in the order that
-// keeps "Major Outage" above "Partial Outage". Only the bare label
-// "Operational" is healthy: a qualified one ("Not Operational", "Partially
-// Operational") is a degradation whatever the icon says. When the words are
+// keeps "Major Outage" above "Partial Outage". An unqualified "operational"
+// ("Operational", "Fully Operational") is healthy; a qualified one ("Not
+// Operational", "Partially Operational") is a degradation whatever the icon
+// says, by the same vocabulary the banner is read with. When the words are
 // unfamiliar the icon colour decides, per the page's own legend; when both
 // are unfamiliar the row is an open degradation of unknown size, floored at
 // minor and logged so a new vocabulary does not collapse silently.
@@ -221,7 +226,7 @@ func rootlySeverity(status, icon string) Severity {
 		return false
 	}
 	switch {
-	case len(words) == 1 && words[0] == "operational":
+	case has("operational") && !rootlyQualified(words):
 		return SevNone
 	case has("major", "down", "unavailable"):
 		return SevCritical

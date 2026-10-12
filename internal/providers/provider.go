@@ -140,10 +140,16 @@ type Provider struct {
 	// Optional providers are skipped gracefully (not surfaced as unreachable)
 	// when they do not expose a public feed (e.g. a 404).
 	Optional bool
-	// Page marks a provider whose feed is its status page's own HTML rather
-	// than a machine-readable endpoint. Check fetches it as the document it
-	// is (see there), and the URL-shape test exempts it.
-	Page bool
+}
+
+// Page reports whether a Kind's feed is the status page's own HTML rather
+// than a machine-readable endpoint. It is a property of the adapter, not a
+// flag on the provider, so a provider cannot be registered on a page-reading
+// Kind and fetched API-shaped (which the page's host would challenge). Check
+// fetches a page as the document it is, the capture dedup keys on what the
+// page SAID rather than on its bytes, and the URL-shape test exempts it.
+func (k Kind) Page() bool {
+	return k == KindRootly
 }
 
 // Incident is a single open issue reported by a provider feed. It carries its
@@ -444,7 +450,7 @@ func (c *Checker) Check(ctx context.Context, p Provider) (Result, error) {
 		return Result{Feed: FeedUnreachable}, err
 	}
 	req.Header.Set("User-Agent", "AI-Cloud-Status/1.0 (+https://github.com/AlgoraLabs-AI/AI-Cloud-Status)")
-	if p.Page {
+	if p.Kind.Page() {
 		// The feed is the status page itself, so ask for it the way a page is
 		// asked for: an HTML Accept and the Fetch Metadata a top-level
 		// navigation carries. That metadata is what Cloudflare's managed

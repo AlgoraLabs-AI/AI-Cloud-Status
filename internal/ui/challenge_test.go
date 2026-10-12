@@ -58,7 +58,7 @@ func TestAChallengedPollIsRetriedBeforeItIsFiledAsNoFeed(t *testing.T) {
 				checker: &providers.Checker{Client: srv.Client()},
 				backoff: monitor.Backoff{}, // no waiting between attempts
 			}
-			p := providers.Provider{ID: "p", Name: "P", Kind: providers.KindRootly, URL: srv.URL, Optional: true, Page: true}
+			p := providers.Provider{ID: "p", Name: "P", Kind: providers.KindRootly, URL: srv.URL, Optional: true}
 			st := c.checkProviderWithRetry(context.Background(), p)
 			if st.outcome != tc.wantOutcome || st.attempts != tc.wantAttempts {
 				t.Errorf("outcome=%v attempts=%d, want %v after %d attempts (err=%v)",
@@ -75,7 +75,7 @@ func TestAChallengedPollIsRetriedBeforeItIsFiledAsNoFeed(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := &Controller{checker: &providers.Checker{Client: srv.Client()}, backoff: monitor.Backoff{}}
-		p := providers.Provider{ID: "p", Name: "P", Kind: providers.KindRootly, URL: srv.URL, Optional: true, Page: true}
+		p := providers.Provider{ID: "p", Name: "P", Kind: providers.KindRootly, URL: srv.URL, Optional: true}
 		st := c.checkProviderWithRetry(context.Background(), p)
 		if st.outcome != history.OutcomeSkipped || hits.Load() != 1 {
 			t.Errorf("outcome=%v after %d requests, want skipped after exactly 1", st.outcome, hits.Load())

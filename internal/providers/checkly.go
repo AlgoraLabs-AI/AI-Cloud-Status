@@ -11,14 +11,14 @@ import (
 // init self-registers the Checkly adapter as the LEGACY reader of Mistral's
 // archived captures. No live provider uses it.
 //
-// Mistral's status page was a Checkly status page until 2026-10, and its
-// server-proxied "unresolved-incidents" endpoint was the feed this adapter
-// read. The page is Rootly now (see rootly.go) and that endpoint answers 404,
-// but every Mistral capture archived before the move is Checkly JSON, and
-// cmd/alertaudit re-parses the archive with ParseFeed: the day the provider
-// was re-keyed, all 157 of them read as a broken parser and the audit failed
-// the run on it. RegisterLegacy is what lets ParseFeed hand them to this
-// adapter, so the archive stays readable without a live Checkly provider.
+// Mistral's status page was a Checkly status page, and its server-proxied
+// "unresolved-incidents" endpoint was the feed this adapter read. The page is
+// Rootly now (see rootly.go) and that endpoint answers 404, but an archive
+// outlives its feed: every Mistral capture recorded before the move is
+// Checkly JSON, and cmd/alertaudit re-derives severities from the archive
+// with ParseFeed. RegisterLegacy is what lets ParseFeed hand those captures
+// to this adapter, so the archive stays readable without a live Checkly
+// provider and without the audit reading a changed feed as a broken parser.
 func init() {
 	RegisterParser(KindCheckly, func(_ Provider, data []byte) (Result, error) {
 		return parseCheckly(data)

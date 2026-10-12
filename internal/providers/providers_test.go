@@ -773,7 +773,7 @@ func TestDefaultProvidersWellFormed(t *testing.T) {
 func TestDefaultProvidersQueryStatusAPIs(t *testing.T) {
 	apiMarker := []string{"summary.json", "incidents.json", "currentevents", "/status/feed", "unresolved-incidents", "index.json", "feed.xml"}
 	for _, p := range Default() {
-		if p.Page {
+		if p.Kind.Page() {
 			// The page IS the feed (Rootly exposes no API or RSS); the parser
 			// anchors on its service rows, which is the same guarantee.
 			continue
@@ -1036,9 +1036,12 @@ func TestRootlySeverityScale(t *testing.T) {
 		{"Affected", "sp-error-bg", SevMajor},
 		{"Major Outage", "sp-error-bg", SevCritical},
 		{"major outage", "", SevCritical}, // case-insensitive
-		// A qualified "operational" is not operational, whatever the icon.
+		// A qualified "operational" is not operational, whatever the icon;
+		// an unqualified one is, whatever surrounds the word.
 		{"Not Operational", "sp-error-bg", SevMajor},
 		{"Partially Operational", "sp-success-bg", SevMajor},
+		{"Fully Operational", "sp-success-bg", SevNone},
+		{"Operational (Monitoring)", "", SevNone},
 		// Keywords are words: "Countdown" is not "down".
 		{"Countdown", "sp-success-bg", SevNone},
 		{"Something New", "sp-error-bg", SevMajor},

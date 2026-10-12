@@ -23,12 +23,16 @@ func TestCheckAsksForAPageAsADocument(t *testing.T) {
 	var got http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Clone()
+		if r.URL.Path == "/api" {
+			_, _ = w.Write(readFixture(t, "statuspage_none.json"))
+			return
+		}
 		_, _ = w.Write(readFixture(t, "rootly_operational.html"))
 	}))
 	defer srv.Close()
 
 	ck := &Checker{Client: srv.Client()}
-	page := Provider{ID: "p", Name: "P", Kind: KindRootly, URL: srv.URL, Page: true}
+	page := Provider{ID: "p", Name: "P", Kind: KindRootly, URL: srv.URL + "/page"}
 	if _, err := ck.Check(context.Background(), page); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +52,7 @@ func TestCheckAsksForAPageAsADocument(t *testing.T) {
 		t.Errorf("page request User-Agent = %q, want our own", ua)
 	}
 
-	api := Provider{ID: "a", Name: "A", Kind: KindRootly, URL: srv.URL}
+	api := Provider{ID: "a", Name: "A", Kind: KindStatuspage, URL: srv.URL + "/api"}
 	if _, err := ck.Check(context.Background(), api); err != nil {
 		t.Fatal(err)
 	}
@@ -62,8 +66,9 @@ func TestCheckAsksForAPageAsADocument(t *testing.T) {
 // token and fresh CSP nonces per response, so two polls of the SAME open
 // incident differ byte for byte. Hashed raw, every poll would archive the
 // whole page again and an incident would evict its own onset from the budget;
-// the dedup key blanks those parts for a Page provider and keeps them for a
-// feed, whose bytes are the key.
+// for a page Kind the dedup key is what the parser read (the Result), so the
+// same state is one capture whatever the markup minted, while a feed's bytes
+// stay its own key.
 func TestFeedCaptureDedupsAPageWhoseTokensRotate(t *testing.T) {
 	dir := t.TempDir()
 	fc := NewFeedCapture(dir)
@@ -81,7 +86,7 @@ func TestFeedCaptureDedupsAPageWhoseTokensRotate(t *testing.T) {
 	}
 	res := Result{Severity: SevCritical, Incidents: []Incident{{Summary: "x", Severity: SevCritical}}}
 
-	page := Provider{ID: "page", Page: true}
+	page := Provider{ID: "page", Kind: KindRootly}
 	fc.Capture(page, []byte(first), res, nil)
 	fc.Capture(page, []byte(second), res, nil)
 	files, _ := os.ReadDir(filepath.Join(dir, "page"))
@@ -120,7 +125,7 @@ func TestCheckTellsAChallengeFromAnAbsentFeed(t *testing.T) {
 	defer forbidden.Close()
 
 	ck := &Checker{Client: challenged.Client()}
-	optional := Provider{ID: "p", Name: "P", Kind: KindRootly, URL: challenged.URL, Optional: true, Page: true}
+	optional := Provider{ID: "p", Name: "P", Kind: KindRootly, URL: challenged.URL, Optional: true}
 	_, err := ck.Check(context.Background(), optional)
 	if !errors.Is(err, ErrChallenged) || !errors.Is(err, ErrNoFeed) {
 		t.Errorf("challenged Optional provider: err = %v, want ErrChallenged, which is also ErrNoFeed", err)
@@ -131,7 +136,7 @@ func TestCheckTellsAChallengeFromAnAbsentFeed(t *testing.T) {
 		t.Errorf("plain 403 on an Optional provider: err = %v, want ErrNoFeed and not a challenge", err)
 	}
 
-	required := Provider{ID: "r", Name: "R", Kind: KindRootly, URL: challenged.URL, Page: true}
+	required := Provider{ID: "r", Name: "R", Kind: KindRootly, URL: challenged.URL}
 	res, err := ck.Check(context.Background(), required)
 	var se *StatusError
 	if !errors.As(err, &se) || se.Code != http.StatusForbidden || !se.Challenged || res.Feed != FeedUnreachable {
