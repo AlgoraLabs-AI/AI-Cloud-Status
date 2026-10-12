@@ -46,12 +46,13 @@ var (
 	// "All Systems Operational": the one span styled text-4xl, wherever that
 	// token sits in its class list.
 	rootlyBanner = regexp.MustCompile(`(?is)<span\b[^>]*class="[^"]*\btext-4xl\b[^"]*"[^>]*>\s*(.*?)\s*</span>`)
-	// rootlySummary isolates one collapsible row's header. Every service is one
-	// such row: a status icon, an <h2> with the name, and a status label that
-	// closes the header. The "Services" section header is a summary too, with
-	// a heading but no icon, which is how it is told apart.
-	rootlySummary = regexp.MustCompile(`(?is)<summary\b[^>]*>(.*?)</summary>`)
-	rootlyName    = regexp.MustCompile(`(?is)<h2\b[^>]*>(.*?)</h2>`)
+	// rootlyRow isolates one service row's header: the <summary> of a
+	// <details class="group …"> container. Every service is one such row: a
+	// status icon, an <h2> with the name, and a status label that closes the
+	// header. The "Services" section header is a <details> too, but not a
+	// "group" one, so it is never a row candidate whatever icon it gains.
+	rootlyRow  = regexp.MustCompile(`(?is)<details\b[^>]*class="[^"]*\bgroup\b[^"]*"[^>]*>\s*<summary\b[^>]*>(.*?)</summary>`)
+	rootlyName = regexp.MustCompile(`(?is)<h2\b[^>]*>(.*?)</h2>`)
 	// rootlyTextSpan matches a span holding bare text; the LAST one in a row's
 	// header is its status label. The label closes the header on the captured
 	// page; should an affected row carry something after it (a count, a
@@ -94,7 +95,7 @@ func parseRootly(data []byte) (Result, error) {
 	}
 
 	var services []rootlyService
-	for _, m := range rootlySummary.FindAllStringSubmatch(page, -1) {
+	for _, m := range rootlyRow.FindAllStringSubmatch(page, -1) {
 		block := strings.TrimSpace(m[1])
 		name := rootlyName.FindStringSubmatch(block)
 		if name == nil {
@@ -102,7 +103,7 @@ func parseRootly(data []byte) (Result, error) {
 		}
 		icon := rootlyIcon.FindStringSubmatch(block)
 		if icon == nil {
-			continue // a section header ("Services"): a heading, no status icon
+			continue // a heading without a status icon is not a service row
 		}
 		svc := rootlyService{Name: plainNote(name[1]), Icon: icon[1]}
 		if spans := rootlyTextSpan.FindAllStringSubmatch(block, -1); len(spans) > 0 {
@@ -184,10 +185,13 @@ func rootlyAllClear(banner string) bool {
 }
 
 // rootlyNotClear are the words that qualify an "operational" into something
-// less: a banner carrying any of them is not all clear.
+// less: a banner carrying any of them is not all clear. "no", "issues" and
+// "incidents" are deliberately absent: "All Systems Operational. No incidents
+// reported" is an all-clear, and reading its negation as trouble would make
+// it a minor incident that never closes.
 var rootlyNotClear = []string{
-	"not", "no", "partial", "partially", "degraded", "outage", "down", "unavailable",
-	"maintenance", "issue", "issues", "affected", "major", "minor", "incident", "incidents",
+	"not", "partial", "partially", "degraded", "outage", "down", "unavailable",
+	"maintenance", "affected", "major", "minor",
 }
 
 // rootlyWords lower-cases a label and splits it into words, so a keyword is

@@ -24,9 +24,11 @@ var (
 	registryMu sync.Mutex
 	registered []Provider
 	parsers    = map[Kind]ParseFunc{}
-	// legacy maps a provider ID to the Kinds its feed USED to be, oldest
-	// last. A capture archived under a previous feed is still that provider's
-	// capture, and ParseFeed reads it with the adapter of its time.
+	// legacy maps a provider ID to the Kinds its feed USED to be, in
+	// registration order. A capture archived under a previous feed is still
+	// that provider's capture, and ParseFeed offers it to each of these
+	// adapters in turn; every one of them anchors on its own shape, so the
+	// order does not decide which reads it.
 	legacy = map[string][]Kind{}
 )
 
@@ -73,7 +75,8 @@ func RegisterLegacy(id string, k Kind) {
 	legacy[id] = append(legacy[id], k)
 }
 
-// legacyKindsFor returns the Kinds provider id's feed used to be, newest first.
+// legacyKindsFor returns the Kinds provider id's feed used to be, in
+// registration order.
 func legacyKindsFor(id string) []Kind {
 	registryMu.Lock()
 	defer registryMu.Unlock()

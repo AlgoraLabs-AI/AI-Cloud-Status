@@ -1148,6 +1148,26 @@ func TestParseRootlyReadsTheLastTextSpanAsTheLabel(t *testing.T) {
 	}
 }
 
+// TestParseRootlyIgnoresAnIconOnTheSectionHeader: the "Services" header is
+// not a row because it is not a "group" container, not because it has no
+// icon, so a header that gains an aggregate status icon during an outage
+// does not become an unreadable row and fail the page closed.
+func TestParseRootlyIgnoresAnIconOnTheSectionHeader(t *testing.T) {
+	whole := string(readFixture(t, "rootly_degraded.html"))
+	i := strings.Index(whole, `<h2 class="">Services</h2>`)
+	if i < 0 {
+		t.Fatal("fixture has no Services header")
+	}
+	withIcon := whole[:i] + `<span class="flex sp-error-bg text-red-500"><svg></svg></span>` + whole[i:]
+	res, err := parseRootly([]byte(withIcon))
+	if err != nil {
+		t.Fatalf("a status icon on the section header made the page unreadable: %v", err)
+	}
+	if res.Severity != SevCritical || len(res.Incidents) != 1 {
+		t.Errorf("got %v with %d incidents, want the degraded page's critical incident", res.Severity, len(res.Incidents))
+	}
+}
+
 // TestParseRootlyAnEmptyBannerIsAnError: a banner span with no words is the
 // anchor missing, never a minor incident with an empty summary.
 func TestParseRootlyAnEmptyBannerIsAnError(t *testing.T) {
@@ -1185,15 +1205,16 @@ func TestParseFeedReadsAnArchivedCaptureWithTheAdapterOfItsTime(t *testing.T) {
 // all-clear still is (a banner read as an incident would never close).
 func TestRootlyAllClearIsTheWholePhrase(t *testing.T) {
 	for banner, want := range map[string]bool{
-		"All Systems Operational":               true,
-		"  all systems operational":             true,
-		"All Systems Are Operational":           true,
-		"All services operational":              true,
-		"Not Operational":                       false,
-		"Partially Operational":                 false,
-		"Operational with degraded performance": false,
-		"Partial System Outage":                 false,
-		"":                                      false,
+		"All Systems Operational":                        true,
+		"  all systems operational":                      true,
+		"All Systems Are Operational":                    true,
+		"All services operational":                       true,
+		"All Systems Operational. No incidents reported": true,
+		"Not Operational":                                false,
+		"Partially Operational":                          false,
+		"Operational with degraded performance":          false,
+		"Partial System Outage":                          false,
+		"":                                               false,
 	} {
 		if got := rootlyAllClear(banner); got != want {
 			t.Errorf("rootlyAllClear(%q) = %v, want %v", banner, got, want)

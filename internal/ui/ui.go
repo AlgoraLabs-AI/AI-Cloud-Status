@@ -334,9 +334,13 @@ type Controller struct {
 
 // provState is the latest known state of a provider check.
 type provState struct {
-	checked  bool
-	skipped  bool
-	err      error
+	checked bool
+	skipped bool
+	// challenged marks a skip that was a Cloudflare challenge outlasting every
+	// attempt, so the next such poll can tell a persisting state from a new
+	// one and log only the transition.
+	challenged bool
+	err        error
 	res      providers.Result
 	when     time.Time
 	latency  time.Duration
@@ -1999,9 +2003,17 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 			// Filed as a skip like any absent feed, but the log must say
 			// which: a challenge that outlasts every attempt is the request
 			// shape being refused again, and that is the first thing to look
-			// at when a Page provider goes grey.
-			slog.Warn("provider feed challenged on every attempt, read as no public feed",
-				"id", p.ID, "attempts", tries)
+			// at when a Page provider goes grey. Logged on the way IN only: a
+			// challenge that stays tightened for months would otherwise write
+			// the same line every poll.
+			st.challenged = true
+			c.mu.Lock()
+			wasChallenged := c.provStates[p.ID].challenged
+			c.mu.Unlock()
+			if !wasChallenged {
+				slog.Warn("provider feed challenged on every attempt, read as no public feed",
+					"id", p.ID, "attempts", tries)
+			}
 		}
 	case err != nil:
 		st.err = err
