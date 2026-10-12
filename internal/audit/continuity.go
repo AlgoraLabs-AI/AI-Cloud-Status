@@ -86,6 +86,11 @@ type ContinuityReport struct {
 	// HistoryHorizon is the oldest sample retained across the audited series,
 	// i.e. how far back any claim here can reach.
 	HistoryHorizon time.Time
+	// HistoryErr is set when history.json was there and could not be read. The
+	// section still runs — the connectivity windows come from the journal alone
+	// and need no samples — but every window that needed a sample is then "no
+	// evidence" for a reason the reader must see: a LOSS, not a quiet period.
+	HistoryErr string
 }
 
 // Unclosed returns only the windows that are real defects.
@@ -101,7 +106,10 @@ func (r ContinuityReport) Unclosed() []OpenWindow {
 
 // RunContinuity audits the alert sources that have no capture corpus: custom URL
 // checks and the app-wide connectivity alerts.
-func RunContinuity(dir string) (ContinuityReport, error) {
+//
+// hist is dir's history.json, loaded ONCE by the caller (LoadHistory) and shared
+// with Run; this section reads its sample series.
+func RunContinuity(dir string, hist HistoryFile) (ContinuityReport, error) {
 	var rep ContinuityReport
 
 	cfg, err := loadConfig(dir)
@@ -112,10 +120,20 @@ func RunContinuity(dir string) (ContinuityReport, error) {
 	if err != nil {
 		return rep, err
 	}
-	hist, err := history.Load(filepath.Join(dir, "history.json"), history.DefaultCapacity)
-	if err != nil {
-		return rep, err
+	if hist.Err != nil {
+		// Unreadable is not fatal here, whatever the cause — corrupt or a read
+		// error: the load hands back an empty History and the section degrades
+		// to "no evidence" where it needed samples, which is what it always did
+		// for a file that was never written. The connectivity windows come from
+		// the journal alone and are still judged. Returning the error instead
+		// dropped the whole section, and with it an unclosed window from the
+		// exit code — the provider section reports the same file as a LOSS and
+		// goes on. The difference is named on the report, and the file is left
+		// exactly where it is: this is a read-only diagnostic of the running
+		// app's data.
+		rep.HistoryErr = hist.Err.Error()
 	}
+	samples := hist.hist()
 
 	// Only checks that still exist: a deleted URL leaves an orphan series and an
 	// unclosable window, and accusing the app over a check the user removed is
@@ -158,7 +176,7 @@ func RunContinuity(dir string) (ContinuityReport, error) {
 	sort.Strings(rep.Checked)
 
 	for _, id := range rep.Checked {
-		series := hist.Series(id)
+		series := samples.Series(id)
 		if len(series) > 0 {
 			if rep.HistoryHorizon.IsZero() || series[0].Time.Before(rep.HistoryHorizon) {
 				rep.HistoryHorizon = series[0].Time

@@ -84,7 +84,7 @@ func TestContinuityCatchesTheUnclosedWindow(t *testing.T) {
 		series(start, 10, 2, true),
 	)
 
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestContinuityCleanWhenPaired(t *testing.T) {
 		{Time: down.Add(2 * time.Minute), ID: fixtureID, Title: monitor.TitleProviderRecovered, Recovery: true},
 	}, series(start, 10, 2, true))
 
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestContinuityIgnoresAnOngoingOutage(t *testing.T) {
 		[]alertlog.Entry{{Time: down, ID: fixtureID, Title: monitor.TitleProviderOutage}},
 		series(start, 10, 5, false), // never recovers, and the tail is fresh
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestContinuityIgnoresAnUnobservedRecovery(t *testing.T) {
 		[]alertlog.Entry{{Time: down, ID: fixtureID, Title: monitor.TitleProviderOutage}},
 		series(start, 10, 3, false), // stops while down, hours ago
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestContinuityIgnoresATruncatedRun(t *testing.T) {
 		[]alertlog.Entry{{Time: start, ID: fixtureID, Title: monitor.TitleProviderOutage}},
 		series(start, 0, 3, true), // opens mid-outage: nothing healthy precedes it
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestContinuityDropsDeletedChecks(t *testing.T) {
 		}},
 		series(start, 10, 2, true),
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestContinuityCountsStaleClosures(t *testing.T) {
 			Recovery: true, Suppressed: "stale-across-restart"},
 	}, series(start, 10, 2, true))
 
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestContinuityConnectivityIsNeverAssertedFromSamples(t *testing.T) {
 		[]alertlog.Entry{{Time: start, Title: monitor.TitleTotalLoss, Body: "no internet"}},
 		series(start, 10, 2, true),
 	)
-	rep, err := RunContinuity(dir)
+	rep, err := RunContinuity(dir, LoadHistory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,5 +243,22 @@ func TestContinuityConnectivityIsNeverAssertedFromSamples(t *testing.T) {
 	}
 	if n := len(rep.Unclosed()); n != 0 {
 		t.Errorf("Unclosed = %d, want 0 — connectivity is journal-only evidence", n)
+	}
+}
+
+// TestContinuitySurvivesAnUnreadableHistory: a history.json that could not be
+// READ (not merely parsed) must degrade this section the way a corrupt one
+// does, not drop it. Returning the error skipped the whole section in
+// alertaudit, and with it an unclosed connectivity window from the exit code,
+// while the provider section reported the same file as a loss and went on.
+func TestContinuitySurvivesAnUnreadableHistory(t *testing.T) {
+	dir := stage(t, nil, nil)
+	unreadable := HistoryFile{Hist: history.New(history.DefaultCapacity), Found: true, Err: os.ErrPermission}
+	rep, err := RunContinuity(dir, unreadable)
+	if err != nil {
+		t.Fatalf("RunContinuity returned %v for an unreadable history; want the section to run and name the loss", err)
+	}
+	if rep.HistoryErr == "" {
+		t.Error("HistoryErr is empty: the loss must be named on the report")
 	}
 }

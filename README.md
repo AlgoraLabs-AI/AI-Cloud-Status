@@ -112,15 +112,17 @@ beside the executable and never anywhere else:
 | macOS | `~/Library/Application Support/AI-Cloud-Status/` |
 | Linux | `$XDG_CONFIG_HOME/AI-Cloud-Status/` (or `~/.config/AI-Cloud-Status/`) |
 
-A normal install writes exactly five things there, all of them your own state:
+A normal install writes these five things there, all of them your own state:
 
 | File | What it is |
 | --- | --- |
 | `config.json` | Your settings: which checks are on, intervals, regions, mutes, language |
-| `history.json` | The uptime strip's samples, so the last 24 h survives a restart |
+| `history.json` | The uptime strip's samples, so the last 24 h survives a restart — plus a small per-provider coverage record (last attempt, last successful read, current run of failures) that is **not** trimmed with the samples, so "when did this feed last work" survives longer than the strip does |
 | `incidents.json` | The incident journal behind "Incident history — last 24 h" |
 | `open-outages.json` | Outages still open at shutdown, so their recovery alert is not swallowed |
 | `instance.lock` | The single-instance guard |
+
+One more can appear: if `history.json` is corrupt at launch, the app moves it to `history.json.corrupt` and starts a fresh one rather than overwrite it. That file is only kept for you to look at; it is safe to delete. If the file is intact but cannot be read at that moment (another program held it open), the app leaves it untouched and does not save history for that run, so the next launch reads it whole.
 
 **Nothing is sent anywhere.** The app talks to the services it monitors and to
 GitHub's release API (for the update check) and to nobody else. There is no

@@ -16,11 +16,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/alertlog"
 	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/config"
+	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/history"
 	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/monitor"
 	"github.com/AlgoraLabs-AI/AI-Cloud-Status/internal/providers"
 )
@@ -120,9 +122,46 @@ type Finding struct {
 // major incident as if it were still part of the old one — see
 // boundOpenIntervals.
 type MissingRecovery struct {
-	Start     time.Time // when alert-log recorded the outage opening
-	ClearedAt time.Time // the later capture proving it actually resolved
+	// Kind separates the ways a window ends without a logged recovery. Its zero
+	// value, KindUnset, asserts nothing — only ClearedByCapture carries ClearedAt.
+	Kind  MissingRecoveryKind
+	Start time.Time // when alert-log recorded the outage opening
+	// ClearedAt is the later capture proving it actually resolved. Set ONLY for
+	// ClearedByCapture; for BoundedByHorizon no such capture exists and this
+	// stays zero. Read Kind — never ClearedAt.IsZero(). A formatter that printed
+	// this field unconditionally is what emitted the literal
+	// "cleared by 0000-12-31 21:00:00", asserting a clearance nobody observed.
+	ClearedAt time.Time
 }
+
+// MissingRecoveryKind separates the two ways an outage window ends without a
+// logged recovery. They are different findings and must not read alike.
+//
+// A discriminator rather than a second timestamp on purpose: a "BoundedAt" field
+// would carry the auditor's own horizon POLICY inside a finding about the
+// incident, and the zero-value hazard would just move to the other branch.
+type MissingRecoveryKind int
+
+const (
+	// KindUnset is the zero value ON PURPOSE, and it asserts nothing.
+	//
+	// The original defect in this file was a formatter printing a zero ClearedAt
+	// as a real clearance time. Making the ASSERTING kind the zero value would
+	// leave that one careless `MissingRecovery{Start: x}` away from returning —
+	// forever, in every future formatter, decode path and copy. Defending each
+	// consumer with an `IsZero()` guard patches the call sites; making the zero
+	// value non-asserting removes the class.
+	KindUnset MissingRecoveryKind = iota
+	// ClearedByCapture: a later capture read below Major, so the feed proves the
+	// incident really did resolve and only the recovery ALERT is missing — a
+	// delivery/logging gap, not a false outage.
+	ClearedByCapture
+	// BoundedByHorizon: nothing ever corroborated the window closing, and the
+	// record continued past the point it stopped being supported, so the window
+	// was closed by policy to stop it certifying every later capture. There is NO
+	// evidence the incident cleared; it may still be open right now.
+	BoundedByHorizon
+)
 
 // ProviderReport summarizes one provider's audit.
 type ProviderReport struct {
@@ -136,6 +175,123 @@ type ProviderReport struct {
 	LastAlertTime     time.Time // zero if never in alert-log
 	Findings          []Finding // only true-major captures, chronological
 	MissingRecoveries []MissingRecovery
+	// Coverage is this provider's attendance record from history.json, and
+	// HasCoverage says whether one exists at all. This is a DIFFERENT evidence
+	// tier from everything above it: captures and the alert log are written only
+	// when diagnostics are enabled, while history is ordinary user state that is
+	// always written. Keep the two apart when reporting — see Report.
+	Coverage    history.CoverageEntry
+	HasCoverage bool
+	// CoverageDropped says this provider HAD a coverage entry and the reader
+	// discarded it as clock damage: HasCoverage is false for a LOSS, not a gap,
+	// and the row must say so rather than "never polled".
+	CoverageDropped bool
+}
+
+// FeedVerdict is the three-way answer NeverCaptured could never give.
+type FeedVerdict int
+
+const (
+	// FeedUnknown: nothing conclusive. No coverage record at all, or a run of
+	// failures too short to call sustained. NOT a fault.
+	FeedUnknown FeedVerdict = iota
+	// FeedHealthy: the last attempt that told us ANYTHING was a successful read.
+	//
+	// Not "the most recent attempt" — blind and skipped polls are attempts that
+	// carry no information, and a run of them after a real success leaves the
+	// last thing we actually learned still being that success. Staleness is what
+	// bounds how long that stays a fair answer, and it is measured from the same
+	// informative observation rather than from the attempt count.
+	FeedHealthy
+	// FeedBroken: attempts keep failing and none has succeeded since. This is the
+	// case that used to be indistinguishable from "genuinely operational all
+	// window", and the reason the audit could not tell the two apart.
+	FeedBroken
+)
+
+// sustainedFailureAttempts is how many consecutive failed polls it takes before
+// a feed is called broken rather than merely failing right now.
+//
+// A count, not a duration, because a poll round has no fixed length: a round in
+// which a provider is timing out costs several times a healthy one, so any
+// wall-clock threshold derived from the configured interval understates the real
+// elapsed time by a wide and variable margin. What the verdict actually needs is
+// "this was not one bad look", and consecutive attempts say that directly.
+const sustainedFailureAttempts = 10
+
+// FeedVerdict classifies whether this provider's feed can actually be read,
+// from the attendance record rather than by inferring it from an absence.
+//
+// It keys on the CURRENT run of failures, not on whether a success has ever been
+// recorded. "Has ever succeeded" is useless as a health signal: any working
+// launch stamps LastSuccess within a minute, so after the first successful poll
+// of the provider's life it is permanently non-zero — a verdict resting on it
+// could never report a fault again, least of all for a feed that worked fine for
+// months and then broke.
+//
+// It deliberately does not look at Findings or captures: those are the tier that
+// only exists when diagnostics are on, and mixing the two is what made the old
+// advisory untrustworthy.
+// It takes `now` rather than reading a clock, so a verdict is reproducible and a
+// caller cannot get a different answer than the report it is printing.
+func (r ProviderReport) FeedVerdict(now time.Time) FeedVerdict {
+	cov := r.Coverage
+	switch {
+	case !r.HasCoverage || cov.LastAttempt.IsZero():
+		return FeedUnknown
+	case cov.LastAttempt.After(now.Add(history.CoverageFutureSlack)):
+		// A record stamped ahead of now is clock damage, not an observation. It
+		// matters here and not only at load because the staleness escape below
+		// measures elapsed time: against a future stamp that value is negative,
+		// so an arbitrarily old verdict would be asserted as current forever with
+		// no way out.
+		return FeedUnknown
+	case cov.LastInformative.IsZero():
+		// Attempts were made and every single one was blind or skipped, so
+		// nothing was ever learned about this feed. Calling that healthy would
+		// assert a reading that never happened.
+		return FeedUnknown
+	case now.Sub(cov.LastInformative) > coverageFreshness:
+		// Nothing has been LEARNED in a long time. Measured from the last
+		// informative observation, not the last attempt: a machine offline for
+		// months still attempts every round, so an attempt-based rule would call
+		// a months-old verdict current.
+		return FeedUnknown
+	case cov.ConsecutiveFailures >= sustainedFailureAttempts:
+		return FeedBroken
+	case cov.ConsecutiveFailures > 0:
+		// Failing, but not for long enough to assert it. One bad poll is not
+		// evidence of a broken feed.
+		return FeedUnknown
+	case cov.LastSuccess.Equal(cov.LastInformative):
+		// The last thing actually learned was a successful read. CHECKED, not
+		// inferred from "no failures outstanding".
+		//
+		// This check was removed once as unreachable, on the reasoning that only a
+		// success clears the failure count. A later change to the recorder made it
+		// reachable — a reset that declines to count leaves zero failures with a
+		// FAILURE as the last informative observation — and the verdict then
+		// asserted a read that never happened, which is the whole class this file
+		// exists to prevent. An invariant enforced in another package is not an
+		// invariant; it is an assumption with a footnote.
+		return FeedHealthy
+	default:
+		return FeedUnknown
+	}
+}
+
+// coverageFreshness bounds how long a coverage record is allowed to speak for
+// the present. Past it the audit reports "unknown" rather than repeating a
+// months-old verdict about a provider nobody has polled since.
+const coverageFreshness = 7 * 24 * time.Hour
+
+// FeedFault reports a coverage-tier fault worth failing the run over.
+//
+// The exit code and the printed report must both come from HERE. Deriving the
+// condition independently in two places is how a run ends up exiting 1 while its
+// own report says nothing was found.
+func (r ProviderReport) FeedFault(now time.Time) bool {
+	return r.Enabled && r.HasPublicFeed && r.FeedVerdict(now) == FeedBroken
 }
 
 // UncoveredCount returns how many Findings are genuinely Uncovered.
@@ -167,11 +323,84 @@ func (r ProviderReport) AllCapturesUnparseable() bool {
 	return r.TotalCaptures > 0 && r.ParseErrors == r.TotalCaptures
 }
 
+// HistoryFile is history.json as both audit sections see it: read once, by
+// LoadHistory, and handed to Run and RunContinuity.
+//
+// One read, not one per section, for two reasons. The file is megabytes on a
+// mature install — every retained sample — and the provider section used to
+// decode only the coverage key while the continuity section decoded the whole
+// thing, so the audit parsed it twice. And the running app rewrites the file on
+// every save: two reads can see two different versions, and then the two
+// sections of one report describe two different files.
+//
+// Hist is never nil; it is empty when the file is absent or unreadable, and
+// Found and Err say which (see history.LoadFile for the three states).
+type HistoryFile struct {
+	Hist  *history.History
+	Found bool
+	// Dropped names the checks whose coverage entry was discarded as clock
+	// damage, so the report can mark THEIR rows as a loss.
+	Dropped []string
+	Err     error
+}
+
+// hist returns the History to read, never nil: a zero HistoryFile reads as an
+// absent file rather than dereferencing nothing.
+func (f HistoryFile) hist() *history.History {
+	if f.Hist == nil {
+		return history.New(history.DefaultCapacity)
+	}
+	return f.Hist
+}
+
+// LoadHistory reads dir's history.json for the audit. Nothing here is fatal —
+// each section decides what an unreadable file means for its own evidence.
+func LoadHistory(dir string) HistoryFile {
+	h, found, dropped, err := history.LoadFile(filepath.Join(dir, "history.json"), history.DefaultCapacity)
+	return HistoryFile{Hist: h, Found: found, Dropped: dropped, Err: err}
+}
+
 // Report is the full audit result.
 type Report struct {
 	GeneratedAt   time.Time
 	AlertLogStart time.Time // zero if alert-log.jsonl doesn't exist / is empty
 	Providers     []ProviderReport
+	// HistoryPresent says whether the coverage tier can ANSWER: history.json was
+	// there, it parsed, and it holds at least one coverage entry. Whether the
+	// file merely exists is HistoryFound's job.
+	//
+	// It is reported separately from the alert log and the captures because the
+	// three are NOT the same grade of evidence: alert-log.jsonl and feed-samples/
+	// are written only while diagnostics are enabled and are absent on a default
+	// install, while history.json is ordinary user state and is always written.
+	// A reader that cannot see which tier a verdict came from will trust a green
+	// report whose entire capture corpus was empty.
+	//
+	// The third condition matters because an install upgraded to this build has a clean,
+	// parseable history.json with no coverage key at all, and calling that "tier
+	// present" while every verdict resolves to unknown is the contradiction the
+	// tier line exists to prevent.
+	//
+	// The other two make the three failure modes distinguishable, because a
+	// consumer that cannot tell them apart reports an evidence LOSS as a gap:
+	//   HistoryFound=false                     -> no file
+	//   HistoryFound=true, HistoryErr!=""      -> present, unreadable (loss)
+	//   HistoryFound=true, HistoryErr=="",
+	//     HistoryPresent=false                 -> readable, no coverage yet
+	HistoryPresent bool
+	HistoryFound   bool
+	HistoryErr     string
+	// CoverageDropped counts entries the reader discarded as clock damage
+	// (stamped beyond CoverageFutureSlack). Without it an install whose every
+	// entry was dropped reads as "no coverage record yet" — a LOSS reported as a
+	// gap, the confusion the tier line exists to prevent.
+	CoverageDropped int
+	// DiagnosticsEnabled is config.json's own answer, so a report never has to
+	// infer "diagnostics are off" from an empty corpus. The two causes of an
+	// empty capture tier — never switched on, or switched on and genuinely quiet
+	// — need different responses from a reader, and the config distinguishes them
+	// without guessing.
+	DiagnosticsEnabled bool
 }
 
 // transition is one alert-log line for a provider, restricted to the
@@ -230,7 +459,10 @@ func (iv interval) distance(t time.Time) time.Duration {
 // TODAY's region configuration for captures of any age; an older capture
 // audited against a since-changed region list is a known limitation (no
 // historical config snapshots exist to do better).
-func Run(dir string) (Report, error) {
+//
+// hist is dir's history.json, loaded ONCE by the caller (LoadHistory) and shared
+// with RunContinuity, which needs the same file for its sample series.
+func Run(dir string, hist HistoryFile) (Report, error) {
 	if fi, err := os.Stat(dir); err != nil {
 		return Report{}, fmt.Errorf("app data directory: %w", err)
 	} else if !fi.IsDir() {
@@ -278,8 +510,29 @@ func Run(dir string) (Report, error) {
 		}
 	}
 
+	// The coverage tier. history.json is a separate witness from the capture and
+	// alert-log corpora above and stays separate all the way to the exit code: it
+	// is user state written on every poll, so it is the only witness that exists
+	// on an install with diagnostics off.
+	//
+	// A failed read is non-fatal but must not be silent: a present-but-corrupt
+	// file has to report as unreadable, not as absent, and certainly not as
+	// "coverage tier present" while yielding no verdicts.
+	histErr := ""
+	if hist.Err != nil {
+		histErr = hist.Err.Error()
+	}
+
 	feedSamplesDir := filepath.Join(dir, "feed-samples")
-	report := Report{GeneratedAt: time.Now(), AlertLogStart: alertStart}
+	report := Report{
+		GeneratedAt:        time.Now(),
+		AlertLogStart:      alertStart,
+		HistoryPresent:     hist.Found && hist.Err == nil && hist.hist().CoverageCount() > 0,
+		HistoryFound:       hist.Found,
+		HistoryErr:         histErr,
+		CoverageDropped:    len(hist.Dropped),
+		DiagnosticsEnabled: cfg.DebugLogging,
+	}
 	for _, p := range providers.Default() {
 		captures, err := loadCaptures(filepath.Join(feedSamplesDir, p.ID), p, cfg.Regions)
 		if err != nil {
@@ -297,6 +550,8 @@ func Run(dir string) (Report, error) {
 			LastAlertTime:     lastAlertByID[p.ID],
 			MissingRecoveries: missing,
 		}
+		pr.Coverage, pr.HasCoverage = hist.hist().Coverage(p.ID)
+		pr.CoverageDropped = slices.Contains(hist.Dropped, p.ID)
 		for _, c := range captures {
 			if c.Time.After(pr.LastCaptureTime) {
 				pr.LastCaptureTime = c.Time
@@ -375,7 +630,9 @@ func boundOpenIntervals(windows []interval, captures []Capture, tolerance time.D
 			}
 			if c.Severity < providers.SevMajor {
 				out[i].End = c.Time
-				missing = append(missing, MissingRecovery{Start: out[i].Start, ClearedAt: c.Time})
+				missing = append(missing, MissingRecovery{
+					Kind: ClearedByCapture, Start: out[i].Start, ClearedAt: c.Time,
+				})
 				cleared = true
 				break
 			}
@@ -411,7 +668,10 @@ func boundOpenIntervals(windows []interval, captures []Capture, tolerance time.D
 		bound := lastSupport.Add(openWindowHorizon)
 		if !recordEnd.IsZero() && recordEnd.After(bound) {
 			out[i].End = bound
-			missing = append(missing, MissingRecovery{Start: out[i].Start})
+			// No clearing capture was ever seen: the window is closed by POLICY,
+			// not by evidence. ClearedAt stays zero and Kind says so, because the
+			// incident may well still be open.
+			missing = append(missing, MissingRecovery{Kind: BoundedByHorizon, Start: out[i].Start})
 		}
 	}
 	return out, missing

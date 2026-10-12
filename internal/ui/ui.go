@@ -9,6 +9,7 @@ package ui
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"image/color"
 	"log/slog"
@@ -114,6 +115,27 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // blip is tolerated without a tight retry loop.
 const providerRetryAttempts = 3
 
+// historyLoadRetryAfter is the pause before the one retry of a history.json read
+// that failed for a reason other than corruption (see New).
+const historyLoadRetryAfter = time.Second
+
+// retryDeadline bounds a manual Retry. It covers what the scheduled path may
+// spend — providerRetryAttempts attempts at the client's own 15s timeout, plus
+// backoff — so a slow feed that reads fine on schedule cannot accrue failures
+// only through clicks; a retry cut short by this deadline is then a feed slower
+// than any scheduled poll tolerates, a transport failure the record counts.
+const retryDeadline = 50 * time.Second
+
+// quitDrain bounds how long quit waits for cancelled polls to file their
+// observations before the shutdown save (see quit).
+const quitDrain = 3 * time.Second
+
+// firstProbeWait bounds how long the first provider round waits for the
+// connectivity probe's first answer. The probe runs 3s-timeout checks against a
+// handful of targets, so it is normally done within a few seconds of the startup
+// delay; the bound exists for the case where it never answers at all.
+const firstProbeWait = 10 * time.Second
+
 // historySaveEvery is how many countdown ticks (seconds) elapse between
 // background saves of the on-disk history ring buffer.
 const historySaveEvery = 60
@@ -170,7 +192,27 @@ type Controller struct {
 	cfg        config.Config
 	engine     *monitor.Engine
 	provStates map[string]provState
-	connDown   bool // every enabled connectivity target is currently unreachable
+	// round is the scheduled polling round in progress, minted by runProviders
+	// from History.NextRound. A manual retry records under it so the coverage
+	// record counts it as this round's observation, never as a round of its own.
+	round uint64
+	// runCtx is the app's run context, so work started by a user action — a
+	// manual retry — ends when the app does instead of recording into a History
+	// that will never be saved again. runCancel ends it from quit, BEFORE the
+	// shutdown save, and inflight counts the polls that still have to file.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+	inflight  sync.WaitGroup
+	// lastRoundAnyOK is whether ANY provider read its feed in the previous round.
+	// It is the independent proof of connectivity for machines whose networks
+	// block the probe targets — and it is not circular, because it is a DIFFERENT
+	// provider succeeding, never the failing one vouching for itself.
+	lastRoundAnyOK bool
+	connDown       bool // every enabled connectivity target is currently unreachable
+	// connJudged is whether any connectivity target was checked at all. Without
+	// it connDown==false is ambiguous between "the link is fine" and "nothing
+	// was asked", and the second is not evidence of the first.
+	connJudged bool
 	// connDownSince is when the current total-connectivity blackout began
 	// (zero when connectivity is up). It bounds which provider observations
 	// still count as evidence that the machine has internet.
@@ -211,6 +253,12 @@ type Controller struct {
 	// triggers force an immediate poll, bypassing the sleep (Refresh now).
 	providerTrigger chan struct{}
 	connTrigger     chan struct{}
+	// probeJudged is closed once the connectivity probe has answered for the
+	// first time, so the first provider round is judged against a witness that
+	// exists instead of against "nobody has said yet" — which read as no link
+	// and filed the first round of every launch as blind.
+	probeJudged chan struct{}
+	probeOnce   sync.Once
 
 	// filter/sort state for the status table.
 	filter  string
@@ -299,6 +347,116 @@ type provState struct {
 	// open the last time anyone could see — "resolved 1m ago" would otherwise be
 	// inferred from an absence that is our own blindness.
 	lastOK time.Time
+	// outcome is WHY this poll ended the way it did, as a history.Outcome*
+	// constant. Classified once, where the error is still in hand, so the sample
+	// and the coverage record can never disagree about the same poll.
+	//
+	// carryLastOK folds `prev` into a fresh observation but touches only lastOK,
+	// so this field is always the fresh poll's own answer.
+	outcome string
+}
+
+// feedOutcome maps a classified feed failure onto the coarser vocabulary the
+// history layer persists.
+//
+// history keeps its own constants rather than storing a providers value, for the
+// same reason IncidentLog stores a bare severity int: the on-disk format must not
+// move when the classifier gains a case. DNS, timeout, TLS and the unclassified
+// fallback all collapse to "transport" — the distinction matters in the log line
+// and in the UI, not in the answer to "was the feed readable".
+func feedOutcome(k providers.FeedFailure) string {
+	switch k {
+	case providers.FeedFailHTTP:
+		return history.OutcomeHTTP
+	case providers.FeedFailUnparseable:
+		return history.OutcomeParse
+	default:
+		return history.OutcomeTransport
+	}
+}
+
+// coverageObservation builds the attendance record for one completed check.
+//
+// One definition, because there are two callers and the blindness rule is subtle
+// enough that a copy would drift: a future non-informative case added here must
+// not be missed on the other path.
+//
+// Every judgement it cannot make for itself arrives as a parameter, and each one
+// is the WITNESS for a property rather than a proxy for it:
+//
+//	noLink    the connectivity probe said the machine had no link. NOT the
+//	          offline latch, which folds in "every provider failed" and would
+//	          therefore excuse a fleet-wide feed outage with itself.
+//	cancelled the poll was aborted by shutdown. From ctx.Err(), NOT from
+//	          inspecting st.err: monitor.Retry returns the LAST ATTEMPT's error
+//	          when cancellation lands during a backoff, so the error value is
+//	          silent about cancellation exactly when it matters.
+//	round     the scheduled polling round this poll belongs to, from
+//	          History.NextRound — zero only before the first round is minted.
+//	          The record counts rounds, not polls, so an on-demand re-poll (a
+//	          Retry, "Refresh now") carries the round in progress, not a new one.
+//	runGap    how long attempts may be apart before the polling is deemed to
+//	          have stopped — the app closed, the machine asleep. Derived from
+//	          the configured cadence, which is all that matters for it: within a
+//	          process the round number decides, however long a round took.
+//
+// Taking them as parameters also lets one poll round judge every provider
+// against a single snapshot; reading them per provider lets a link dropping
+// mid-round give some a real failure and others a blind one.
+func coverageObservation(st provState, noLink, cancelled bool, round uint64, runGap time.Duration) history.CoverageObservation {
+	// A skip is a LIVE 403/404 answer (providers.Check returns ErrNoFeed on
+	// those for an Optional provider) and reaches here with no error, so it
+	// must be judged against the witness like a failure is: a captive portal
+	// answers 403 to everything, and filing that as skipped-by-design ended an
+	// Optional provider's failure run every round through the portal.
+	blind := (st.err != nil || st.skipped) && (noLink || cancelled)
+	return history.CoverageObservation{
+		At:      st.when,
+		OK:      st.outcome == history.OutcomeReadable,
+		Skipped: st.skipped && !blind,
+		Round:   round,
+		RunGap:  runGap,
+		// A poll that never got an answer from the feed — because the machine had
+		// no link, or because shutdown cancelled it — is an attempt that carries
+		// no verdict about the feed.
+		//
+		// noLink is the CONNECTIVITY PROBE's answer, not the offline latch — see
+		// the caller.
+		//
+		// There is deliberately no "but it answered over HTTP" exemption. That
+		// existed only while blindness was keyed on the offline latch, which
+		// folded in "every provider failed" and so would have excused a
+		// fleet-wide feed outage with itself; the exemption was the patch for
+		// that circularity. With an independent witness the exemption is not
+		// merely redundant, it is harmful: a captive portal or intercepting proxy
+		// answers 200 with a login page, which parses as garbage, and the
+		// exemption would file that as positive evidence against every provider
+		// at once.
+		Blind: blind,
+		// Only set when the poll actually FAILED and the failure is the feed's to
+		// answer for — the field's own contract: a failure class, or empty on a
+		// success, a skip and a blind attempt alike. RecordCoverage happens to
+		// read it on the failure branch alone today; filling it on another branch
+		// would quietly wait for someone to hoist the assignment, at which point a
+		// healthy feed persists LastFailureClass="readable" or a blind poll's
+		// transport error is filed against the provider.
+		FailureClass: failureClassOf(st, blind),
+	}
+}
+
+// failureClassOf is st.outcome when the poll failed and the failure can be laid
+// at the feed's door, and empty otherwise — on a success, a skip, and a blind
+// attempt, whose error describes the machine's link, not the provider.
+func failureClassOf(st provState, blind bool) string {
+	if blind {
+		return ""
+	}
+	switch st.outcome {
+	case history.OutcomeReadable, history.OutcomeSkipped, "":
+		return ""
+	default:
+		return st.outcome
+	}
 }
 
 // carryLastOK folds the previous state's lastOK into a fresh observation: a
@@ -351,8 +509,37 @@ func New() *Controller {
 		histPath = filepath.Join(dir, "history.json")
 	}
 	hist, err := history.Load(histPath, history.DefaultCapacity)
-	if err != nil {
-		slog.Warn("history restore failed; starting empty", "err", err)
+	if err != nil && !errors.Is(err, history.ErrCorrupt) {
+		// A read error is not proof the bytes are unusable: a scanner or a
+		// backup tool holding the file for a moment fails the read and is gone
+		// a second later. One retry before the aside, so a one-second hold does
+		// not move months of coverage record out of the app's way.
+		time.Sleep(historyLoadRetryAfter)
+		hist, err = history.Load(histPath, history.DefaultCapacity)
+	}
+	switch {
+	case errors.Is(err, history.ErrCorrupt):
+		// The bytes are unusable — the one case that PROVES the file is not
+		// worth keeping in place. Starting empty over it would have the 60s
+		// save overwrite the never-pruned coverage record, so it is set aside
+		// first; the aside may itself fail, and then the log line is what
+		// remains.
+		aside, mvErr := history.SetAside(histPath)
+		slog.Warn("history is corrupt; starting empty", "err", err, "moved_to", aside, "move_err", mvErr)
+		if mvErr != nil {
+			histPath = ""
+		}
+	case err != nil:
+		// Still unreadable after the retry — a permission state, a lock that
+		// outlasts a second. That proves nothing about the bytes: moving a
+		// valid record aside over a transient state, as this once did, lost
+		// months of coverage to a sync tool's mode flip. The file stays where
+		// it is, and this run does not save over it — with no path there is no
+		// save, and the next launch reads the file whole. The cost is this
+		// run's own record, which is lost (TASK-9: recover persistence once
+		// the hold ends).
+		slog.Warn("history could not be read; running without persistence", "err", err)
+		histPath = ""
 	}
 	hist.Prune(providerUptimeWindow+time.Hour, time.Now())
 
@@ -422,6 +609,7 @@ func New() *Controller {
 		urlStates:              map[string]urlState{},
 		providerTrigger:        make(chan struct{}, 1),
 		connTrigger:            make(chan struct{}, 1),
+		probeJudged:            make(chan struct{}),
 		sortKey:                cfg.Sort.Column,
 		sortAsc:                cfg.Sort.Ascending,
 	}
@@ -484,6 +672,10 @@ func (c *Controller) Run() {
 	c.lastUIBeat.Store(c.startedAt.UnixNano())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	c.mu.Lock()
+	c.runCtx = ctx
+	c.runCancel = cancel
+	c.mu.Unlock()
 	go c.runConnectivity(ctx)
 	go c.runProviders(ctx)
 	go c.runCountdownTicker(ctx)
@@ -540,8 +732,38 @@ func (c *Controller) saveWindowState() {
 // quit persists state (window size + history) and exits the app.
 func (c *Controller) quit() {
 	c.saveWindowState()
+	// Stop the polls BEFORE the shutdown save, and wait for them to file what
+	// they have. A poll still in flight at quit used to be recorded after the
+	// save and never reach disk, so that provider's LastRound was persisted
+	// one round behind the fleet, and the next launch read the round it was
+	// missing as a skipped one — nine rounds of evidence lost to a quick
+	// restart. A cancelled poll files as a blind attempt, which carries the
+	// round number; the wait is bounded so a hung request cannot hold the
+	// quit.
+	c.mu.Lock()
+	cancel := c.runCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	c.drainPolls(quitDrain)
 	c.saveHistory()
 	c.app.Quit()
+}
+
+// drainPolls waits up to d for every provider poll in flight to file its
+// observation.
+func (c *Controller) drainPolls(d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		c.inflight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		slog.Warn("quit: polls still in flight after the drain bound; saving what is on the record", "bound", d)
+	}
 }
 
 // saveHistory persists the in-memory ring buffer and incident journal (best
@@ -612,6 +834,13 @@ func (c *Controller) buildMainMenu() *fyne.MainMenu {
 		fyne.NewMenuItem(t.RefreshNow, c.forceRefreshNow),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem(t.TrayHide, c.hideToTray),
+		// Our own Quit, flagged IsQuit (see quitMenuItem): without it Fyne
+		// appends a Quit of its own to this menu — App → Quit and Cmd+Q on
+		// macOS — bound straight to the driver, which skipped c.quit and with
+		// it the shutdown save and the poll drain. Measured on the darwin soak
+		// of 4a43a30: a round completed eight seconds before that Quit was never
+		// written, and only the 60s periodic save had reached disk.
+		quitMenuItem(t.TrayQuit, c.quit),
 	)
 	help := fyne.NewMenu("Help",
 		fyne.NewMenuItem(t.CheckForUpdates, func() {
@@ -1107,7 +1336,8 @@ func (c *Controller) openURL(raw string) {
 	}
 }
 
-// quitMenuItem builds the tray's Quit entry, flagged as THE quit item.
+// quitMenuItem builds a Quit entry — the tray's and the main menu's — flagged as
+// THE quit item, so every way out of the app runs c.quit.
 //
 // Fyne's addMissingQuitForMenu appends its own Quit unless the last item is
 // already marked IsQuit — and it only sets that flag itself when the label
@@ -1242,6 +1472,14 @@ func (c *Controller) runConnectivity(ctx context.Context) {
 
 			c.mu.Lock()
 			down := anyChecked && allDown
+			// Whether there was a WITNESS at all, kept separate from its verdict.
+			// down is false both when the link is fine and when no connectivity
+			// target is enabled to say — and a consumer that cannot tell those
+			// apart reads "no evidence" as "evidence of a link".
+			c.connJudged = anyChecked
+			// Closed on the first pass whatever the answer — including "no target
+			// enabled to say", which is itself the witness's answer.
+			c.probeOnce.Do(func() { close(c.probeJudged) })
 			// Stamp when the blackout STARTED. recomputeOffline needs it to tell a
 			// provider fetch that proves we are online from one that merely
 			// succeeded before the network dropped — see the freshness rule there.
@@ -1384,6 +1622,16 @@ func (c *Controller) checkTotalLoss(byID map[string]monitor.TargetStatus) {
 	c.saveOutageState()
 }
 
+// nextRound mints the next scheduled polling round and publishes it as the one
+// in progress, for the manual-retry path to record under.
+func (c *Controller) nextRound() uint64 {
+	round := c.history.NextRound()
+	c.mu.Lock()
+	c.round = round
+	c.mu.Unlock()
+	return round
+}
+
 func (c *Controller) runProviders(ctx context.Context) {
 	defer logPanic("runProviders")
 	first := time.Now().Add(startupDelay)
@@ -1393,10 +1641,51 @@ func (c *Controller) runProviders(ctx context.Context) {
 	if !sleepCtx(ctx, startupDelay) {
 		return
 	}
+	// Both loops wake from the same startup delay and the probe takes seconds to
+	// answer, so without this the first round snapshots an unjudged witness and
+	// is filed blind against every provider — one real failure dropped per
+	// launch, and an app opened and closed inside one round never accumulating
+	// evidence against a broken feed. Wait for the probe's first answer, bounded:
+	// a probe that never answers (no engine) must not hold polling hostage.
+	c.mu.Lock()
+	c.nextProviderPoll = time.Now().Add(firstProbeWait) // the countdown's upper bound while waiting
+	c.mu.Unlock()
+	select {
+	case <-c.probeJudged:
+	case <-time.After(firstProbeWait):
+	case <-ctx.Done():
+		return
+	}
+	// A "Refresh now" clicked during that wait is answered by the first round
+	// itself; its token, left in the channel, would run every provider a second
+	// time straight after it.
+	select {
+	case <-c.providerTrigger:
+	default:
+	}
+	// The probe may have answered well inside the bound: the countdown reads
+	// "now" from here, not a wait that is over.
+	c.mu.Lock()
+	c.nextProviderPoll = time.Now()
+	c.mu.Unlock()
+	// The round number is minted on the CADENCE: the next round is due one
+	// interval after the last mint, whatever woke the loop. "Refresh now" wakes
+	// it through providerTrigger and re-polls inside the round in progress, so
+	// the coverage record sees the same round and does not count it twice —
+	// that is what makes a failure run count rounds and not clicks. Minting on
+	// the timer OBJECT instead, re-armed after every poll, let a click that
+	// raced the tick run the cadence poll under the old number, and clicks
+	// closer together than one interval stalled minting altogether — a user
+	// hitting Refresh through an outage could keep the run from ever reaching
+	// the sustained threshold. A round that outlasts the interval is followed
+	// by the next one at once: rounds then come as fast as they complete, one
+	// in flight at a time, never faster than the cadence.
+	round := c.nextRound()
+	lastMint := time.Now()
 	for {
 		c.pruneExpiredRegionMutes() // expire timed region deactivations + notify "resumed"
 		c.pruneExpiredSilences()    // expire timed per-check silences (silently)
-		c.pollProvidersOnce(ctx)
+		c.pollProvidersOnce(ctx, round)
 		c.pollURLChecksOnce(ctx)
 		c.recomputeOffline()
 		c.refresh()
@@ -1407,110 +1696,272 @@ func (c *Controller) runProviders(ctx context.Context) {
 		// c.mu). Reusing the same value also keeps the displayed countdown in sync
 		// with the actual wait if the interval changes between calls.
 		interval := c.providerInterval()
+		due := roundDue(lastMint, interval)
 		c.mu.Lock()
-		c.nextProviderPoll = time.Now().Add(interval)
+		c.nextProviderPoll = due
 		c.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(interval):
+		case <-time.After(time.Until(due)):
 		case <-c.providerTrigger:
+		}
+		if now := time.Now(); mintRound(due, now) {
+			round = c.nextRound()
+			lastMint = now
 		}
 	}
 }
 
-func (c *Controller) pollProvidersOnce(ctx context.Context) {
+// roundDue is when the next polling round is due: one interval after the last
+// mint, whatever woke the loop in between. A late round (the previous one
+// outlasted the interval) is due already.
+func roundDue(lastMint time.Time, interval time.Duration) time.Time {
+	return lastMint.Add(interval)
+}
+
+// mintRound says whether a wake-up at now starts a new round or re-polls inside
+// the one in progress: a wake before the round is due is a "Refresh now" and
+// polls under the current number. Pulled out of the loop so the decision that
+// makes a failure run count rounds and not clicks is testable on its own.
+func mintRound(due, now time.Time) bool {
+	return !now.Before(due)
+}
+
+// noLinkLocked is the connectivity witness a coverage observation is judged
+// against: the probe said the machine had no link — or nobody was there to say
+// — and no provider proved otherwise by reading its feed last round. Caller
+// holds c.mu. One definition for the scheduled poll and the manual retry: the
+// next term added to this rule must land in both, or the two paths judge the
+// same link differently and a blind retry counts as evidence.
+func (c *Controller) noLinkLocked() bool {
+	return (c.connDown || !c.connJudged) && !c.lastRoundAnyOK
+}
+
+// staleAfter is how old a provider observation may be before it says nothing
+// about now: the configured cadence, doubled, so one poll that ran long is
+// absorbed. The offline detector uses it as its freshness bound and the coverage
+// record as its run gap (floored at an hour there) — ONE definition, or the two
+// disagree about whether the same observation is current. Takes c.mu, so call
+// it unlocked.
+func (c *Controller) staleAfter() time.Duration { return 2 * c.providerInterval() }
+
+func (c *Controller) pollProvidersOnce(ctx context.Context, round uint64) {
 	list := c.enabledProviders()
 	interest := c.regionsOfInterest()
+	// Snapshot the offline state ONCE for the whole round. recomputeOffline also
+	// runs from the connectivity loop on its own, much shorter interval, so a
+	// link dropping mid-round would otherwise give providers polled before the
+	// latch a real failure and providers polled after it a blind one — one
+	// connectivity event leaving an inconsistent attendance record across the
+	// fleet. Every provider in a round must be judged against the same answer.
+	//
+	// What this does NOT do, stated so nobody reads more into it. The witness is
+	// necessarily behind a drop that happens DURING the round: providers polled
+	// before the probe notices record a real failure, and that costs up to TWO
+	// failures per episode and no more: the round of the drop, and the next
+	// one when a provider polled before the drop read its feed, because that
+	// read is the proof of a link (lastRoundAnyOK) the next round is judged
+	// against. From there the rounds go blind until a poll succeeds, which
+	// resets the counter to zero — well inside the sustained run a verdict
+	// needs. The first round of a process used to be
+	// the mirror image — snapshotted before the probe had answered, so filed
+	// blind against every provider — and runProviders now waits for the probe's
+	// first answer before that round (see probeJudged). The witness for "this
+	// poll could not see anything" is the CONNECTIVITY PROBE, not the offline
+	// latch.
+	//
+	// monitor.Evaluate mixes two very different things into that latch: the ping
+	// result, which is independent evidence, and "every provider was
+	// unreachable", which is a heuristic derived from the same failures we would
+	// be excusing. Keying blindness on the latch is therefore circular — a
+	// fleet-wide feed outage makes every provider fail, the latch flips, and from
+	// the next round on the outage is recorded as "we could not see" and the
+	// verdict can never fire. Which is precisely the incident this record exists
+	// to catch.
+	//
+	// c.connDown comes from ICMP/TCP probes to the default targets. It says
+	// nothing about any provider's feed, which is exactly why it can arbitrate.
+	c.mu.Lock()
+	// No witness is not a clean bill of health. With every connectivity target
+	// disabled there is nothing that can say whether the machine had a link, so
+	// a failure cannot be attributed to the feed — it is recorded as an attempt
+	// that taught nothing. The cost is that a user who turns off all
+	// connectivity checks loses the feed-not-readable verdict; the alternative is
+	// asserting a link nobody observed and blaming providers for the user's own
+	// network, which is the failure this whole record exists to avoid.
+	// anyOK is the escape hatch for a network that blocks the probe targets
+	// outright — common on corporate links — where connDown is permanently true
+	// and would otherwise make every failure blind, leaving the verdict inert and
+	// silent about being inert. A successful HTTPS fetch from ANY provider proves
+	// the machine was online, and it is not circular: it is a different provider
+	// succeeding, never the failing one excusing itself.
+	noLinkAtRoundStart := c.noLinkLocked()
+	c.mu.Unlock()
+	// Within a process, whether this provider was looked at every round is
+	// answered by the round number, exactly. The run-gap only has to say when
+	// the polling STOPPED — the app closed, the machine asleep — so the
+	// configured cadence is all it needs; the record floors it at an hour, which
+	// no round costs. The measured round cost that used to feed this, doubled
+	// and clamped, was a proxy for the round number, and every threshold derived
+	// from it moved when a round got slow.
+	roundGap := c.staleAfter()
 	var wg sync.WaitGroup
 	for _, p := range list {
 		wg.Add(1)
+		c.inflight.Add(1)
 		go func(p providers.Provider) {
 			defer wg.Done()
+			defer c.inflight.Done()
 			st := c.checkProviderWithRetry(ctx, p)
-
-			c.mu.Lock()
-			st = carryLastOK(c.provStates[p.ID], st)
-			c.provStates[p.ID] = st
-			c.mu.Unlock()
-
-			// History: latency is the (last) fetch duration; "up" means we read the
-			// feed AND the service is operational in the regions of interest. An
-			// UNREADABLE feed records an Unknown sample — grey on the strip, outside
-			// the uptime % — mirroring the Status column and alerting, which never
-			// treat "could not check" as an outage (a 2-minute local internet blip
-			// used to paint red bands across every provider). When genuinely down,
-			// capture the regions whose MAJOR incidents drove it so the uptime strip
-			// can be recomputed against later region de-selections (an empty set
-			// means an unscoped/global down that muting can never green). Severity
-			// comes from unmutedSeverity — the same incident-first kernel as the
-			// Status column — so the strip can never show green during a displayed
-			// outage.
-			reachable := st.res.Reachable() && !st.skipped
-			up := reachable && unmutedSeverity(st.res, interest) < providers.SevMajor
-			sample := history.Sample{Time: st.when, Up: up, Unknown: !reachable, Latency: st.latency}
-			if !up && reachable {
-				sample.DownRegions, _ = sampleDownRegions(st.res, interest)
-			}
-			// Capture any degradation INDEPENDENTLY of the outage state: a provider
-			// can have both a major (region A) and a minor (region B) incident, and
-			// muting A must reveal the amber from B rather than going green.
-			if reachable {
-				degRegions, degUnscoped := sampleDegradedRegions(st.res, interest)
-				if degUnscoped || len(degRegions) > 0 {
-					sample.Degraded = true
-					sample.DegradedRegions = degRegions
-				}
-			}
-			c.history.Add(p.ID, sample)
-
-			// Journal every incident the feed currently lists so the detail
-			// panel can show a last-24h history after they resolve. Recorded
-			// unfiltered; region scoping is applied at display time against the
-			// then-current interest set.
-			if reachable && len(st.res.Incidents) > 0 {
-				c.incidents.Observe(p.ID, incidentEntries(st.res.Incidents), st.when)
-			}
-
-			// Alert on real, region-scoped service outages only. A feed we could not
-			// read is "unknown" and never alerts. Suppressed while globally offline,
-			// muted, notifications off, or when every region driving the outage has
-			// been deactivated (#7). The edge detector still advances (delivery is
-			// gated, not the state), so the outage re-alerts on its next real change.
-			if st.res.Reachable() && !st.skipped {
-				sev := unmutedSeverity(st.res, interest)
-				down := sev >= providers.SevMajor
-				// Journal what the feed actually said whenever it is not clean, so a
-				// captured payload in feed-samples/ can always be matched against the
-				// decision it produced. A silently-empty or mis-parsed feed then shows
-				// up as "operational" here for hours next to a real outage, instead of
-				// leaving no trace at all (the failure mode that hid the 2026-07-23
-				// Azure West US incident for days).
-				if sev > providers.SevNone || len(st.res.Incidents) > 0 {
-					slog.Info("provider degraded", "id", p.ID, "severity", sev.String(),
-						"down", down, "incidents", len(st.res.Incidents),
-						"summaries", strings.Join(st.res.Labels(), " | "))
-				}
-				summary := ""
-				if down {
-					summary = unmutedWorstSummary(st.res, interest)
-				}
-				if n := c.outages.Update(p.ID, p.Name, summary, down); n != nil {
-					c.deliver(p.ID, n, p.StatusPage(), false,
-						c.alertSuppressedReason(p.ID, st.res, interest))
-					// Persisted AFTER delivery, for two reasons. The state must
-					// record whether the opening alert was actually SHOWN, which
-					// only deliver decides; and on the recovery side a crash
-					// between the two now leaves the latch on disk — a duplicate
-					// recovery next launch, which is far better than the silent
-					// loss the reverse order produced.
-					c.saveOutageState()
-				}
-			}
+			// A poll cancelled by shutdown never got an answer from the feed, so
+			// counting it would let a user who launches and quits during the
+			// poll window accumulate failures no provider ever produced — and
+			// that reaches the audit's exit code. ctx.Err() rather than
+			// inspecting st.err: monitor.Retry returns the LAST ATTEMPT's error
+			// when cancellation lands during a backoff, so the error value is
+			// silent about cancellation in exactly the case this filter exists
+			// for.
+			c.recordPoll(p, st, interest, noLinkAtRoundStart, ctx.Err() != nil, round, roundGap)
 		}(p)
 	}
 	wg.Wait()
+	c.mu.Lock()
+	c.lastRoundAnyOK = false
+	for _, p := range list {
+		if st, ok := c.provStates[p.ID]; ok && st.outcome == history.OutcomeReadable {
+			c.lastRoundAnyOK = true
+			break
+		}
+	}
+	c.mu.Unlock()
+}
+
+// recordPoll files one provider observation everywhere a poll result goes: the
+// row state, the uptime sample, the coverage record, the incident journal and
+// the outage detector. It is the ONE post-poll path, for the scheduled round
+// and the Retry affordance alike — a second copy of this bookkeeping is where a
+// retry wrote the coverage record and nothing else, so the audit's two
+// witnesses disagreed about a feed the user had just watched come back.
+//
+// noLink is the connectivity witness snapshotted when the poll was LAUNCHED;
+// cancelled says the app ended before the feed answered; round and roundGap
+// are the coverage record's own terms (see coverageObservation).
+func (c *Controller) recordPoll(p providers.Provider, st provState, interest []string,
+	noLink, cancelled bool, round uint64, roundGap time.Duration) {
+	c.mu.Lock()
+	// carryLastOK: without it a FAILED poll drops lastOK to the zero time, and
+	// the detail panel uses lastOK as the reference clock for its 24h incident
+	// window — so one failure silently emptied the list it was showing.
+	st = carryLastOK(c.provStates[p.ID], st)
+	c.provStates[p.ID] = st
+	// A poll that READ its feed is proof of a link, whichever path ran it: on a
+	// network that blocks the probe targets, this is what stops the next round
+	// filing every failure as blind. It is not circular — a different provider
+	// succeeding, never the failing one excusing itself.
+	if st.outcome == history.OutcomeReadable {
+		c.lastRoundAnyOK = true
+	}
+	c.mu.Unlock()
+
+	// History: latency is the (last) fetch duration; "up" means we read the
+	// feed AND the service is operational in the regions of interest. An
+	// UNREADABLE feed records an Unknown sample — grey on the strip, outside
+	// the uptime % — mirroring the Status column and alerting, which never
+	// treat "could not check" as an outage (a 2-minute local internet blip
+	// used to paint red bands across every provider). When genuinely down,
+	// capture the regions whose MAJOR incidents drove it so the uptime strip
+	// can be recomputed against later region de-selections (an empty set
+	// means an unscoped/global down that muting can never green). Severity
+	// comes from unmutedSeverity — the same incident-first kernel as the
+	// Status column — so the strip can never show green during a displayed
+	// outage.
+	reachable := st.res.Reachable() && !st.skipped
+	up := reachable && unmutedSeverity(st.res, interest) < providers.SevMajor
+	sample := history.Sample{
+		Time: st.when, Up: up, Unknown: !reachable, Latency: st.latency,
+	}
+	if !up && reachable {
+		sample.DownRegions, _ = sampleDownRegions(st.res, interest)
+	}
+	// Capture any degradation INDEPENDENTLY of the outage state: a provider
+	// can have both a major (region A) and a minor (region B) incident, and
+	// muting A must reveal the amber from B rather than going green.
+	if reachable {
+		degRegions, degUnscoped := sampleDegradedRegions(st.res, interest)
+		if degUnscoped || len(degRegions) > 0 {
+			sample.Degraded = true
+			sample.DegradedRegions = degRegions
+		}
+	}
+	c.history.Add(p.ID, sample)
+
+	// Attendance, separately from the sample. The ring is display-scoped
+	// and Prune truncates it to the uptime window at every launch, so it
+	// cannot answer "when did this feed LAST work" once an outage outlives
+	// that window — which is exactly the question asked after the fact.
+	// Coverage is a per-check high-water mark and is never pruned, so it
+	// can. Skipped checks are recorded as attempts with no success and no
+	// failure class: an Optional provider with no public feed was looked
+	// at, and it is not broken.
+	//
+	// Blind: a failed poll while the machine itself has no connectivity
+	// says nothing about THIS feed, and counting it would blame all
+	// fifteen providers for the user's router — a fault that now reaches
+	// the audit's exit code, so it must not be recorded from an unreadable
+	// observation. The custom-URL path applies the same IDEA to its
+	// unknown samples but keys it on the offline latch (urlchecks.go),
+	// the witness this path rejects as circular; the two are not the same
+	// rule, and "fixing one to match the other" must go towards the probe.
+	//
+	// The offline answer is the caller's snapshot, not a live read, so
+	// every provider in a round is judged against the same state.
+	c.history.RecordCoverage(p.ID, coverageObservation(st, noLink, cancelled, round, roundGap))
+
+	// Journal every incident the feed currently lists so the detail
+	// panel can show a last-24h history after they resolve. Recorded
+	// unfiltered; region scoping is applied at display time against the
+	// then-current interest set.
+	if reachable && len(st.res.Incidents) > 0 {
+		c.incidents.Observe(p.ID, incidentEntries(st.res.Incidents), st.when)
+	}
+
+	// Alert on real, region-scoped service outages only. A feed we could not
+	// read is "unknown" and never alerts. Suppressed while globally offline,
+	// muted, notifications off, or when every region driving the outage has
+	// been deactivated (#7). The edge detector still advances (delivery is
+	// gated, not the state), so the outage re-alerts on its next real change.
+	if reachable {
+		sev := unmutedSeverity(st.res, interest)
+		down := sev >= providers.SevMajor
+		// Journal what the feed actually said whenever it is not clean, so a
+		// captured payload in feed-samples/ can always be matched against the
+		// decision it produced. A silently-empty or mis-parsed feed then shows
+		// up as "operational" here for hours next to a real outage, instead of
+		// leaving no trace at all (the failure mode that hid the 2026-07-23
+		// Azure West US incident for days).
+		if sev > providers.SevNone || len(st.res.Incidents) > 0 {
+			slog.Info("provider degraded", "id", p.ID, "severity", sev.String(),
+				"down", down, "incidents", len(st.res.Incidents),
+				"summaries", strings.Join(st.res.Labels(), " | "))
+		}
+		summary := ""
+		if down {
+			summary = unmutedWorstSummary(st.res, interest)
+		}
+		if n := c.outages.Update(p.ID, p.Name, summary, down); n != nil {
+			c.deliver(p.ID, n, p.StatusPage(), false,
+				c.alertSuppressedReason(p.ID, st.res, interest))
+			// Persisted AFTER delivery, for two reasons. The state must
+			// record whether the opening alert was actually SHOWN, which
+			// only deliver decides; and on the recovery side a crash
+			// between the two now leaves the latch on disk — a duplicate
+			// recovery next launch, which is far better than the silent
+			// loss the reverse order produced.
+			c.saveOutageState()
+		}
+	}
 }
 
 // checkProviderWithRetry fetches p's feed, retrying a failed READ with
@@ -1537,6 +1988,7 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 	switch {
 	case err == providers.ErrNoFeed:
 		st.skipped = true
+		st.outcome = history.OutcomeSkipped
 	case err != nil:
 		st.err = err
 		st.res = providers.Result{Feed: providers.FeedUnreachable}
@@ -1547,10 +1999,12 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 		// reason and the raw error both go in; the reason is what you grep for,
 		// the error is what you send to whoever owns the network.
 		kind, code := providers.ClassifyFeedFailure(err)
+		st.outcome = feedOutcome(kind)
 		slog.Warn("provider feed unreadable", "id", p.ID, "reason", kind.String(),
 			"http_status", code, "attempts", tries, "err", err)
 	default:
 		st.res = res
+		st.outcome = history.OutcomeReadable
 	}
 	st.when = time.Now()
 	return st
@@ -1559,19 +2013,16 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 // recomputeOffline folds the latest connectivity and provider observations into
 // the offline detector and refreshes the banner on a transition.
 func (c *Controller) recomputeOffline() {
-	c.mu.Lock()
-	connDown := c.connDown
 	// Only FRESH provider observations count. provStates persists between
 	// provider polls (a minute by default) while this runs from the 1s
 	// connectivity loop, and Evaluate now treats a reachable feed as proof the
 	// machine is online. Without a freshness bound, a successful poll from a
 	// minute ago would keep vetoing the offline banner for a full provider
 	// interval after the network actually dropped — trading one wrong answer for
-	// a slower right one. Two intervals of slack absorbs a poll that ran long.
-	fresh := 2 * time.Duration(c.cfg.IntervalSeconds) * time.Second
-	if fresh <= 0 {
-		fresh = 2 * time.Duration(config.DefaultIntervalSeconds) * time.Second
-	}
+	// a slower right one. Resolved before the lock: staleAfter takes c.mu.
+	fresh := c.staleAfter()
+	c.mu.Lock()
+	connDown := c.connDown
 	// ...and only observations made AFTER the connectivity probes went dark. A
 	// successful HTTPS fetch is proof the machine was online WHEN IT HAPPENED,
 	// not now. Freshness alone is a 2-minute window, so a poll that landed
@@ -1640,14 +2091,54 @@ func (c *Controller) forceRefreshNow() {
 // recheckProvider re-runs a single provider's status check immediately (used by
 // the Retry affordance on error rows).
 func (c *Controller) recheckProvider(p providers.Provider) {
+	c.inflight.Add(1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		st := c.checkProviderWithRetry(ctx, p)
+		defer c.inflight.Done()
+		// Derived from the app's run context so a quit cancels a retry in
+		// flight and waits for it to file (see quit): an observation recorded
+		// after the shutdown save never reaches disk, and a refresh after
+		// teardown touches a UI that is gone. retryDeadline on top is the
+		// retry's own patience.
 		c.mu.Lock()
-		c.provStates[p.ID] = st
+		base := c.runCtx
 		c.mu.Unlock()
-		c.refresh()
+		if base == nil {
+			base = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(base, retryDeadline)
+		defer cancel()
+		// The round and the connectivity witness are snapshotted at the START,
+		// exactly as the scheduled path snapshots them at round start: a link
+		// that drops during the retry is the same event it is for a scheduled
+		// poll, judged against the state the poll was launched under.
+		c.mu.Lock()
+		round := c.round
+		noLink := c.noLinkLocked()
+		c.mu.Unlock()
+		st := c.checkProviderWithRetry(ctx, p)
+		// A manual retry is filed exactly as a scheduled poll is — the same
+		// sample, coverage, journal and outage bookkeeping, through the same
+		// function — under the round in progress and against the same
+		// connectivity witness. Its success lets the user's own observation
+		// clear a failure run they just watched end, and close the outage they
+		// are looking at; otherwise the records contradict what is on screen,
+		// and one of them drives the audit's exit code. Its FAILURE counts too:
+		// the record counts at most one failure per round however many polls
+		// the round saw, so ten clicks in a minute cannot manufacture a run —
+		// and recording only the successes made the record manipulable in one
+		// direction, where a lucky click on a flapping feed reset a nine-round
+		// run while ten failed clicks changed nothing.
+		//
+		// Cancelled means the APP ended, not that the feed was slow: it is
+		// filed as a blind attempt exactly as a scheduled poll cut by shutdown
+		// is — one rule for one event — while the deadline (retryDeadline) is a
+		// transport failure the record counts. What a cancelled retry skips is
+		// the refresh: the UI it would touch is being torn down.
+		cancelled := errors.Is(ctx.Err(), context.Canceled)
+		c.recordPoll(p, st, c.regionsOfInterest(), noLink, cancelled, round, c.staleAfter())
+		if !cancelled {
+			c.refresh()
+		}
 	}()
 }
 
