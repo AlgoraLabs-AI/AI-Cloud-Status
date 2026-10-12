@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,7 +21,16 @@ func init() {
 		ID: testProviderID, Name: "Test Audit Provider", Category: providers.CategoryDev,
 		Kind: providers.KindStatuspage, URL: "https://example.invalid/summary.json",
 	})
+	// A page Kind owned by this test binary, with a parser that reads any
+	// body as one major incident: the archive round trip below depends on no
+	// production parser's anchors.
+	providers.RegisterPageParser(testPageKind, func(_ providers.Provider, _ []byte) (providers.Result, error) {
+		return providers.Result{Severity: providers.SevMajor, Incidents: []providers.Incident{{Summary: "page", Severity: providers.SevMajor}}}, nil
+	})
 }
+
+// testPageKind is the page Kind registered in init for the archive round trip.
+const testPageKind providers.Kind = "test-audit-page"
 
 // statuspageFixture builds a minimal Atlassian-Statuspage-shaped payload with
 // one unresolved incident. pageIndicator deliberately can (and in the
@@ -62,33 +70,32 @@ func writeCapture(t *testing.T, dir, provider string, ts time.Time, label string
 // the timestamp and the gzip magic and never on the suffix. A reader that
 // started filtering by ".json" would fail here, not in production.
 func TestLoadCapturesReadsWhatFeedCaptureWrites(t *testing.T) {
-	// The smallest page the Rootly parser reads: a banner, the service list
-	// heading, one affected row, a whole document. Owned here so a change to
-	// the providers fixtures cannot fail a test about the archive's naming.
-	page := []byte(`<html><body>
-<div class="sp-error-bg"><span class="text-4xl">Partial System Outage</span></div>
-<h2 class="">Services</h2>
-<details class="group"><summary><span class="sp-error-bg"><svg></svg></span><h2>Audio API</h2><span class="text-red-500">Partial Outage</span></summary></details>
-</body></html>`)
+	page := []byte("<html><body>a page</body></html>")
 	dir := t.TempDir()
-	p := providers.Provider{ID: "page-roundtrip", Name: "Page", Kind: providers.KindRootly}
+	p := providers.Provider{ID: "page-roundtrip", Name: "Page", Kind: testPageKind}
 	res, err := providers.ParseFeed(p, page)
 	if err != nil {
 		t.Fatal(err)
 	}
 	providers.NewFeedCapture(filepath.Join(dir, "feed-samples")).Capture(p, page, res, nil)
 
+	// What was written is the providers package's contract (its naming test
+	// owns the suffix); this test only needs one file to exist to read back.
 	pdir := filepath.Join(dir, "feed-samples", p.ID)
 	files, err := os.ReadDir(pdir)
-	if err != nil || len(files) != 1 || !strings.HasSuffix(files[0].Name(), ".html.gz") {
-		t.Fatalf("FeedCapture wrote %v (%v), want one .html.gz capture", files, err)
+	var names []string
+	for _, f := range files {
+		names = append(names, f.Name())
+	}
+	if err != nil || len(names) != 1 {
+		t.Fatalf("FeedCapture wrote %v (%v), want one capture", names, err)
 	}
 	caps, err := loadCaptures(pdir, p, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(caps) != 1 || caps[0].ParseErr != nil {
-		t.Errorf("loadCaptures read %+v, want the one capture with no parse error", caps)
+		t.Errorf("loadCaptures read %+v, want the one capture %s with no parse error", caps, names[0])
 	}
 }
 

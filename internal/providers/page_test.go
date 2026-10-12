@@ -73,8 +73,12 @@ func TestFeedCaptureNamesAPageAsHTML(t *testing.T) {
 	fc.Capture(Provider{ID: "feed", Kind: KindStatuspage}, readFixture(t, "statuspage_major.json"), res, nil)
 	for id, want := range map[string]string{"page": "-major.html.gz", "feed": "-major.json.gz"} {
 		files, err := os.ReadDir(filepath.Join(dir, id))
-		if err != nil || len(files) != 1 || !strings.HasSuffix(files[0].Name(), want) {
-			t.Errorf("%s capture named %v (%v), want one file ending in %s", id, files, err, want)
+		var names []string
+		for _, f := range files {
+			names = append(names, f.Name())
+		}
+		if err != nil || len(names) != 1 || !strings.HasSuffix(names[0], want) {
+			t.Errorf("%s capture named %v (%v), want one file ending in %s", id, names, err, want)
 		}
 	}
 }
