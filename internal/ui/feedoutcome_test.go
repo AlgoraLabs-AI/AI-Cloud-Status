@@ -14,7 +14,7 @@ import (
 // shape, and the record keeps its coarse vocabulary.
 func TestFeedOutcomeCoversEveryFailureClass(t *testing.T) {
 	want := map[providers.FeedFailure]string{
-		providers.FeedFailNone:        history.OutcomeTransport,
+		providers.FeedFailNone:        history.OutcomeReadable,
 		providers.FeedFailOther:       history.OutcomeTransport,
 		providers.FeedFailDNS:         history.OutcomeTransport,
 		providers.FeedFailTimeout:     history.OutcomeTransport,
@@ -28,8 +28,9 @@ func TestFeedOutcomeCoversEveryFailureClass(t *testing.T) {
 			t.Errorf("feedOutcome(%v) = %q, want %q", k, got, w)
 		}
 	}
-	// Every class the classifier can return is in the table above.
-	for k := providers.FeedFailNone; k <= providers.FeedFailChallenged; k++ {
+	// Every class the classifier can return is in the table above; the bound
+	// is the classifier's own, so a class added there is a failure here.
+	for k := providers.FeedFailNone; k < providers.FeedFailureCount; k++ {
 		if _, ok := want[k]; !ok {
 			t.Errorf("FeedFailure %d (%v) has no expected outcome in this test", k, k)
 		}

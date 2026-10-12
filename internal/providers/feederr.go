@@ -28,6 +28,11 @@ const (
 	FeedFailHTTP                           // answered, but not 200
 	FeedFailUnparseable                    // answered 200 with bytes no adapter understood
 	FeedFailChallenged                     // answered with a Cloudflare challenge: the request shape was refused
+
+	// FeedFailureCount is one past the last class: the bound a consumer uses
+	// to prove it handles every class, so a class added here and forgotten
+	// there is a failing test rather than a silent fallthrough.
+	FeedFailureCount
 )
 
 // String is the short, stable token used in log lines (`reason=certificate`).

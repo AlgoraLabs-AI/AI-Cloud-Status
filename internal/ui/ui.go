@@ -370,6 +370,8 @@ type provState struct {
 // and in the UI, not in the answer to "was the feed readable".
 func feedOutcome(k providers.FeedFailure) string {
 	switch k {
+	case providers.FeedFailNone:
+		return history.OutcomeReadable
 	case providers.FeedFailHTTP, providers.FeedFailChallenged:
 		// A challenge is an HTTP answer that refused the request shape: the
 		// record keeps its coarse vocabulary, and the distinction lives in the
