@@ -129,10 +129,14 @@ func parseRootly(data []byte) (Result, error) {
 		}
 		// A row with no readable label is still a row with an icon: the
 		// legend's colour is a verdict on its own, so the row is read from
-		// it rather than failing the page during the outage it reports. Only
-		// a row that says nothing either way is unreadable.
-		if svc.Status == "" && svc.Icon == "" {
-			return Result{}, fmt.Errorf("rootly: service row %q has no readable status", svc.Name)
+		// it rather than failing the page during the outage it reports, and
+		// its label is the legend's word for that colour. Only a row that
+		// says nothing either way is unreadable.
+		if svc.Status == "" {
+			if svc.Icon == "" {
+				return Result{}, fmt.Errorf("rootly: service row %q has no readable status", svc.Name)
+			}
+			svc.Status = rootlyLegend[svc.Icon]
 		}
 		services = append(services, svc)
 	}
@@ -140,11 +144,18 @@ func parseRootly(data []byte) (Result, error) {
 		return Result{}, errors.New("rootly: page carries no service rows")
 	}
 
-	m := rootlyBanner.FindStringSubmatch(page)
-	if m == nil {
+	// The banner is the headline span nearest ABOVE the service list: a card
+	// the page gains during an incident may carry the same headline style,
+	// but it sits above the banner, so the last match before the list wins.
+	above := page[:len(page)-len(list)]
+	if len(above) == 0 {
+		above = page
+	}
+	ms := rootlyBanner.FindAllStringSubmatch(above, -1)
+	if len(ms) == 0 {
 		return Result{}, errors.New("rootly: page carries no status banner")
 	}
-	banner := plainNote(m[1])
+	banner := plainNote(ms[len(ms)-1][1])
 	if banner == "" {
 		// A banner with no words is the anchor missing, not a verdict: it
 		// must not become a minor incident with an empty summary.
@@ -188,6 +199,14 @@ func parseRootly(data []byte) (Result, error) {
 	return res, nil
 }
 
+// rootlyLegend is the page's own word for each status icon colour, used as a
+// row's label when the row carries an icon and no readable words.
+var rootlyLegend = map[string]string{
+	"sp-success-bg": "Operational",
+	"sp-error-bg":   "Affected",
+	"bg-yellow-100": "Maintenance",
+}
+
 // rootlyAllClear reports whether the page banner is an all-clear verdict: it
 // says "operational" and nothing that takes it back. "Not Operational" and
 // "Partially Operational" must not pass for it; "All Systems Are Operational"
@@ -195,7 +214,7 @@ func parseRootly(data []byte) (Result, error) {
 // minor incident that never closes.
 func rootlyAllClear(banner string) bool {
 	words := rootlyWords(banner)
-	return slices.Contains(words, "operational") && !rootlyQualified(words)
+	return containsAny(words, "operational") && !rootlyQualified(words)
 }
 
 // rootlyQualified reports whether a label's words take an "operational" back.
@@ -204,17 +223,22 @@ func rootlyAllClear(banner string) bool {
 // Systems Operational. No incidents reported" is an all-clear, and reading
 // its negation as trouble would make it a minor incident that never closes.
 func rootlyQualified(words []string) bool {
-	for _, w := range words {
-		if slices.Contains(rootlyQualifiers, w) {
-			return true
-		}
-	}
-	return false
+	return containsAny(words, rootlyQualifiers...)
 }
 
 var rootlyQualifiers = []string{
 	"not", "partial", "partially", "degraded", "outage", "down", "unavailable",
 	"maintenance", "affected", "major", "minor",
+}
+
+// containsAny reports whether words holds any of the wanted words.
+func containsAny(words []string, wanted ...string) bool {
+	for _, w := range wanted {
+		if slices.Contains(words, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // rootlyWords lower-cases a label and splits it into words, so a keyword is
@@ -238,24 +262,17 @@ func rootlyWords(label string) []string {
 // collapse silently.
 func rootlySeverity(status, icon string) Severity {
 	words := rootlyWords(status)
-	has := func(ws ...string) bool {
-		for _, w := range ws {
-			if slices.Contains(words, w) {
-				return true
-			}
-		}
-		return false
-	}
 	switch {
 	case rootlyAllClear(status):
 		return SevNone
-	case has("major", "down", "unavailable"):
+	case containsAny(words, "major", "down", "unavailable"):
 		return SevCritical
-	case has("degraded", "maintenance"):
+	case containsAny(words, "degraded", "maintenance", "minor"):
 		// Before the qualified-operational case: "Operational (Degraded
-		// Performance)" and "Operational – Under Maintenance" are minor.
+		// Performance)", "Operational – Under Maintenance" and "Operational
+		// (minor issues)" are minor.
 		return SevMinor
-	case has("partial", "partially", "outage", "affected", "operational"):
+	case containsAny(words, "partial", "partially", "outage", "affected", "operational"):
 		return SevMajor
 	}
 	switch icon {

@@ -2009,6 +2009,14 @@ func (c *Controller) checkProviderWithRetry(ctx context.Context, p providers.Pro
 			st.challenged = true
 			c.mu.Lock()
 			wasChallenged := c.provStates[p.ID].challenged
+			if !wasChallenged && c.provStates != nil {
+				// Latch it here, under the lock, so a poll overlapping this
+				// one (a manual retry during a scheduled round) sees the
+				// transition already taken and does not log it again.
+				prev := c.provStates[p.ID]
+				prev.challenged = true
+				c.provStates[p.ID] = prev
+			}
 			c.mu.Unlock()
 			if !wasChallenged {
 				slog.Warn("provider feed challenged on every attempt, read as no public feed",

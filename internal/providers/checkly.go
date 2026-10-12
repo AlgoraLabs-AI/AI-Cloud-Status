@@ -30,9 +30,9 @@ func init() {
 // response. Only currently-open incidents are returned, so any incident present
 // is an active issue.
 type checklyIncidents struct {
-	// A pointer so an absent key (nil) is told from an empty list (the
-	// all-clear): see the anchor in parseCheckly.
-	Incidents *[]checklyIncident `json:"incidents"`
+	// Raw so an absent key (empty) is told from a present one, null or a
+	// list: see the anchor in parseCheckly.
+	Incidents json.RawMessage `json:"incidents"`
 }
 
 type checklyIncident struct {
@@ -57,17 +57,21 @@ func parseCheckly(data []byte) (Result, error) {
 	if err := json.Unmarshal(decodeFeed(data), &feed); err != nil {
 		return Result{}, err
 	}
-	// The anchor: the "incidents" key must be present, even when empty (a
-	// nil pointer is the key missing; an empty list is the all-clear). As the
+	// The anchor: the "incidents" key must be present. An empty list and a
+	// null are both the all-clear; the key missing is not this feed. As the
 	// legacy reader behind ParseFeed this adapter is handed every body the
 	// Rootly parser rejects, and `{}` or `{"message":"Forbidden"}` must read
 	// as unreadable, not as a quiet all-clear.
-	if feed.Incidents == nil {
+	if len(feed.Incidents) == 0 {
 		return Result{}, errors.New("checkly: document carries no incidents key")
+	}
+	var incidents []checklyIncident
+	if err := json.Unmarshal(feed.Incidents, &incidents); err != nil {
+		return Result{}, err
 	}
 
 	res := Result{Severity: SevNone}
-	for _, inc := range *feed.Incidents {
+	for _, inc := range incidents {
 		sev := checklySeverity(inc.Severity)
 		if sev > res.Severity {
 			res.Severity = sev

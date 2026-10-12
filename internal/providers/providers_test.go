@@ -771,7 +771,7 @@ func TestDefaultProvidersWellFormed(t *testing.T) {
 // hit a machine-readable status/health API (so results reflect true outage
 // state), never a bare marketing domain.
 func TestDefaultProvidersQueryStatusAPIs(t *testing.T) {
-	apiMarker := []string{"summary.json", "incidents.json", "currentevents", "/status/feed", "unresolved-incidents", "index.json", "feed.xml"}
+	apiMarker := []string{"summary.json", "incidents.json", "currentevents", "/status/feed", "index.json", "feed.xml"}
 	for _, p := range Default() {
 		if p.Kind.Page() {
 			// The page IS the feed (Rootly exposes no API or RSS); the parser
@@ -1045,6 +1045,7 @@ func TestRootlySeverityScale(t *testing.T) {
 		// A minor qualifier on "operational" is minor, not major.
 		{"Operational (Degraded Performance)", "", SevMinor},
 		{"Operational - Under Maintenance", "bg-yellow-100", SevMinor},
+		{"Operational (Minor issues)", "", SevMinor},
 		// No words at all: the icon is the verdict.
 		{"", "sp-error-bg", SevMajor},
 		{"", "sp-success-bg", SevNone},
@@ -1124,8 +1125,13 @@ func TestParseRootlyFailsClosedOnAPartialRead(t *testing.T) {
 			res.Severity, len(res.Incidents))
 	}
 	redIcon := whole[:i] + strings.Replace(whole[i:], "sp-success-bg text-green-400", "sp-error-bg text-red-500", 1)
-	if res, err := parseRootly([]byte(wrapLabel(redIcon))); err != nil || res.Severity != SevMajor {
-		t.Errorf("a row with an unreadable label and a red icon = %v, %v; want major from the icon", res.Severity, err)
+	res, err := parseRootly([]byte(wrapLabel(redIcon)))
+	if err != nil || res.Severity != SevMajor {
+		t.Fatalf("a row with an unreadable label and a red icon = %v, %v; want major from the icon", res.Severity, err)
+	}
+	// The icon's legend word stands in for the label: no dangling "Name: ".
+	if len(res.Incidents) != 1 || res.Incidents[0].Summary != "Audio API: Affected" {
+		t.Errorf("icon-only row incident = %+v, want summary \"Audio API: Affected\"", res.Incidents)
 	}
 
 	truncated := whole[:strings.LastIndex(whole, "Batch API")]
