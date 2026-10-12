@@ -69,6 +69,14 @@ var (
 	// rootlyServices is the heading of the service list; rows are read from
 	// there on, so an incident card above the list is never a row.
 	rootlyServices = regexp.MustCompile(`(?is)<h2\b[^>]*>\s*Services\s*</h2>`)
+)
+
+// rootlyBannerReach is how far above the banner span its coloured container
+// opens: the container, an icon wrapper and an SVG sit between them on the
+// captured page (under 1,500 bytes).
+const rootlyBannerReach = 2000
+
+var (
 	// rootlyIcon reads the status icon's colour class, the page's second
 	// channel for the same fact: its legend pairs sp-success-bg with
 	// "Operational", sp-error-bg with "Affected" and bg-yellow-100 with
@@ -102,11 +110,14 @@ func parseRootly(data []byte) (Result, error) {
 	}
 
 	// Rows are read from the service list's heading on, so a card the page
-	// gains above it during an incident is never mistaken for a service.
-	list := page
-	if loc := rootlyServices.FindStringIndex(page); loc != nil {
-		list = page[loc[1]:]
+	// gains above it during an incident is never mistaken for a service. The
+	// heading is an anchor like the rows and the banner: without it the two
+	// guarantees it carries would silently lapse, so its absence is an error.
+	loc := rootlyServices.FindStringIndex(page)
+	if loc == nil {
+		return Result{}, errors.New("rootly: page carries no service list heading")
 	}
+	list := page[loc[1]:]
 	var services []rootlyService
 	for _, m := range rootlyRow.FindAllStringSubmatch(list, -1) {
 		block := strings.TrimSpace(m[1])
@@ -147,19 +158,27 @@ func parseRootly(data []byte) (Result, error) {
 	// The banner is the headline span nearest ABOVE the service list: a card
 	// the page gains during an incident may carry the same headline style,
 	// but it sits above the banner, so the last match before the list wins.
-	above := page[:len(page)-len(list)]
-	if len(above) == 0 {
-		above = page
-	}
-	ms := rootlyBanner.FindAllStringSubmatch(above, -1)
+	above := page[:loc[0]]
+	ms := rootlyBanner.FindAllStringSubmatchIndex(above, -1)
 	if len(ms) == 0 {
 		return Result{}, errors.New("rootly: page carries no status banner")
 	}
-	banner := plainNote(ms[len(ms)-1][1])
+	last := ms[len(ms)-1]
+	banner := plainNote(above[last[2]:last[3]])
 	if banner == "" {
 		// A banner with no words is the anchor missing, not a verdict: it
 		// must not become a minor incident with an empty summary.
 		return Result{}, errors.New("rootly: status banner carries no text")
+	}
+	// The banner's container carries the page's legend colour too, in the
+	// same classes the row icons use. The words say all clear, or the colour
+	// does when the words name no trouble: a page owner may reword the
+	// all-clear ("All systems running normally"), and a reworded all-clear
+	// must not be an incident that never closes; words that do name trouble
+	// ("Degraded Performance") are believed over a green container.
+	allClear := rootlyAllClear(banner)
+	if m := rootlyIcon.FindStringSubmatch(above[max(0, last[0]-rootlyBannerReach):last[0]]); m != nil {
+		allClear = allClear || (m[1] == "sp-success-bg" && !rootlyQualified(rootlyWords(banner)))
 	}
 
 	res := Result{Severity: SevNone}
@@ -179,7 +198,7 @@ func parseRootly(data []byte) (Result, error) {
 	switch {
 	case len(affected) > 0:
 		summary := banner
-		if rootlyAllClear(summary) {
+		if allClear {
 			// The rows disagree with the banner: say what the rows say.
 			summary = strings.Join(notes, ", ")
 		}
@@ -189,7 +208,7 @@ func parseRootly(data []byte) (Result, error) {
 			Components: affected,
 			Note:       strings.Join(notes, "\n"),
 		})
-	case !rootlyAllClear(banner):
+	case !allClear:
 		// Every row reads operational but the banner does not: something is
 		// posted that the rows do not show. A real but unquantified
 		// degradation, floored at minor rather than read as all clear.
@@ -265,23 +284,19 @@ func rootlySeverity(status, icon string) Severity {
 	switch {
 	case rootlyAllClear(status):
 		return SevNone
+	case containsAny(words, "degraded", "maintenance", "minor"):
+		// Before the outage words: "Down for Maintenance", "Operational
+		// (Degraded Performance)" and "Operational (minor issues)" are minor.
+		return SevMinor
 	case containsAny(words, "major", "down", "unavailable"):
 		return SevCritical
-	case containsAny(words, "degraded", "maintenance", "minor"):
-		// Before the qualified-operational case: "Operational (Degraded
-		// Performance)", "Operational – Under Maintenance" and "Operational
-		// (minor issues)" are minor.
-		return SevMinor
 	case containsAny(words, "partial", "partially", "outage", "affected", "operational"):
 		return SevMajor
 	}
-	switch icon {
-	case "sp-success-bg":
-		return SevNone
-	case "sp-error-bg":
-		return SevMajor
-	case "bg-yellow-100":
-		return SevMinor
+	// The icon decides, through the legend's own word for its colour, so the
+	// icon-only and the unfamiliar-label paths cannot disagree.
+	if w, ok := rootlyLegend[icon]; ok {
+		return rootlySeverity(w, "")
 	}
 	slog.Warn("rootly: unknown service status, treating as minor", "status", status)
 	return SevMinor

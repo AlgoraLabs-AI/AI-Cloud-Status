@@ -74,7 +74,7 @@ func TestFeedCaptureDedupsAPageWhoseTokensRotate(t *testing.T) {
 	fc := NewFeedCapture(dir)
 	// The full live page: it carries the csrf-token and csp-nonce metas and
 	// the per-script nonce attributes the trimmed fixtures dropped.
-	whole := string(readFixture(t, "rootly_live_page.html"))
+	whole := string(readFixture(t, "rootly_live_page.html.gz"))
 	rotate := func(tag string) string {
 		s := strings.Replace(whole, `csp-nonce" content="`, `csp-nonce" content="`+tag, 1)
 		s = strings.Replace(s, `csrf-token" content="`, `csrf-token" content="`+tag, 1)

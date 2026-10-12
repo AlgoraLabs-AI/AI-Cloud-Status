@@ -1,8 +1,11 @@
 package providers
 
 import (
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,6 +20,16 @@ func readFixture(t *testing.T, name string) []byte {
 	data, err := os.ReadFile(filepath.Join("testdata", name))
 	if err != nil {
 		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	if strings.HasSuffix(name, ".gz") {
+		// A whole live page is committed gzipped (a tenth of its size).
+		zr, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("gunzip fixture %s: %v", name, err)
+		}
+		if data, err = io.ReadAll(zr); err != nil {
+			t.Fatalf("gunzip fixture %s: %v", name, err)
+		}
 	}
 	return data
 }
@@ -1046,6 +1059,7 @@ func TestRootlySeverityScale(t *testing.T) {
 		{"Operational (Degraded Performance)", "", SevMinor},
 		{"Operational - Under Maintenance", "bg-yellow-100", SevMinor},
 		{"Operational (Minor issues)", "", SevMinor},
+		{"Down for Maintenance", "bg-yellow-100", SevMinor},
 		// No words at all: the icon is the verdict.
 		{"", "sp-error-bg", SevMajor},
 		{"", "sp-success-bg", SevNone},
@@ -1144,6 +1158,13 @@ func TestParseRootlyFailsClosedOnAPartialRead(t *testing.T) {
 		t.Error("a page without the status banner parsed, want an error")
 	}
 
+	// The service list heading is an anchor too: without it the row and
+	// banner guarantees would lapse silently, so it fails closed instead.
+	noHeading := strings.Replace(whole, `<h2 class="">Services</h2>`, `<h2 class="">Components</h2>`, 1)
+	if _, err := parseRootly([]byte(noHeading)); err == nil {
+		t.Error("a page without the service list heading parsed, want an error")
+	}
+
 	// The controls: the whole page still reads, and so does one an edge
 	// appended a marker to after the closing tag.
 	if _, err := parseRootly([]byte(whole)); err != nil {
@@ -1158,7 +1179,7 @@ func TestParseRootlyFailsClosedOnAPartialRead(t *testing.T) {
 // live page (fifteen rows, the uptime charts, the head with its tokens): the
 // properties the trimmed fixture pins must hold on the real markup too.
 func TestParseRootlyReadsTheWholeLivePage(t *testing.T) {
-	res, err := parseRootly(readFixture(t, "rootly_live_page.html"))
+	res, err := parseRootly(readFixture(t, "rootly_live_page.html.gz"))
 	if err != nil {
 		t.Fatalf("the live page no longer parses: %v", err)
 	}
@@ -1182,6 +1203,35 @@ func TestParseRootlyIgnoresACardAboveTheServiceList(t *testing.T) {
 	}
 	if len(res.Incidents) != 1 || strings.Join(res.Incidents[0].Components, ",") != "Audio API,Batch API,Console" {
 		t.Errorf("components = %+v, want the three affected rows and no phantom from the card", res.Incidents)
+	}
+}
+
+// TestParseRootlyARewordedAllClearIsStillAllClear: the banner's container
+// carries the legend's green, so an all-clear worded without "operational"
+// ("All systems running normally") is not an incident that never closes,
+// while the same words in a red container still are.
+func TestParseRootlyARewordedAllClearIsStillAllClear(t *testing.T) {
+	whole := string(readFixture(t, "rootly_operational.html"))
+	green := strings.Replace(whole, "All Systems Operational", "All systems running normally", 1)
+	res, err := parseRootly([]byte(green))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevNone || len(res.Incidents) != 0 {
+		t.Errorf("reworded all-clear in a green container = %v with %+v, want all clear", res.Severity, res.Incidents)
+	}
+	red := strings.Replace(green,
+		`<div class="sp-success-bg w-full rounded-[20px] flex flex-col items-center justify-center gap-3 p-8 text-green-400">`,
+		`<div class="sp-error-bg w-full rounded-[20px] flex flex-col items-center justify-center gap-3 p-8 text-red-500">`, 1)
+	if red == green {
+		t.Fatal("fixture banner container not found")
+	}
+	res, err = parseRootly([]byte(red))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevMinor || len(res.Incidents) != 1 {
+		t.Errorf("unfamiliar banner in a red container = %v with %+v, want a minor incident", res.Severity, res.Incidents)
 	}
 }
 
