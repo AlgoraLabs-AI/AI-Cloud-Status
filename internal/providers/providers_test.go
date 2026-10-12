@@ -275,32 +275,6 @@ func TestStatuspageIncidentNote(t *testing.T) {
 	}
 }
 
-// TestParseChecklyTimesAndNote pins the Checkly (Mistral) incident metadata:
-// created_at → Started, newest update → Updated + Note.
-func TestParseChecklyTimesAndNote(t *testing.T) {
-	feed := `{"incidents":[{"name":"Audio API Degraded","severity":"MEDIUM",
-	 "created_at":"2026-07-17T07:55:56.406Z","updated_at":"2026-07-17T07:55:56.428Z",
-	 "services":[{"name":"Audio API"}],
-	 "incidentUpdates":[{"status":"INVESTIGATING",
-	  "description":"Requests to the Audio API are experiencing degraded service.",
-	  "created_at":"2026-07-17T08:30:00.000Z"}]}]}`
-	res, err := parseCheckly([]byte(feed))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Incidents) != 1 {
-		t.Fatalf("incidents = %d, want 1", len(res.Incidents))
-	}
-	inc := res.Incidents[0]
-	if inc.Note == "" || inc.Started.IsZero() {
-		t.Errorf("Note/Started missing: %+v", inc)
-	}
-	// Updated must advance to the newest update's timestamp (08:30 > 07:55).
-	if inc.Updated.UTC().Hour() != 8 {
-		t.Errorf("Updated = %v, want the newest update time", inc.Updated)
-	}
-}
-
 // TestParseAWSStaleEvents pins the zombie-event demotion: an event still open
 // ("Disrupted") whose last update is older than awsStaleAfter is KEPT but
 // demoted to SevMinor. Regression for the real me-central-1 (UAE) /
@@ -799,6 +773,11 @@ func TestDefaultProvidersWellFormed(t *testing.T) {
 func TestDefaultProvidersQueryStatusAPIs(t *testing.T) {
 	apiMarker := []string{"summary.json", "incidents.json", "currentevents", "/status/feed", "unresolved-incidents", "index.json", "feed.xml"}
 	for _, p := range Default() {
+		if p.Page {
+			// The page IS the feed (Rootly exposes no API or RSS); the parser
+			// anchors on its service rows, which is the same guarantee.
+			continue
+		}
 		ok := false
 		for _, m := range apiMarker {
 			if strings.Contains(p.URL, m) {
@@ -866,8 +845,8 @@ func TestModularSelfRegistration(t *testing.T) {
 			t.Errorf("provider %q uses kind %q with no registered parser", p.ID, p.Kind)
 		}
 	}
-	if _, ok := parserFor(KindCheckly); !ok {
-		t.Error("Checkly adapter did not self-register")
+	if _, ok := parserFor(KindRootly); !ok {
+		t.Error("Rootly adapter did not self-register")
 	}
 	if _, ok := parserFor(KindBetterStack); !ok {
 		t.Error("Better Stack adapter did not self-register")
@@ -906,66 +885,103 @@ func encodeUTF16LE(s string) []byte {
 	return out
 }
 
-func TestParseChecklyOpenIncidents(t *testing.T) {
-	res, err := parseCheckly(readFixture(t, "checkly_incidents.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// MAJOR is the top of Checkly's MINOR < MEDIUM < MAJOR scale.
-	if res.Severity != SevCritical {
-		t.Errorf("severity = %v, want critical (worst open incident)", res.Severity)
-	}
-	if len(res.Incidents) != 2 {
-		t.Fatalf("incidents = %d, want 2 open", len(res.Incidents))
-	}
-	inc := findIncident(res.Incidents, "Deep Research is down.")
-	if !strings.Contains(inc.Summary, "Vibe") {
-		t.Errorf("incident summary %q should name the affected service", inc.Summary)
-	}
-}
-
-// TestChecklySeverityScale pins Checkly's three-level scale. MEDIUM used to be
-// unmapped and fell through to the SevMinor default, capping Mistral below the
-// SevMajor alert threshold: every Mistral incident payload captured over
-// 2026-07-18..23 was MEDIUM, so Mistral could never raise an alert.
-func TestChecklySeverityScale(t *testing.T) {
-	cases := map[string]Severity{
-		"MINOR":       SevMinor,
-		"MEDIUM":      SevMajor,
-		"MAJOR":       SevCritical,
-		"CRITICAL":    SevCritical,
-		"MAINTENANCE": SevMinor,
-		"medium":      SevMajor, // case-insensitive
-	}
-	for in, want := range cases {
-		if got := checklySeverity(in); got != want {
-			t.Errorf("checklySeverity(%q) = %v, want %v", in, got, want)
-		}
-	}
-}
-
-// TestParseChecklyMediumAlerts is the end-to-end guard on the above: the real
-// captured Mistral payload must reach the SevMajor alert threshold.
-func TestParseChecklyMediumAlerts(t *testing.T) {
-	res, err := parseCheckly(readFixture(t, "checkly_medium.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Severity < SevMajor {
-		t.Errorf("severity = %v, want >= major so a MEDIUM incident can alert", res.Severity)
-	}
-	if len(res.Incidents) != 1 {
-		t.Fatalf("incidents = %d, want 1", len(res.Incidents))
-	}
-}
-
-func TestParseChecklyOperational(t *testing.T) {
-	res, err := parseCheckly(readFixture(t, "checkly_operational.json"))
+// TestParseRootlyOperational reads the live Mistral page as captured on
+// 2026-10-11 (header, banner, legend and three of the fifteen service rows,
+// uptime charts trimmed): all clear is SevNone with no incident.
+func TestParseRootlyOperational(t *testing.T) {
+	res, err := parseRootly(readFixture(t, "rootly_operational.html"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Severity != SevNone || len(res.Incidents) != 0 {
 		t.Errorf("operational page = %v with %d incidents, want none/0", res.Severity, len(res.Incidents))
+	}
+}
+
+// TestParseRootlyDegraded is the same page with the banner and three rows
+// edited to the states the page's own legend documents (Affected, Maintenance).
+// The worst row sets the severity, the affected rows fold into ONE incident
+// titled with the banner, and the note lists each row's own words.
+func TestParseRootlyDegraded(t *testing.T) {
+	res, err := parseRootly(readFixture(t, "rootly_degraded.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevCritical {
+		t.Errorf("severity = %v, want critical (the Major Outage row)", res.Severity)
+	}
+	if len(res.Incidents) != 1 {
+		t.Fatalf("incidents = %d, want 1 (the page has no incident timeline, only service states)", len(res.Incidents))
+	}
+	inc := res.Incidents[0]
+	if inc.Summary != "Partial System Outage" {
+		t.Errorf("Summary = %q, want the page banner", inc.Summary)
+	}
+	if got := strings.Join(inc.Components, ","); got != "Audio API,Batch API,Console" {
+		t.Errorf("Components = %q, want the three non-operational rows in page order", got)
+	}
+	if !strings.Contains(inc.Note, "Audio API: Partial Outage") || !strings.Contains(inc.Note, "Batch API: Maintenance") {
+		t.Errorf("Note = %q, want each row's own status label", inc.Note)
+	}
+}
+
+// TestRootlySeverityScale pins the keyword mapping and the icon fallback. The
+// labels are prose rather than an enum, so an unfamiliar label must still land
+// where the icon colour says, and never on SevNone unless the icon is green.
+func TestRootlySeverityScale(t *testing.T) {
+	cases := []struct {
+		status, icon string
+		want         Severity
+	}{
+		{"Operational", "sp-success-bg", SevNone},
+		{"Degraded Performance", "sp-error-bg", SevMinor},
+		{"Under Maintenance", "bg-yellow-100", SevMinor},
+		{"Partial Outage", "sp-error-bg", SevMajor},
+		{"Affected", "sp-error-bg", SevMajor},
+		{"Major Outage", "sp-error-bg", SevCritical},
+		{"major outage", "", SevCritical}, // case-insensitive
+		{"Something New", "sp-error-bg", SevMajor},
+		{"Something New", "bg-yellow-100", SevMinor},
+		{"Something New", "sp-success-bg", SevNone},
+		{"Something New", "", SevMinor},
+	}
+	for _, tc := range cases {
+		if got := rootlySeverity(tc.status, tc.icon); got != tc.want {
+			t.Errorf("rootlySeverity(%q, %q) = %v, want %v", tc.status, tc.icon, got, tc.want)
+		}
+	}
+}
+
+// TestParseRootlyBannerAloneIsNotAllClear: every row operational but the banner
+// says otherwise. Something is posted that the rows do not show, so the page is
+// a minor incident carrying the banner's words, never a clean SevNone.
+func TestParseRootlyBannerAloneIsNotAllClear(t *testing.T) {
+	page := strings.Replace(string(readFixture(t, "rootly_operational.html")),
+		"All Systems Operational", "Degraded Performance", 1)
+	res, err := parseRootly([]byte(page))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Severity != SevMinor || len(res.Incidents) != 1 || res.Incidents[0].Summary != "Degraded Performance" {
+		t.Errorf("got %v with %+v, want minor with the banner as the incident", res.Severity, res.Incidents)
+	}
+}
+
+// TestParseRootlyRejectsAPageWithoutServices pins the anchor. The Cloudflare
+// challenge that fronted this host for months is a 200-shaped HTML document
+// when it is not a 403; so is any error page. None of them carries a service
+// row, and none may read as operational.
+func TestParseRootlyRejectsAPageWithoutServices(t *testing.T) {
+	notThePage := [][]byte{
+		readFixture(t, "rootly_challenge.html"),
+		[]byte(`<html><body>nope</body></html>`),
+		[]byte(`{"message":"Forbidden"}`),
+		{},
+	}
+	for _, doc := range notThePage {
+		if _, err := parseRootly(doc); err == nil {
+			t.Errorf("parseRootly(%s) accepted a page with no service rows as healthy", truncate(string(doc), 40))
+		}
 	}
 }
 

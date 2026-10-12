@@ -72,7 +72,7 @@ func parseInstatus(data []byte) (Result, error) {
 		// severities whenever the list is non-empty, so a SevNone incident does
 		// not just contribute nothing — it DISCARDS the HASISSUES bump below
 		// and paints the provider operational. Every other adapter floors an
-		// open incident at minor for the same reason (xai.go, checkly.go,
+		// open incident at minor for the same reason (xai.go, rootly.go,
 		// googlecloud.go, aws.go).
 		sev := instatusImpactSeverity(inc.Impact)
 		if sev == SevNone && !strings.EqualFold(strings.TrimSpace(inc.Impact), "UNDERMAINTENANCE") {

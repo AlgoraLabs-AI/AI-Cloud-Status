@@ -331,8 +331,9 @@ func TestNoAdapterSilentlyAcceptsGarbage(t *testing.T) {
 		`<html><body>nope</body></html>`,
 	}
 	parsers := map[string]func([]byte) (Result, error){
-		"azure": parseAzure,
-		"xai":   parseXAI,
+		"azure":  parseAzure,
+		"xai":    parseXAI,
+		"rootly": parseRootly,
 	}
 	for name, parse := range parsers {
 		for _, g := range garbage {

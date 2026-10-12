@@ -16,7 +16,7 @@ type ParseFunc func(p Provider, data []byte) (Result, error)
 //   - adding a provider on an existing backend = one new file with a Register
 //     call (see bitbucket.go), and
 //   - adding a whole new backend = one new adapter file with a RegisterParser
-//     call (see checkly.go / betterstack.go),
+//     call (see rootly.go / betterstack.go),
 //
 // with NO edit to any central list. init() runs single-threaded at package load,
 // but the mutex keeps Register/RegisterParser safe if ever called concurrently.

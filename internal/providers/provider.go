@@ -101,7 +101,7 @@ const (
 	KindGoogleCloud Kind = "googlecloud" // status.cloud.google.com incidents.json
 	KindAWS         Kind = "aws"         // AWS Health public current events
 	KindAzure       Kind = "azure"       // Azure status RSS feed
-	KindCheckly     Kind = "checkly"     // Checkly status page (e.g. Mistral)
+	KindRootly      Kind = "rootly"      // Rootly status page, read from its HTML (e.g. Mistral)
 	KindBetterStack Kind = "betterstack" // Better Stack status page (e.g. Hugging Face)
 	KindInstatus    Kind = "instatus"    // Instatus status page (e.g. Perplexity)
 	KindXAI         Kind = "xai"         // xAI status RSS feed (status.x.ai/feed.xml)
@@ -139,6 +139,10 @@ type Provider struct {
 	// Optional providers are skipped gracefully (not surfaced as unreachable)
 	// when they do not expose a public feed (e.g. a 404).
 	Optional bool
+	// Page marks a provider whose feed is its status page's own HTML rather
+	// than a machine-readable endpoint. Check fetches it as the document it
+	// is (see there), and the URL-shape test exempts it.
+	Page bool
 }
 
 // Incident is a single open issue reported by a provider feed. It carries its
@@ -412,7 +416,23 @@ func (c *Checker) Check(ctx context.Context, p Provider) (Result, error) {
 		return Result{Feed: FeedUnreachable}, err
 	}
 	req.Header.Set("User-Agent", "AI-Cloud-Status/1.0 (+https://github.com/AlgoraLabs-AI/AI-Cloud-Status)")
-	req.Header.Set("Accept", "application/json, application/rss+xml, text/xml;q=0.9, */*;q=0.8")
+	if p.Page {
+		// The feed is the status page itself, so ask for it the way a page is
+		// asked for: an HTML Accept and the Fetch Metadata a top-level
+		// navigation carries. That metadata is what Cloudflare's managed
+		// challenge at status.mistral.ai keys on. Measured 2026-10-11, this
+		// User-Agent throughout and Go's default TLS: without the Sec-Fetch
+		// headers every request answered 403 "Just a moment..." (Cf-Mitigated:
+		// challenge), with them 15 of 15 fresh connections answered the page.
+		// Neither the User-Agent nor the TLS fingerprint changes; nothing here
+		// claims to be a browser.
+		req.Header.Set("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		req.Header.Set("Sec-Fetch-Site", "none")
+	} else {
+		req.Header.Set("Accept", "application/json, application/rss+xml, text/xml;q=0.9, */*;q=0.8")
+	}
 
 	resp, err := c.Client.Do(req)
 	if err != nil {
